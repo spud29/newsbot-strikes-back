@@ -1,0 +1,71 @@
+{
+  "hourly": [
+    {
+      "timestamp": "2025-11-07 02:00:00",
+      "processed": 0,
+      "duplicates": 1,
+      "errors": 0,
+      "by_category": {},
+      "by_source": {
+        "rss": {},
+        "telegram": {}
+      },
+      "media": {
+        "images": 0,
+        "videos": 0,
+        "ocr_extractions": 0
+      },
+      "performance": {
+        "total_processing_time": 0.0,
+        "avg_processing_time": 0.0,
+        "entry_count": 0
+      }
+    },
+    {
+      "timestamp": "2025-11-07 03:00:00",
+      "processed": 1,
+      "duplicates": 0,
+      "errors": 1,
+      "by_category": {
+        "music": 1
+      },
+      "by_source": {
+        "rss": {},
+        "telegram": {}
+      },
+      "media": {
+        "images": 0,
+        "videos": 0,
+        "ocr_extractions": 0
+      },
+      "performance": {
+        "total_processing_time": 0.0,
+        "avg_processing_time": 0.0,
+        "entry_count": 0
+      }
+    }
+  ],
+  "daily": [],
+  "all_time": {
+    "processed": 0,
+    "duplicates": 1,
+    "errors": 1,
+    "by_category": {},
+    "by_source": {
+      "rss": {},
+      "telegram": {}
+    },
+    "media": {
+      "images": 0,
+      "videos": 0,
+      "ocr_extractions": 0
+    },
+    "performance": {
+      "total_processing_time": 0.0,
+      "avg_processing_time": 0.0,
+      "entry_count": 0
+    }
+  },
+  "current_hour": "2025-11-07 04:00:00",
+  "current_day": "2025-11-07"
+}

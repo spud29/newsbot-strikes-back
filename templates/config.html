@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+
+{% block title %}Configuration - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-gear"></i> Configuration</h1>
+        <p class="text-muted">View and manage bot configuration</p>
+    </div>
+    <div class="col-auto">
+        <button class="btn btn-primary" onclick="refreshConfig()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+</div>
+
+<!-- Current Configuration -->
+<div class="row">
+    <div class="col-md-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-sliders"></i> Thresholds</h5>
+            </div>
+            <div class="card-body">
+                <div id="config-thresholds">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-clock"></i> Intervals</h5>
+            </div>
+            <div class="card-body">
+                <div id="config-intervals">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-12 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-tags"></i> Categories & Channels</h5>
+            </div>
+            <div class="card-body">
+                <div id="config-categories">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-chat-quote"></i> System Prompt</h5>
+            </div>
+            <div class="card-body">
+                <div id="config-prompt">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="alert alert-info mt-4">
+    <strong><i class="bi bi-info-circle"></i> Note:</strong> To edit configuration, modify <code>config.py</code> directly and restart the bot. Configuration editing through the dashboard is planned for a future update.
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function refreshConfig() {
+    try {
+        const response = await fetch('/api/config');
+        const config = await response.json();
+        
+        // Thresholds
+        document.getElementById('config-thresholds').innerHTML = `
+            <table class="table table-sm mb-0">
+                <tr>
+                    <td><strong>Duplicate Threshold:</strong></td>
+                    <td>${(config.duplicate_threshold * 100).toFixed(0)}%</td>
+                </tr>
+                <tr>
+                    <td><strong>Similarity Threshold:</strong></td>
+                    <td>${(config.similarity_threshold * 100).toFixed(0)}%</td>
+                </tr>
+            </table>
+        `;
+        
+        // Intervals
+        document.getElementById('config-intervals').innerHTML = `
+            <table class="table table-sm mb-0">
+                <tr>
+                    <td><strong>Poll Interval:</strong></td>
+                    <td>${config.poll_interval} seconds (${Math.round(config.poll_interval / 60)} minutes)</td>
+                </tr>
+                <tr>
+                    <td><strong>DB Retention:</strong></td>
+                    <td>${config.db_retention_hours} hours</td>
+                </tr>
+            </table>
+        `;
+        
+        // Categories
+        let categoriesHtml = '<div class="table-responsive"><table class="table table-sm table-hover">';
+        categoriesHtml += '<thead><tr><th>Category</th><th>Discord Channel ID</th></tr></thead><tbody>';
+        
+        for (const [category, channelId] of Object.entries(config.discord_channels)) {
+            categoriesHtml += `<tr>
+                <td><span class="badge bg-secondary">${category}</span></td>
+                <td><code>${channelId}</code></td>
+            </tr>`;
+        }
+        
+        categoriesHtml += '</tbody></table></div>';
+        document.getElementById('config-categories').innerHTML = categoriesHtml;
+        
+        // System Prompt
+        document.getElementById('config-prompt').innerHTML = `
+            <pre class="mb-0" style="white-space: pre-wrap; font-size: 0.9rem;">${escapeHtml(config.system_prompt)}</pre>
+        `;
+    } catch (error) {
+        console.error('Error refreshing config:', error);
+        alert('Failed to load configuration');
+    }
+}
+
+function escapeHtml(text) {
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return text.replace(/[&<>"']/g, m => map[m]);
+}
+
+// Load config on page load
+document.addEventListener('DOMContentLoaded', refreshConfig);
+</script>
+{% endblock %}
+

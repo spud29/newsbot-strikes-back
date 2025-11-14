@@ -5,6 +5,8 @@ import asyncio
 import time
 import signal
 import sys
+import subprocess
+import os
 from utils import logger, setup_logging
 import config
 from database import Database
@@ -32,6 +34,10 @@ class NewsAggregatorBot:
         
         self.running = False
         
+        # Process management for dashboard and ngrok
+        self.uvicorn_process = None
+        self.ngrok_process = None
+        
         # Statistics
         self.stats = {
             'processed': 0,
@@ -42,6 +48,65 @@ class NewsAggregatorBot:
         
         logger.info("All components initialized")
     
+    def start_uvicorn(self):
+        """Start uvicorn server for dashboard"""
+        try:
+            logger.info("Starting uvicorn dashboard server...")
+            # Start uvicorn as a subprocess
+            # Don't capture stdout/stderr so logs appear in terminal
+            self.uvicorn_process = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", "dashboard:app", "--host", "0.0.0.0", "--port", "8000"],
+                stdout=None,  # Let it go to terminal
+                stderr=None,  # Let it go to terminal
+                cwd=os.getcwd()
+            )
+            logger.info("✓ Dashboard server started on http://0.0.0.0:8000")
+        except Exception as e:
+            logger.error(f"Failed to start uvicorn: {e}")
+    
+    def start_ngrok(self):
+        """Start ngrok tunnel for remote access"""
+        try:
+            logger.info("Starting ngrok tunnel...")
+            # Start ngrok as a subprocess
+            self.ngrok_process = subprocess.Popen(
+                ["ngrok", "http", "8000"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            logger.info("✓ Ngrok tunnel started (check http://127.0.0.1:4040 for public URL)")
+        except Exception as e:
+            logger.error(f"Failed to start ngrok: {e}")
+            logger.info("Note: Make sure ngrok is installed and in your PATH")
+    
+    def stop_uvicorn(self):
+        """Stop uvicorn server"""
+        if self.uvicorn_process:
+            try:
+                logger.info("Stopping uvicorn dashboard server...")
+                self.uvicorn_process.terminate()
+                self.uvicorn_process.wait(timeout=5)
+                logger.info("✓ Dashboard server stopped")
+            except subprocess.TimeoutExpired:
+                logger.warning("Uvicorn didn't stop gracefully, killing process...")
+                self.uvicorn_process.kill()
+            except Exception as e:
+                logger.error(f"Error stopping uvicorn: {e}")
+    
+    def stop_ngrok(self):
+        """Stop ngrok tunnel"""
+        if self.ngrok_process:
+            try:
+                logger.info("Stopping ngrok tunnel...")
+                self.ngrok_process.terminate()
+                self.ngrok_process.wait(timeout=5)
+                logger.info("✓ Ngrok tunnel stopped")
+            except subprocess.TimeoutExpired:
+                logger.warning("Ngrok didn't stop gracefully, killing process...")
+                self.ngrok_process.kill()
+            except Exception as e:
+                logger.error(f"Error stopping ngrok: {e}")
+    
     async def start(self):
         """Start the bot"""
         logger.info("Starting bot...")
@@ -50,6 +115,12 @@ class NewsAggregatorBot:
         if not self.ollama.health_check():
             logger.error("Ollama health check failed! Please ensure Ollama is running.")
             return
+        
+        # Start uvicorn dashboard
+        self.start_uvicorn()
+        
+        # Start ngrok tunnel
+        self.start_ngrok()
         
         # Start Discord client
         await self.discord_poster.start()
@@ -65,9 +136,13 @@ class NewsAggregatorBot:
         logger.info("Stopping bot...")
         self.running = False
         
-        
+        # Stop Telegram and Discord clients
         await self.telegram_poller.stop()
         await self.discord_poster.stop()
+        
+        # Stop uvicorn and ngrok
+        self.stop_uvicorn()
+        self.stop_ngrok()
         
         logger.info("Bot stopped")
     
@@ -208,25 +283,39 @@ class NewsAggregatorBot:
                 if ocr_text:
                     # Store embedding with OCR text included for better future duplicate detection
                     combined_embedding = self.ollama.generate_embedding(combined_content)
-                    self.db.add_embedding(combined_content, combined_embedding)
+                    self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
                 else:
-                    self.db.add_embedding(content, embedding)
+                    self.db.add_embedding(content, embedding, entry_id=entry_id)
+                
+                # Store message mapping with source URL for all entries
+                if discord_message_id and discord_channel_id:
+                    # Get or construct source URL
+                    source_url = entry.get('link') or entry.get('url')
+                    
+                    # For Telegram entries, construct the t.me URL
+                    if source_type == 'telegram' and not source_url:
+                        message_id = entry.get('message_id')
+                        channel_name = entry.get('source')
+                        if message_id and channel_name:
+                            # Remove @ prefix if present (t.me URLs don't use it)
+                            channel_name_clean = channel_name.lstrip('@')
+                            source_url = f"https://t.me/{channel_name_clean}/{message_id}"
+                    
+                    self.db.store_message_mapping(
+                        telegram_entry_id=entry_id,
+                        telegram_message_id=entry.get('message_id', 0),
+                        discord_channel_id=discord_channel_id,
+                        discord_message_id=discord_message_id,
+                        content=content,
+                        source_url=source_url,
+                        video_urls=entry.get('video_urls', [])
+                    )
                 
                 # Update last message ID for Telegram entries
                 if source_type == 'telegram':
                     message_id = entry.get('message_id')
                     if message_id:
                         self.telegram_poller.update_last_message_id(entry_id, message_id)
-                        
-                        # Store message mapping for edit tracking
-                        if discord_message_id and discord_channel_id:
-                            self.db.store_message_mapping(
-                                telegram_entry_id=entry_id,
-                                telegram_message_id=message_id,
-                                discord_channel_id=discord_channel_id,
-                                discord_message_id=discord_message_id,
-                                content=content
-                            )
                 
                 # Update statistics
                 self.stats['processed'] += 1
@@ -271,6 +360,10 @@ class NewsAggregatorBot:
         # Clean up old database entries
         logger.info("Cleaning up old database entries...")
         self.db.cleanup_old_entries()
+        
+        # Clean up old media files (older than 2 days)
+        from utils import cleanup_old_media_files
+        cleanup_old_media_files(retention_days=2)
         
         # Get database stats
         db_stats = self.db.get_stats()
@@ -436,13 +529,15 @@ class NewsAggregatorBot:
             )
             
             if success:
-                # Update the stored content in the mapping
+                # Update the stored content in the mapping (preserve source_url)
                 self.db.store_message_mapping(
                     telegram_entry_id=entry_id,
                     telegram_message_id=mapping_info['telegram_message_id'],
                     discord_channel_id=discord_channel_id,
                     discord_message_id=discord_message_id,
-                    content=new_content
+                    content=new_content,
+                    source_url=mapping_info.get('source_url'),
+                    video_urls=mapping_info.get('video_urls', [])
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

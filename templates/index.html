@@ -1,0 +1,391 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-speedometer2"></i> Dashboard</h1>
+        <p class="text-muted">Monitor your news aggregator bot</p>
+    </div>
+    <div class="col-auto">
+        <button class="btn btn-primary" onclick="refreshStats()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+</div>
+
+<!-- System Health -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card border-primary">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-cpu"></i> Ollama Status
+                </h5>
+                <h3 id="ollama-status" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span> Loading...
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card border-info">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-activity"></i> Bot Status
+                </h5>
+                <h3 id="bot-status" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span> Loading...
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card border-success">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-check-circle"></i> Processed (24h)
+                </h5>
+                <h3 id="processed-24h" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card border-warning">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-database"></i> Database Size
+                </h5>
+                <h3 id="db-size" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Sources Overview -->
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-rss"></i> RSS Feeds
+                </h5>
+                <h3 id="rss-count" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+                <p class="text-muted mb-0">Active sources</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-telegram"></i> Telegram Channels
+                </h5>
+                <h3 id="telegram-count" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+                <p class="text-muted mb-0">Active sources</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Activity -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-clock-history"></i> Recent Activity</h5>
+            </div>
+            <div class="card-body">
+                <div id="recent-activity">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                        <p class="text-muted mt-2">Loading recent entries...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Entry Details Modal -->
+<div class="modal fade" id="entryDetailsModal" tabindex="-1" aria-labelledby="entryDetailsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="entry-details-title">Entry Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="entry-details-body">
+                <div class="text-center">
+                    <span class="spinner-border"></span>
+                    <p class="mt-2">Loading entry details...</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function refreshStats() {
+    try {
+        // Fetch health status
+        const healthResponse = await fetch('/api/health');
+        const health = await healthResponse.json();
+        
+        document.getElementById('ollama-status').innerHTML = 
+            health.ollama === 'up' 
+                ? '<span class="text-success"><i class="bi bi-check-circle-fill"></i> Online</span>' 
+                : '<span class="text-danger"><i class="bi bi-x-circle-fill"></i> Offline</span>';
+        
+        document.getElementById('bot-status').innerHTML = 
+            health.bot === 'active' 
+                ? '<span class="text-success"><i class="bi bi-check-circle-fill"></i> Active</span>' 
+                : '<span class="text-warning"><i class="bi bi-exclamation-circle-fill"></i> Inactive</span>';
+        
+        // Fetch statistics
+        const statsResponse = await fetch('/api/stats');
+        const stats = await statsResponse.json();
+        
+        document.getElementById('processed-24h').textContent = stats.processed_24h;
+        document.getElementById('db-size').textContent = 
+            stats.database.processed_ids + ' IDs / ' + stats.database.embeddings + ' embeddings';
+        document.getElementById('rss-count').textContent = stats.rss_feeds_count;
+        document.getElementById('telegram-count').textContent = stats.telegram_channels_count;
+        
+        // Recent activity
+        const recentDiv = document.getElementById('recent-activity');
+        if (stats.recent_entries.length === 0) {
+            recentDiv.innerHTML = '<p class="text-muted">No recent entries</p>';
+        } else {
+            let html = '<div class="table-responsive"><table class="table table-sm table-hover">';
+            html += '<thead><tr><th>Entry ID</th><th>Source</th><th>Time</th></tr></thead><tbody>';
+            
+            stats.recent_entries.forEach(entry => {
+                const date = new Date(entry.timestamp * 1000).toLocaleString();
+                html += `<tr>
+                    <td><code><a href="#" class="entry-link text-primary" data-entry-id="${entry.id}" style="text-decoration: none; cursor: pointer;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${entry.id}</a></code></td>
+                    <td><span class="badge bg-secondary">${entry.source}</span></td>
+                    <td>${date}</td>
+                </tr>`;
+            });
+            
+            html += '</tbody></table></div>';
+            recentDiv.innerHTML = html;
+            
+            // Add click handlers for entry links
+            document.querySelectorAll('.entry-link').forEach(link => {
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const entryId = this.getAttribute('data-entry-id');
+                    showEntryDetails(entryId);
+                });
+            });
+        }
+    } catch (error) {
+        console.error('Error refreshing stats:', error);
+        alert('Failed to refresh statistics');
+    }
+}
+
+async function showEntryDetails(entryId) {
+    try {
+        // Show loading state
+        const modalBody = document.getElementById('entry-details-body');
+        modalBody.innerHTML = '<div class="text-center"><span class="spinner-border"></span><p class="mt-2">Loading entry details...</p></div>';
+        
+        const modal = new bootstrap.Modal(document.getElementById('entryDetailsModal'));
+        document.getElementById('entry-details-title').textContent = `Entry Details: ${entryId}`;
+        modal.show();
+        
+        // Fetch entry details
+        const response = await fetch(`/api/entry/${encodeURIComponent(entryId)}`);
+        const data = await response.json();
+        
+        if (!data.found) {
+            modalBody.innerHTML = `<div class="alert alert-warning">Entry not found: ${entryId}</div>`;
+            return;
+        }
+        
+        // Format timestamp
+        const timestamp = data.timestamp ? new Date(data.timestamp * 1000).toLocaleString() : 'N/A';
+        
+        // Build details HTML
+        let html = '<div class="row">';
+        
+        // Basic Info
+        html += '<div class="col-md-6 mb-3">';
+        html += '<h6 class="text-muted">Basic Information</h6>';
+        html += '<table class="table table-sm table-borderless">';
+        html += `<tr><th width="40%">Entry ID:</th><td><code>${data.entry_id}</code></td></tr>`;
+        html += `<tr><th>Source Type:</th><td><span class="badge bg-secondary">${data.source_type || 'N/A'}</span></td></tr>`;
+        html += `<tr><th>Processed:</th><td>${timestamp}</td></tr>`;
+        html += '</table>';
+        html += '</div>';
+        
+        // Discord Info
+        html += '<div class="col-md-6 mb-3">';
+        html += '<h6 class="text-muted">Discord Information</h6>';
+        html += '<table class="table table-sm table-borderless">';
+        if (data.discord_channel_id) {
+            html += `<tr><th width="40%">Channel ID:</th><td><code>${data.discord_channel_id}</code></td></tr>`;
+        }
+        if (data.discord_message_id) {
+            html += `<tr><th>Message ID:</th><td><code>${data.discord_message_id}</code></td></tr>`;
+        }
+        if (!data.discord_channel_id && !data.discord_message_id) {
+            html += '<tr><td colspan="2" class="text-muted">No Discord information available</td></tr>';
+        }
+        html += '</table>';
+        html += '</div>';
+        
+        html += '</div>';
+        
+        // Source URL
+        if (data.source_url) {
+            html += '<div class="mb-3">';
+            html += '<h6 class="text-muted">Source URL</h6>';
+            html += `<p><a href="${data.source_url}" target="_blank" rel="noopener noreferrer">${data.source_url} <i class="bi bi-box-arrow-up-right"></i></a></p>`;
+            html += '</div>';
+        }
+        
+        // Telegram Message ID
+        if (data.telegram_message_id && data.telegram_message_id !== 0) {
+            html += '<div class="mb-3">';
+            html += '<h6 class="text-muted">Telegram</h6>';
+            html += `<p>Message ID: <code>${data.telegram_message_id}</code></p>`;
+            html += '</div>';
+        }
+        
+        // Content
+        html += '<div class="mb-3">';
+        html += '<h6 class="text-muted">Content</h6>';
+        if (data.content) {
+            const contentPreview = data.content.length > 1000 
+                ? data.content.substring(0, 1000) + '...' 
+                : data.content;
+            html += `<div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 0.9em;">${escapeHtml(contentPreview)}</div>`;
+            if (data.content.length > 1000) {
+                html += `<p class="text-muted small mt-2">Content truncated (${data.content.length} characters total)</p>`;
+            }
+        } else {
+            html += '<p class="text-muted">No content available</p>';
+        }
+        html += '</div>';
+        
+        // Media Section
+        if (data.media && (data.media.images.length > 0 || data.media.videos.length > 0)) {
+            html += '<div class="mb-3">';
+            html += '<h6 class="text-muted">Media</h6>';
+            
+            // Images
+            if (data.media.images.length > 0) {
+                html += '<div class="mb-3">';
+                html += '<strong>Images:</strong>';
+                html += '<div class="row g-2 mt-2">';
+                data.media.images.forEach((imageUrl, index) => {
+                    html += `<div class="col-md-6">`;
+                    html += `<div class="card">`;
+                    html += `<img src="${imageUrl}" class="card-img-top" style="max-height: 300px; width: 100%; object-fit: contain; background-color: #f8f9fa;" alt="Image ${index + 1}" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">`;
+                    html += `<div style="display: none; padding: 1rem; text-align: center; color: #999;">Image ${index + 1} (failed to load)</div>`;
+                    html += `<div class="card-body p-2">`;
+                    html += `<small class="text-muted">Image ${index + 1}</small>`;
+                    html += `<br><a href="${imageUrl}" target="_blank" rel="noopener noreferrer" class="small">Open image in new tab <i class="bi bi-box-arrow-up-right"></i></a>`;
+                    html += `</div>`;
+                    html += `</div>`;
+                    html += `</div>`;
+                });
+                html += '</div>';
+                html += '</div>';
+            }
+            
+            // Videos
+            if (data.media.videos.length > 0) {
+                html += '<div class="mb-3">';
+                html += '<strong>Videos:</strong>';
+                html += '<div class="row g-2 mt-2">';
+                data.media.videos.forEach((videoUrl, index) => {
+                    // Check if it's an external URL (Twitter video URLs)
+                    const isExternalUrl = videoUrl.startsWith('http://') || videoUrl.startsWith('https://');
+                    
+                    html += `<div class="col-md-6">`;
+                    html += `<div class="card">`;
+                    
+                    if (isExternalUrl) {
+                        // External video URL - show as embedded player or link
+                        html += `<video controls class="card-img-top" style="max-height: 300px; width: 100%;" crossorigin="anonymous">`;
+                        html += `<source src="${videoUrl}" type="video/mp4">`;
+                        html += `Your browser does not support the video tag.`;
+                        html += `</video>`;
+                        html += `<div class="card-body p-2">`;
+                        html += `<small class="text-muted">Video ${index + 1}</small>`;
+                        html += `<br><a href="${videoUrl}" target="_blank" rel="noopener noreferrer" class="small">Open video URL <i class="bi bi-box-arrow-up-right"></i></a>`;
+                        html += `</div>`;
+                    } else {
+                        // Local video file
+                        html += `<video controls class="card-img-top" style="max-height: 300px; width: 100%;">`;
+                        html += `<source src="${videoUrl}" type="video/mp4">`;
+                        html += `Your browser does not support the video tag.`;
+                        html += `</video>`;
+                        html += `<div class="card-body p-2">`;
+                        html += `<small class="text-muted">Video ${index + 1}</small>`;
+                        html += `</div>`;
+                    }
+                    
+                    html += `</div>`;
+                    html += `</div>`;
+                });
+                html += '</div>';
+                html += '</div>';
+            }
+            
+            html += '</div>';
+        }
+        
+        // Embedding Info
+        if (data.embedding_info) {
+            html += '<div class="mb-3">';
+            html += '<h6 class="text-muted">Embedding Information</h6>';
+            html += '<table class="table table-sm table-borderless">';
+            html += `<tr><th width="40%">Hash:</th><td><code>${data.embedding_info.hash.substring(0, 16)}...</code></td></tr>`;
+            if (data.embedding_info.preview) {
+                html += `<tr><th>Preview:</th><td><code>${escapeHtml(data.embedding_info.preview)}</code></td></tr>`;
+            }
+            html += '</table>';
+            html += '</div>';
+        }
+        
+        modalBody.innerHTML = html;
+        
+    } catch (error) {
+        console.error('Error loading entry details:', error);
+        const modalBody = document.getElementById('entry-details-body');
+        modalBody.innerHTML = `<div class="alert alert-danger">Error loading entry details: ${error.message}</div>`;
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Load stats on page load
+document.addEventListener('DOMContentLoaded', refreshStats);
+</script>
+{% endblock %}
+

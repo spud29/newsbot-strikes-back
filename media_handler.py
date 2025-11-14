@@ -6,7 +6,7 @@ import json
 import subprocess
 import asyncio
 from pathlib import Path
-from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_twitter_attribution, remove_xcom_urls
+from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, remove_twitter_attribution, remove_xcom_urls
 import config
 from ocr_handler import OCRHandler
 
@@ -177,6 +177,7 @@ class MediaHandler:
             full_text = clean_text_content(full_text)
             full_text = resolve_shortened_urls(full_text)
             full_text = remove_emojis(full_text)
+            full_text = remove_corrupted_emoji_marks(full_text)
             full_text = remove_xcom_urls(full_text)
             full_text = remove_twitter_attribution(full_text)
             
@@ -188,13 +189,16 @@ class MediaHandler:
                 if ocr_text:
                     logger.info(f"✓ OCR extracted {len(ocr_text)} characters from Twitter images")
             
+            logger.debug("Assigning entry values...")
             entry['media_files'] = media_files
             entry['video_urls'] = video_urls
             entry['full_text'] = full_text
             entry['ocr_text'] = ocr_text
             entry['download_dir'] = download_dir
+            logger.debug("Entry values assigned successfully")
             
             logger.info(f"Downloaded {len(media_files)} image files from Twitter, extracted {len(video_urls)} video URLs")
+            logger.debug("Returning entry from download_twitter_media")
             return entry
             
         except subprocess.TimeoutExpired:
@@ -322,14 +326,17 @@ class MediaHandler:
     
     def cleanup_entry_media(self, entry):
         """
-        Clean up temporary media files for an entry
+        Clean up temporary media files for an entry (only if older than 2 days)
+        Media files are kept for 2 days to allow viewing in dashboard
         
         Args:
             entry: Entry dictionary with download_dir
         """
         download_dir = entry.get('download_dir')
         if download_dir and os.path.exists(download_dir):
-            cleanup_temp_files(download_dir)
+            # Don't delete immediately - keep for 2 days
+            # Cleanup will be handled by periodic cleanup task
+            pass
     
     def run_download_telegram_media(self, entry):
         """

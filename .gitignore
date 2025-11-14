@@ -35,9 +35,12 @@ bot.log
 # Database files
 data/processed_ids.json
 data/embeddings_cache.json
+data/message_mapping.json
+data/last_message_ids.json
 
 # Temporary media files
 temp_media/
+temp_media_serve/
 
 # Telegram session
 *.session

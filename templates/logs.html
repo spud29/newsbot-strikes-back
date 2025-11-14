@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}Logs - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-file-text"></i> Error Logs</h1>
+        <p class="text-muted">View and filter bot error logs</p>
+    </div>
+    <div class="col-auto">
+        <button class="btn btn-primary" onclick="refreshLogs()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-body">
+                <form class="row g-3" onsubmit="event.preventDefault(); refreshLogs();">
+                    <div class="col-md-3">
+                        <label for="filter-level" class="form-label">Level</label>
+                        <select class="form-select" id="filter-level">
+                            <option value="">All</option>
+                            <option value="ERROR">ERROR</option>
+                            <option value="WARNING">WARNING</option>
+                            <option value="INFO">INFO</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="filter-lines" class="form-label">Lines</label>
+                        <select class="form-select" id="filter-lines">
+                            <option value="50">Last 50</option>
+                            <option value="100" selected>Last 100</option>
+                            <option value="200">Last 200</option>
+                            <option value="500">Last 500</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <label for="filter-search" class="form-label">Search</label>
+                        <input type="text" class="form-control" id="filter-search" placeholder="Search in logs...">
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label">&nbsp;</label>
+                        <button type="submit" class="btn btn-primary w-100">
+                            <i class="bi bi-funnel"></i> Filter
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Log Display -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-terminal"></i> Log Output</h5>
+            </div>
+            <div class="card-body">
+                <div id="log-display" style="max-height: 600px; overflow-y: auto;">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                        <p class="text-muted mt-2">Loading logs...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function refreshLogs() {
+    const level = document.getElementById('filter-level').value;
+    const lines = document.getElementById('filter-lines').value;
+    const search = document.getElementById('filter-search').value;
+    
+    try {
+        const params = new URLSearchParams({ lines, level, search });
+        const response = await fetch(`/api/logs?${params}`);
+        const data = await response.json();
+        
+        const logDiv = document.getElementById('log-display');
+        
+        if (data.logs && data.logs.length > 0) {
+            let html = '<pre class="mb-0" style="font-size: 0.85rem;">';
+            data.logs.forEach(line => {
+                // Color code by severity
+                let className = '';
+                if (line.includes('ERROR')) className = 'text-danger';
+                else if (line.includes('WARNING')) className = 'text-warning';
+                else if (line.includes('INFO')) className = 'text-info';
+                
+                html += `<div class="${className}">${escapeHtml(line)}</div>`;
+            });
+            html += '</pre>';
+            logDiv.innerHTML = html;
+        } else {
+            logDiv.innerHTML = '<p class="text-muted">No logs found matching the filters</p>';
+        }
+    } catch (error) {
+        console.error('Error refreshing logs:', error);
+        document.getElementById('log-display').innerHTML = 
+            '<p class="text-danger">Failed to load logs. Make sure bot.log exists.</p>';
+    }
+}
+
+function escapeHtml(text) {
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return text.replace(/[&<>"']/g, m => map[m]);
+}
+
+// Load logs on page load
+document.addEventListener('DOMContentLoaded', refreshLogs);
+</script>
+{% endblock %}
+

@@ -69,13 +69,14 @@ class Database:
         self._save_json(self.processed_ids_path, self.processed_ids)
         logger.debug(f"Marked as processed: {entry_id}")
     
-    def add_embedding(self, content, embedding):
+    def add_embedding(self, content, embedding, entry_id=None):
         """
         Store an embedding for duplicate detection
         
         Args:
             content: Text content to hash for unique ID
             embedding: List/array of embedding values
+            entry_id: Optional entry ID to link embedding back to original entry
         
         Returns:
             str: Hash key for the stored embedding
@@ -86,7 +87,8 @@ class Database:
         self.embeddings[content_hash] = {
             'embedding': embedding if isinstance(embedding, list) else embedding.tolist(),
             'timestamp': time.time(),
-            'preview': content[:100]  # Store preview for debugging
+            'preview': content[:100],  # Store preview for debugging
+            'entry_id': entry_id  # Store entry_id to link back to message_mapping
         }
         
         self._save_json(self.embeddings_path, self.embeddings)
@@ -184,16 +186,18 @@ class Database:
             'message_mappings': len(self.message_mapping)
         }
     
-    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None):
+    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None):
         """
         Store mapping between Telegram and Discord messages
         
         Args:
-            telegram_entry_id: Full entry ID (e.g., 'telegram_channelname_123')
-            telegram_message_id: Numeric Telegram message ID
+            telegram_entry_id: Full entry ID (e.g., 'telegram_channelname_123' or 'twitter_123')
+            telegram_message_id: Numeric Telegram message ID (or 0 for non-Telegram)
             discord_channel_id: Discord channel ID where message was posted
             discord_message_id: Discord message ID
             content: The message content (for edit comparison)
+            source_url: Original source URL (Twitter/X.com link, etc.)
+            video_urls: List of video URLs (for Twitter entries with videos)
         """
         mapping_key = telegram_entry_id
         self.message_mapping[mapping_key] = {
@@ -201,6 +205,8 @@ class Database:
             'discord_channel_id': discord_channel_id,
             'discord_message_id': discord_message_id,
             'content': content,
+            'source_url': source_url,
+            'video_urls': video_urls if video_urls else [],
             'timestamp': time.time()
         }
         self._save_json(self.message_mapping_path, self.message_mapping)

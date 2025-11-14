@@ -1,0 +1,360 @@
+{% extends "base.html" %}
+
+{% block title %}Database - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-database"></i> Database Tools</h1>
+        <p class="text-muted">Manage database and search entries</p>
+    </div>
+    <div class="col-auto">
+        <button class="btn btn-primary" onclick="refreshDatabase()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+        <button class="btn btn-success" onclick="exportDatabase()">
+            <i class="bi bi-download"></i> Export
+        </button>
+    </div>
+</div>
+
+<!-- Database Stats -->
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">Processed IDs</h5>
+                <h3 id="stat-processed-ids" class="text-primary">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">Embeddings</h5>
+                <h3 id="stat-embeddings" class="text-info">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">Message Mappings</h5>
+                <h3 id="stat-mappings" class="text-success">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Search & Actions -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-search"></i> Search Entries</h5>
+            </div>
+            <div class="card-body">
+                <form onsubmit="event.preventDefault(); searchDatabase();">
+                    <div class="input-group mb-3">
+                        <input 
+                            type="text" 
+                            class="form-control" 
+                            id="search-query" 
+                            placeholder="Search by entry ID or text content..."
+                        >
+                        <button class="btn btn-primary" type="submit">
+                            <i class="bi bi-search"></i> Search
+                        </button>
+                    </div>
+                </form>
+                <p class="text-muted small mb-2">
+                    <i class="bi bi-info-circle"></i> 
+                    You can search by entry ID (e.g., "telegram_123" or "twitter_456") or by any text in the message content.
+                </p>
+                
+                <div id="search-results"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Database Actions -->
+<div class="row">
+    <div class="col-md-6 mb-4">
+        <div class="card border-warning">
+            <div class="card-header bg-warning bg-opacity-10">
+                <h5 class="mb-0"><i class="bi bi-trash"></i> Cleanup Old Entries</h5>
+            </div>
+            <div class="card-body">
+                <p>Remove entries older than the retention period ({{ config.DB_RETENTION_HOURS }} hours).</p>
+                <button class="btn btn-warning" onclick="cleanupDatabase()">
+                    <i class="bi bi-trash"></i> Run Cleanup
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 mb-4">
+        <div class="card border-danger">
+            <div class="card-header bg-danger bg-opacity-10">
+                <h5 class="mb-0"><i class="bi bi-arrow-counterclockwise"></i> Reset Entry</h5>
+            </div>
+            <div class="card-body">
+                <p>Remove a specific entry to allow reprocessing.</p>
+                <form onsubmit="event.preventDefault(); resetEntry();">
+                    <div class="input-group">
+                        <input 
+                            type="text" 
+                            class="form-control" 
+                            id="reset-entry-id" 
+                            placeholder="Entry ID..."
+                        >
+                        <button class="btn btn-danger" type="submit">
+                            <i class="bi bi-arrow-counterclockwise"></i> Reset
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function refreshDatabase() {
+    try {
+        const response = await fetch('/api/stats');
+        const data = await response.json();
+        
+        document.getElementById('stat-processed-ids').textContent = data.database.processed_ids;
+        document.getElementById('stat-embeddings').textContent = data.database.embeddings;
+        document.getElementById('stat-mappings').textContent = data.database.message_mappings;
+    } catch (error) {
+        console.error('Error refreshing database:', error);
+        alert('Failed to refresh database statistics');
+    }
+}
+
+async function searchDatabase() {
+    const query = document.getElementById('search-query').value;
+    const resultsDiv = document.getElementById('search-results');
+    
+    if (!query) {
+        resultsDiv.innerHTML = '';
+        return;
+    }
+    
+    resultsDiv.innerHTML = '<div class="text-center"><span class="spinner-border"></span></div>';
+    
+    try {
+        const response = await fetch(`/api/database/search?q=${encodeURIComponent(query)}`);
+        const data = await response.json();
+        
+        if (data.found) {
+            let html = `<div class="alert alert-success">
+                <h6>Found ${data.count} result${data.count > 1 ? 's' : ''}</h6>
+            </div>`;
+            
+            // Display each result
+            data.results.forEach((result, index) => {
+                const matchTypeLabels = {
+                    'exact_id': 'Exact ID Match',
+                    'partial_id': 'Partial ID Match',
+                    'content': 'Content Match',
+                    'embedding_preview': 'Embedding Preview Match'
+                };
+                
+                const matchTypeBadges = {
+                    'exact_id': 'success',
+                    'partial_id': 'info',
+                    'content': 'primary',
+                    'embedding_preview': 'secondary'
+                };
+                
+                html += `
+                    <div class="card mb-2">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-start mb-2">
+                                <div>
+                                    <span class="badge bg-${matchTypeBadges[result.match_type]} me-2">
+                                        ${matchTypeLabels[result.match_type]}
+                                    </span>
+                                    <code class="text-break">${result.entry_id}</code>
+                                </div>
+                                <div class="btn-group btn-group-sm" role="group">
+                                    <button class="btn btn-outline-success" 
+                                            onclick="reprocessEntryFromSearch('${result.entry_id}')"
+                                            title="Reprocess and post to Discord again">
+                                        <i class="bi bi-arrow-repeat"></i> Reprocess
+                                    </button>
+                                    <button class="btn btn-outline-danger" 
+                                            onclick="fillResetField('${result.entry_id}')"
+                                            title="Reset this entry">
+                                        <i class="bi bi-arrow-counterclockwise"></i> Reset
+                                    </button>
+                                </div>
+                            </div>
+                            <p class="mb-1 text-muted small">
+                                <strong>Processed:</strong> ${new Date(result.timestamp * 1000).toLocaleString()}
+                            </p>
+                            ${result.source_url ? `
+                                <p class="mb-1 small">
+                                    <strong>Source URL:</strong> 
+                                    <a href="${result.source_url}" target="_blank" rel="noopener noreferrer">
+                                        ${result.source_url}
+                                        <i class="bi bi-box-arrow-up-right"></i>
+                                    </a>
+                                </p>
+                            ` : ''}
+                            ${result.preview ? `
+                                <div class="mt-2 p-2 bg-light rounded">
+                                    <small class="text-muted">Preview:</small><br>
+                                    <small>${result.preview}</small>
+                                </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            });
+            
+            resultsDiv.innerHTML = html;
+        } else {
+            resultsDiv.innerHTML = '<div class="alert alert-info">No entries found matching your search</div>';
+        }
+    } catch (error) {
+        console.error('Error searching database:', error);
+        resultsDiv.innerHTML = '<div class="alert alert-danger">Search failed</div>';
+    }
+}
+
+function fillResetField(entryId) {
+    document.getElementById('reset-entry-id').value = entryId;
+    // Scroll to reset section
+    document.getElementById('reset-entry-id').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function cleanupDatabase() {
+    if (!confirm('Are you sure you want to cleanup old entries?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/database/clear', { method: 'POST' });
+        const result = await response.json();
+        
+        if (result.success) {
+            alert('Database cleanup completed successfully');
+            refreshDatabase();
+        } else {
+            alert('Cleanup failed: ' + result.error);
+        }
+    } catch (error) {
+        console.error('Error cleaning database:', error);
+        alert('Failed to cleanup database');
+    }
+}
+
+async function resetEntry() {
+    const entryId = document.getElementById('reset-entry-id').value;
+    
+    if (!entryId) {
+        alert('Please enter an entry ID');
+        return;
+    }
+    
+    if (!confirm(`Are you sure you want to reset entry: ${entryId}?`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/database/reset/${encodeURIComponent(entryId)}`, { 
+            method: 'DELETE' 
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            alert(result.message);
+            document.getElementById('reset-entry-id').value = '';
+            refreshDatabase();
+        } else {
+            alert('Reset failed: ' + result.error);
+        }
+    } catch (error) {
+        console.error('Error resetting entry:', error);
+        alert('Failed to reset entry');
+    }
+}
+
+async function reprocessEntryFromSearch(entryId) {
+    if (!confirm(`Are you sure you want to reprocess and repost this entry?\n\nEntry: ${entryId}\n\nThis will:\n- Extract the content from the database\n- Categorize it again\n- Post it to Discord again\n- Create a new entry ID`)) {
+        return;
+    }
+    
+    // Show loading state
+    const resultsDiv = document.getElementById('search-results');
+    const originalHTML = resultsDiv.innerHTML;
+    
+    try {
+        resultsDiv.innerHTML = '<div class="text-center my-4"><span class="spinner-border"></span><p class="mt-2">Reprocessing entry...</p></div>';
+        
+        const response = await fetch(`/api/database/reprocess/${encodeURIComponent(entryId)}`, { 
+            method: 'POST' 
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            let message = `✅ Entry successfully reprocessed!\n\n`;
+            message += `Category: ${result.category}\n`;
+            message += `Discord Message ID: ${result.discord_message_id}\n`;
+            message += `New Entry ID: ${result.new_entry_id}\n`;
+            if (result.duplicate_warning) {
+                message += `\n⚠️ ${result.duplicate_warning}`;
+            }
+            alert(message);
+            refreshDatabase();
+            // Restore search results
+            resultsDiv.innerHTML = originalHTML;
+        } else {
+            alert('❌ Reprocess failed:\n\n' + result.error);
+            resultsDiv.innerHTML = originalHTML;
+        }
+    } catch (error) {
+        console.error('Error reprocessing entry:', error);
+        alert('Failed to reprocess entry: ' + error.message);
+        resultsDiv.innerHTML = originalHTML;
+    }
+}
+
+async function exportDatabase() {
+    try {
+        const response = await fetch('/api/database/export');
+        const data = await response.json();
+        
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `newsbot-database-${Date.now()}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+    } catch (error) {
+        console.error('Error exporting database:', error);
+        alert('Failed to export database');
+    }
+}
+
+// Load stats on page load
+document.addEventListener('DOMContentLoaded', refreshDatabase);
+</script>
+{% endblock %}
+

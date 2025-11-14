@@ -95,6 +95,54 @@ def cleanup_temp_files(temp_dir):
     except Exception as e:
         logger.error(f"Error cleaning up temp directory {temp_dir}: {e}")
 
+
+def cleanup_old_media_files(media_dir="temp_media", retention_days=2):
+    """
+    Clean up media files older than retention_days
+    
+    Args:
+        media_dir: Path to media directory (default: "temp_media")
+        retention_days: Number of days to keep files (default: 2)
+    """
+    try:
+        media_path = Path(media_dir)
+        if not media_path.exists():
+            return
+        
+        cutoff_time = time.time() - (retention_days * 24 * 3600)
+        deleted_count = 0
+        
+        # Iterate through all subdirectories in temp_media
+        for entry_dir in media_path.iterdir():
+            if entry_dir.is_dir():
+                # Check the modification time of the directory
+                # Use the most recent file modification time as the directory age
+                dir_mtime = entry_dir.stat().st_mtime
+                
+                # Also check files in the directory
+                file_mtimes = []
+                for file_path in entry_dir.rglob("*"):
+                    if file_path.is_file():
+                        file_mtimes.append(file_path.stat().st_mtime)
+                
+                # Use the most recent modification time (directory or any file)
+                most_recent = max([dir_mtime] + file_mtimes) if file_mtimes else dir_mtime
+                
+                # Delete if older than retention period
+                if most_recent < cutoff_time:
+                    try:
+                        shutil.rmtree(entry_dir)
+                        deleted_count += 1
+                        logger.debug(f"Cleaned up old media directory: {entry_dir}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning up media directory {entry_dir}: {e}")
+        
+        if deleted_count > 0:
+            logger.info(f"Cleaned up {deleted_count} old media directories (older than {retention_days} days)")
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up old media files: {e}")
+
 def ensure_directory(directory):
     """
     Ensure a directory exists, create it if it doesn't
@@ -252,7 +300,6 @@ def clean_text_content(text):
 def remove_emojis(text):
     """
     Remove all emoji characters from text and clean up leftover whitespace
-    Also removes question marks that result from emoji encoding issues
     
     Args:
         text: Text containing emojis
@@ -264,24 +311,6 @@ def remove_emojis(text):
         return text
     
     import re
-    
-    # First, remove question marks at the very start of text (likely emoji replacements)
-    text = re.sub(r'^\?+\s*', '', text)
-    
-    # Remove sequences of multiple question marks anywhere (likely emoji replacements)
-    # This catches cases like "??" or "???" that result from encoding issues
-    text = re.sub(r'\?{2,}', '', text)
-    
-    # Remove standalone question marks before common news/announcement patterns
-    # (likely emoji replacements in patterns like "? JUST IN", "? BREAKING", etc.)
-    text = re.sub(r'\?\s*(JUST IN|BREAKING|NEW|UPDATE|ALERT|ANNOUNCEMENT|TRUMP|BIDEN)', r'\1', text, flags=re.IGNORECASE)
-    
-    # Remove standalone question marks that appear after colons/punctuation
-    # (likely emoji replacements in patterns like "JUST IN: ?")
-    text = re.sub(r'(:\s*)\?+(\s|$)', r'\1', text)
-    
-    # Remove question marks at the start of lines
-    text = re.sub(r'^[\?\s]+', '', text, flags=re.MULTILINE)
     
     # Comprehensive emoji pattern covering various Unicode ranges
     emoji_pattern = re.compile(
@@ -313,6 +342,52 @@ def remove_emojis(text):
     lines = text.split('\n')
     cleaned_lines = [line.strip() for line in lines if line.strip()]
     text = '\n'.join(cleaned_lines)
+    
+    # Strip leading and trailing whitespace
+    text = text.strip()
+    
+    return text
+
+def remove_corrupted_emoji_marks(text):
+    """
+    Remove question marks that are corrupted emoji characters.
+    These appear as standalone question marks where emojis used to be.
+    
+    Examples:
+        "?NEW: @unruggable_io..." -> "NEW: @unruggable_io..."
+        "?? The Seeker Airdrop..." -> "The Seeker Airdrop..."
+        "JUST IN: ?? SoFi becomes..." -> "JUST IN: SoFi becomes..."
+    
+    Args:
+        text: Text potentially containing corrupted emoji question marks
+    
+    Returns:
+        str: Text with corrupted emoji question marks removed
+    """
+    if not text:
+        return text
+    
+    import re
+    
+    # Remove question marks at the start of text
+    text = re.sub(r'^\?+', '', text)
+    
+    # Remove question marks after whitespace and before a capital letter
+    # This catches patterns like " ?NEW:" or " ?? SoFi"
+    text = re.sub(r'\s+\?+([A-Z])', r' \1', text)
+    
+    # Remove question marks that appear after a colon and before a capital letter
+    # This catches patterns like "JUST IN: ?? SoFi"
+    text = re.sub(r':\s*\?+([A-Z])', r': \1', text)
+    
+    # Remove multiple consecutive question marks anywhere (but preserve single ? in context)
+    # Only remove if they're standalone (surrounded by spaces or at start/end)
+    text = re.sub(r'\s+\?{2,}\s+', ' ', text)  # Multiple ? with spaces around
+    text = re.sub(r'^\?{2,}\s+', '', text)  # Multiple ? at start
+    text = re.sub(r'\s+\?{2,}$', '', text)  # Multiple ? at end
+    
+    # Clean up any double spaces left behind
+    text = re.sub(r' +', ' ', text)
     
     # Strip leading and trailing whitespace
     text = text.strip()

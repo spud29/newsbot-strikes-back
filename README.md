@@ -85,6 +85,37 @@ The bot will:
 - Post to appropriate Discord channels
 - Log all activities to `bot.log` and console
 
+## Web Dashboard (Optional)
+
+A web-based monitoring and management dashboard is available:
+
+**Features:**
+- Real-time bot and Ollama status monitoring
+- View recent activity and processing statistics
+- Browse and filter error logs
+- Test content categorization manually
+- View configuration and manage database
+- Search, export, and reset database entries
+
+**Quick Start:**
+```bash
+# Install dashboard dependencies
+pip install fastapi uvicorn jinja2 python-multipart
+
+# Add to .env file:
+# DASHBOARD_USERNAME=admin
+# DASHBOARD_PASSWORD=your_secure_password
+
+# Run dashboard (in separate terminal while bot is running)
+uvicorn dashboard:app --reload --port 8000
+
+# Access at: http://localhost:8000
+```
+
+**Documentation:**
+- See `DASHBOARD.md` for full documentation
+- See `DASHBOARD_QUICKSTART.md` for quick setup guide
+
 ## Categories
 
 The bot can categorize content into:

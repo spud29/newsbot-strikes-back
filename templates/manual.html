@@ -1,0 +1,393 @@
+{% extends "base.html" %}
+
+{% block title %}Manual Processing - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-play-circle"></i> Manual Processing</h1>
+        <p class="text-muted">Test categorization and manually process content</p>
+    </div>
+</div>
+
+<!-- Test Categorization -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-lightbulb"></i> Test Categorization</h5>
+            </div>
+            <div class="card-body">
+                <form id="test-form" onsubmit="event.preventDefault(); testCategory();">
+                    <div class="mb-3">
+                        <label for="test-text" class="form-label">Text Content</label>
+                        <textarea 
+                            class="form-control" 
+                            id="test-text" 
+                            rows="6" 
+                            placeholder="Paste text content here to test categorization..."
+                            required
+                        ></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-magic"></i> Test Category
+                    </button>
+                </form>
+                
+                <div id="test-result" class="mt-4" style="display: none;">
+                    <hr>
+                    <h6>Results:</h6>
+                    <div id="test-result-content"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Manual URL Processing -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header bg-primary bg-opacity-10">
+                <h5 class="mb-0"><i class="bi bi-link-45deg"></i> Manual URL Processing</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    Process a Twitter/X or Telegram URL through the full bot pipeline and view detailed debug information. 
+                    <strong>Note:</strong> This will NOT post to Discord.
+                </p>
+                
+                <form id="manual-form" onsubmit="event.preventDefault(); processURL();">
+                    <div class="mb-3">
+                        <label for="manual-url" class="form-label">Twitter or Telegram URL</label>
+                        <input 
+                            type="text" 
+                            class="form-control" 
+                            id="manual-url" 
+                            placeholder="https://twitter.com/user/status/123456 or https://t.me/channel/123"
+                            required
+                        >
+                        <div class="form-text">
+                            Supported: Twitter/X status URLs (twitter.com or x.com) and Telegram message URLs (t.me)
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="process-btn">
+                        <i class="bi bi-play-fill"></i> Process URL
+                    </button>
+                </form>
+                
+                <div id="url-result" class="mt-4" style="display: none;">
+                    <hr>
+                    <div id="url-result-content"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function testCategory() {
+    const text = document.getElementById('test-text').value;
+    const resultDiv = document.getElementById('test-result');
+    const contentDiv = document.getElementById('test-result-content');
+    
+    // Show loading
+    resultDiv.style.display = 'block';
+    contentDiv.innerHTML = '<div class="text-center"><span class="spinner-border"></span></div>';
+    
+    try {
+        const formData = new FormData();
+        formData.append('text', text);
+        
+        const response = await fetch('/api/test-category', {
+            method: 'POST',
+            body: formData
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            let html = '<div class="row">';
+            
+            // Category
+            html += `<div class="col-md-6">
+                <div class="card mb-3">
+                    <div class="card-body">
+                        <h6 class="card-title">Category</h6>
+                        <h4><span class="badge bg-primary">${result.category}</span></h4>
+                    </div>
+                </div>
+            </div>`;
+            
+            // Duplicate Check
+            html += `<div class="col-md-6">
+                <div class="card mb-3">
+                    <div class="card-body">
+                        <h6 class="card-title">Duplicate Check</h6>`;
+            
+            if (result.is_duplicate) {
+                html += `<h4><span class="badge bg-danger">DUPLICATE</span></h4>
+                    <p class="mb-0 small">Similarity: ${(result.duplicate_similarity * 100).toFixed(1)}%</p>`;
+                if (result.match_preview) {
+                    html += `<p class="mb-0 small text-muted mt-2">Matches: "${result.match_preview}"</p>`;
+                }
+            } else if (result.is_similar) {
+                html += `<h4><span class="badge bg-warning">SIMILAR</span></h4>
+                    <p class="mb-0 small">Similarity: ${(result.similar_score * 100).toFixed(1)}%</p>`;
+                if (result.match_preview) {
+                    html += `<p class="mb-0 small text-muted mt-2">Similar to: "${result.match_preview}"</p>`;
+                }
+            } else {
+                html += `<h4><span class="badge bg-success">UNIQUE</span></h4>
+                    <p class="mb-0 small">No similar content found</p>`;
+            }
+            
+            html += `</div></div></div></div>`;
+            
+            contentDiv.innerHTML = html;
+        } else {
+            contentDiv.innerHTML = `<div class="alert alert-danger">Error: ${result.error}</div>`;
+        }
+    } catch (error) {
+        console.error('Error testing category:', error);
+        contentDiv.innerHTML = '<div class="alert alert-danger">Failed to test categorization</div>';
+    }
+}
+
+async function processURL() {
+    const url = document.getElementById('manual-url').value;
+    const resultDiv = document.getElementById('url-result');
+    const contentDiv = document.getElementById('url-result-content');
+    const processBtn = document.getElementById('process-btn');
+    
+    // Show loading
+    resultDiv.style.display = 'block';
+    processBtn.disabled = true;
+    processBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing...';
+    contentDiv.innerHTML = '<div class="text-center py-4"><div class="spinner-border text-primary"></div><p class="mt-3 text-muted">Processing URL through pipeline...</p></div>';
+    
+    try {
+        const formData = new FormData();
+        formData.append('url', url);
+        
+        const response = await fetch('/api/process-url', {
+            method: 'POST',
+            body: formData
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            contentDiv.innerHTML = renderURLResult(result);
+        } else {
+            contentDiv.innerHTML = `<div class="alert alert-danger">
+                <h5 class="alert-heading"><i class="bi bi-x-circle"></i> Processing Failed</h5>
+                <p class="mb-0">${result.error || 'Unknown error occurred'}</p>
+            </div>`;
+        }
+    } catch (error) {
+        console.error('Error processing URL:', error);
+        contentDiv.innerHTML = `<div class="alert alert-danger">
+            <h5 class="alert-heading"><i class="bi bi-x-circle"></i> Request Failed</h5>
+            <p class="mb-0">Failed to process URL. Please check the console for details.</p>
+        </div>`;
+    } finally {
+        processBtn.disabled = false;
+        processBtn.innerHTML = '<i class="bi bi-play-fill"></i> Process URL';
+    }
+}
+
+function renderURLResult(result) {
+    let html = '<div class="url-processing-result">';
+    
+    // Success banner
+    html += `<div class="alert alert-success mb-4">
+        <h5 class="alert-heading"><i class="bi bi-check-circle"></i> Processing Complete</h5>
+        <p class="mb-0">URL processed successfully through the full pipeline</p>
+    </div>`;
+    
+    // Overview cards
+    html += '<div class="row mb-4">';
+    
+    // Source info card
+    html += `<div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h6 class="card-title text-muted mb-2"><i class="bi bi-info-circle"></i> Source</h6>
+                <p class="mb-1"><strong>${result.source_type.toUpperCase()}</strong></p>
+                <p class="mb-0 small text-muted text-break">${result.url}</p>
+            </div>
+        </div>
+    </div>`;
+    
+    // Category card
+    html += `<div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h6 class="card-title text-muted mb-2"><i class="bi bi-tag"></i> Category</h6>
+                <h4><span class="badge bg-primary">${result.category || 'N/A'}</span></h4>
+            </div>
+        </div>
+    </div>`;
+    
+    // Media info card
+    html += `<div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h6 class="card-title text-muted mb-2"><i class="bi bi-image"></i> Media</h6>
+                <p class="mb-1">Files: <strong>${result.media_files || 0}</strong></p>
+                <p class="mb-0">Videos: <strong>${result.video_urls ? result.video_urls.length : 0}</strong></p>
+            </div>
+        </div>
+    </div>`;
+    
+    html += '</div>';
+    
+    // Media preview section (if images are available)
+    if (result.media_urls && result.media_urls.length > 0) {
+        html += '<div class="card mb-4">';
+        html += '<div class="card-header"><h6 class="mb-0"><i class="bi bi-images"></i> Media Preview</h6></div>';
+        html += '<div class="card-body">';
+        html += '<div class="row g-3">';
+        
+        result.media_urls.forEach((url, index) => {
+            html += `<div class="col-md-6 col-lg-4">
+                <div class="media-preview-card">
+                    <img src="${url}" class="img-fluid rounded" alt="Image ${index + 1}" loading="lazy" 
+                         style="max-height: 300px; width: 100%; object-fit: contain; background: #f8f9fa; cursor: pointer;"
+                         onclick="window.open('${url}', '_blank')"
+                         onerror="this.onerror=null; this.src='data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'400\' height=\'300\'%3E%3Crect fill=\'%23ddd\' width=\'400\' height=\'300\'/%3E%3Ctext fill=\'%23999\' font-family=\'sans-serif\' font-size=\'18\' x=\'50%25\' y=\'50%25\' text-anchor=\'middle\' dominant-baseline=\'middle\'%3EImage not available%3C/text%3E%3C/svg%3E';">
+                    <div class="text-center mt-2">
+                        <small class="text-muted">Image ${index + 1}</small>
+                    </div>
+                </div>
+            </div>`;
+        });
+        
+        html += '</div></div></div>';
+    }
+    
+    // Duplicate check section
+    if (result.duplicate_check) {
+        const dc = result.duplicate_check;
+        html += '<div class="card mb-4">';
+        html += '<div class="card-header"><h6 class="mb-0"><i class="bi bi-files"></i> Duplicate Detection</h6></div>';
+        html += '<div class="card-body">';
+        
+        if (dc.is_duplicate) {
+            html += `<div class="alert alert-danger mb-0">
+                <h5 class="alert-heading">DUPLICATE DETECTED</h5>
+                <p class="mb-2">Similarity: <strong>${(dc.duplicate_similarity * 100).toFixed(1)}%</strong></p>`;
+            if (dc.duplicate_match) {
+                html += `<hr><p class="mb-0 small"><strong>Matches:</strong> "${dc.duplicate_match}"</p>`;
+            }
+            html += '</div>';
+        } else if (dc.is_similar) {
+            html += `<div class="alert alert-warning mb-0">
+                <h5 class="alert-heading">SIMILAR CONTENT</h5>
+                <p class="mb-2">Similarity: <strong>${(dc.similar_similarity * 100).toFixed(1)}%</strong></p>`;
+            if (dc.similar_match) {
+                html += `<hr><p class="mb-0 small"><strong>Similar to:</strong> "${dc.similar_match}"</p>`;
+            }
+            html += '</div>';
+        } else {
+            html += `<div class="alert alert-success mb-0">
+                <h5 class="alert-heading">UNIQUE CONTENT</h5>
+                <p class="mb-0">No similar or duplicate content found in database</p>
+            </div>`;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    // Content section (collapsible)
+    html += '<div class="card mb-4">';
+    html += `<div class="card-header" role="button" data-bs-toggle="collapse" data-bs-target="#content-section">
+        <h6 class="mb-0"><i class="bi bi-file-text"></i> Extracted Content <i class="bi bi-chevron-down float-end"></i></h6>
+    </div>`;
+    html += '<div id="content-section" class="collapse show">';
+    html += '<div class="card-body">';
+    if (result.content) {
+        html += `<pre class="content-preview">${escapeHtml(result.content)}</pre>`;
+    } else {
+        html += '<p class="text-muted mb-0">No text content extracted</p>';
+    }
+    html += '</div></div></div>';
+    
+    // OCR text section (collapsible, only if present)
+    if (result.ocr_text) {
+        html += '<div class="card mb-4">';
+        html += `<div class="card-header" role="button" data-bs-toggle="collapse" data-bs-target="#ocr-section">
+            <h6 class="mb-0"><i class="bi bi-card-image"></i> OCR Extracted Text <i class="bi bi-chevron-down float-end"></i></h6>
+        </div>`;
+        html += '<div id="ocr-section" class="collapse">';
+        html += '<div class="card-body">';
+        html += `<pre class="content-preview">${escapeHtml(result.ocr_text)}</pre>`;
+        html += '</div></div></div>';
+    }
+    
+    // Processing steps section (collapsible)
+    html += '<div class="card mb-4">';
+    html += `<div class="card-header" role="button" data-bs-toggle="collapse" data-bs-target="#steps-section">
+        <h6 class="mb-0"><i class="bi bi-list-check"></i> Processing Steps <i class="bi bi-chevron-down float-end"></i></h6>
+    </div>`;
+    html += '<div id="steps-section" class="collapse">';
+    html += '<div class="card-body">';
+    
+    if (result.steps && result.steps.length > 0) {
+        html += '<div class="list-group">';
+        result.steps.forEach(step => {
+            const statusIcon = step.status === 'success' ? 'check-circle text-success' : 'x-circle text-danger';
+            const statusClass = step.status === 'success' ? 'list-group-item-success' : 'list-group-item-danger';
+            
+            html += `<div class="list-group-item ${statusClass}">
+                <div class="d-flex justify-content-between align-items-start">
+                    <div class="flex-grow-1">
+                        <h6 class="mb-1"><i class="bi bi-${statusIcon}"></i> ${step.name}</h6>`;
+            
+            if (step.status === 'success' && step.data) {
+                html += '<small class="text-muted">';
+                for (const [key, value] of Object.entries(step.data)) {
+                    if (typeof value === 'object') continue; // Skip complex objects
+                    html += `${key}: <strong>${value}</strong> | `;
+                }
+                html += '</small>';
+            }
+            
+            if (step.error) {
+                html += `<small class="text-danger">${escapeHtml(step.error)}</small>`;
+            }
+            
+            html += `</div>
+                    <span class="badge bg-secondary">${step.duration.toFixed(2)}s</span>
+                </div>
+            </div>`;
+        });
+        html += '</div>';
+    } else {
+        html += '<p class="text-muted mb-0">No processing steps recorded</p>';
+    }
+    
+    html += '</div></div></div>';
+    
+    html += '</div>'; // Close url-processing-result
+    
+    return html;
+}
+
+function escapeHtml(text) {
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return text.replace(/[&<>"']/g, m => map[m]);
+}
+</script>
+{% endblock %}
+
