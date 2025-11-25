@@ -67,6 +67,63 @@
     </div>
 </div>
 
+<!-- Retry Queue Status -->
+<div class="row mb-4" id="retry-queue-section" style="display: none;">
+    <div class="col-12">
+        <div class="card border-secondary">
+            <div class="card-header bg-secondary text-white">
+                <h5 class="mb-0">
+                    <i class="bi bi-arrow-repeat"></i> Retry Queue
+                    <span class="badge bg-light text-dark ms-2" id="retry-queue-count">0</span>
+                </h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    <i class="bi bi-info-circle"></i> 
+                    Entries that failed gallery-dl extraction are automatically queued for retry (max 3 attempts).
+                </p>
+                <div id="retry-queue-entries">
+                    <div class="text-center text-muted">
+                        <span class="spinner-border spinner-border-sm"></span> Loading retry queue...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Bot Control -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-danger">
+            <div class="card-header bg-danger text-white">
+                <h5 class="mb-0"><i class="bi bi-gear-fill"></i> Emergency Bot Controls</h5>
+            </div>
+            <div class="card-body">
+                <div class="row align-items-center">
+                    <div class="col-md-6">
+                        <h6 class="text-muted mb-2">Bot Process Status</h6>
+                        <div id="bot-process-status">
+                            <span class="spinner-border spinner-border-sm"></span> Checking status...
+                        </div>
+                        <div id="bot-process-details" class="mt-2 small text-muted"></div>
+                    </div>
+                    <div class="col-md-6 text-md-end mt-3 mt-md-0">
+                        <button id="restart-bot-btn" class="btn btn-danger btn-lg" onclick="restartBot()" disabled>
+                            <i class="bi bi-arrow-clockwise"></i> Restart Bot
+                        </button>
+                    </div>
+                </div>
+                <div class="alert alert-warning mt-3 mb-0">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    <strong>Warning:</strong> This will immediately terminate and restart the bot process. 
+                    Any in-progress operations will be interrupted. Use only if the bot is unresponsive or crashed.
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Sources Overview -->
 <div class="row mb-4">
     <div class="col-md-6">
@@ -141,8 +198,199 @@
 
 {% block extra_js %}
 <script>
+async function checkBotStatus() {
+    try {
+        const response = await fetch('/api/bot/status');
+        const status = await response.json();
+        
+        const statusDiv = document.getElementById('bot-process-status');
+        const detailsDiv = document.getElementById('bot-process-details');
+        const restartBtn = document.getElementById('restart-bot-btn');
+        
+        if (status.running) {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-success"><i class="bi bi-check-circle-fill"></i> Running</span></h5>';
+            detailsDiv.textContent = `Process ID: ${status.pid || 'N/A'}`;
+            restartBtn.disabled = false;
+        } else {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-x-circle-fill"></i> Stopped</span></h5>';
+            detailsDiv.textContent = status.message || 'Bot is not running';
+            restartBtn.disabled = false;
+            restartBtn.innerHTML = '<i class="bi bi-play-fill"></i> Start Bot';
+        }
+    } catch (error) {
+        console.error('Error checking bot status:', error);
+        const statusDiv = document.getElementById('bot-process-status');
+        statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-warning"><i class="bi bi-exclamation-triangle-fill"></i> Unknown</span></h5>';
+        document.getElementById('restart-bot-btn').disabled = true;
+    }
+}
+
+async function restartBot() {
+    if (!confirm('Are you sure you want to restart the bot? This will immediately terminate the current bot process and start a new one.')) {
+        return;
+    }
+    
+    const statusDiv = document.getElementById('bot-process-status');
+    const restartBtn = document.getElementById('restart-bot-btn');
+    
+    // Show loading state
+    statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-warning"><i class="bi bi-arrow-clockwise"></i> Restarting...</span></h5>';
+    restartBtn.disabled = true;
+    restartBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Restarting...';
+    
+    try {
+        const response = await fetch('/api/bot/restart', {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-success"><i class="bi bi-check-circle-fill"></i> Restarted Successfully</span></h5>';
+            document.getElementById('bot-process-details').textContent = `New Process ID: ${result.new_pid || 'N/A'}`;
+            
+            // Show success alert
+            const alertHtml = `
+                <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                    <i class="bi bi-check-circle-fill"></i> <strong>Success!</strong> Bot has been restarted successfully.
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            document.querySelector('.card-body .alert-warning').insertAdjacentHTML('afterend', alertHtml);
+            
+            // Wait a moment then refresh status
+            setTimeout(() => {
+                checkBotStatus();
+            }, 2000);
+        } else {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-x-circle-fill"></i> Restart Failed</span></h5>';
+            document.getElementById('bot-process-details').textContent = result.error || 'Unknown error';
+            
+            // Show error alert
+            const alertHtml = `
+                <div class="alert alert-danger alert-dismissible fade show mt-3" role="alert">
+                    <i class="bi bi-x-circle-fill"></i> <strong>Error!</strong> ${result.error || 'Failed to restart bot'}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            document.querySelector('.card-body .alert-warning').insertAdjacentHTML('afterend', alertHtml);
+            
+            restartBtn.disabled = false;
+            restartBtn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Restart Bot';
+        }
+    } catch (error) {
+        console.error('Error restarting bot:', error);
+        statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-x-circle-fill"></i> Error</span></h5>';
+        document.getElementById('bot-process-details').textContent = 'Failed to communicate with server';
+        restartBtn.disabled = false;
+        restartBtn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Restart Bot';
+        
+        alert('Failed to restart bot: ' + error.message);
+    }
+}
+
+async function loadRetryQueue() {
+    try {
+        const response = await fetch('/api/retry-queue');
+        const data = await response.json();
+        
+        if (!data.success) {
+            console.error('Failed to load retry queue:', data.error);
+            return;
+        }
+        
+        const retrySection = document.getElementById('retry-queue-section');
+        const retryCount = document.getElementById('retry-queue-count');
+        const entriesDiv = document.getElementById('retry-queue-entries');
+        
+        const totalEntries = data.stats.total_entries || 0;
+        
+        // Show/hide retry queue section
+        if (totalEntries > 0) {
+            retrySection.style.display = 'block';
+            retryCount.textContent = totalEntries;
+            
+            // Build entries table
+            let html = `
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover">
+                        <thead>
+                            <tr>
+                                <th>Entry ID</th>
+                                <th>Source</th>
+                                <th>Attempts</th>
+                                <th>Content Preview</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.entries.forEach(entry => {
+                const sourceIcon = entry.source_type === 'twitter' ? 'bi-twitter' : 'bi-telegram';
+                const attemptBadge = entry.retry_count >= 3 ? 'bg-danger' : 
+                                    entry.retry_count === 2 ? 'bg-warning' : 'bg-info';
+                
+                html += `
+                    <tr>
+                        <td><code class="small">${entry.entry_id}</code></td>
+                        <td><i class="bi ${sourceIcon}"></i> ${entry.source}</td>
+                        <td>
+                            <span class="badge ${attemptBadge}">${entry.retry_count}/3</span>
+                        </td>
+                        <td class="small text-muted">${entry.content_preview}</td>
+                        <td>
+                            ${entry.link ? `<a href="${entry.link}" target="_blank" class="btn btn-sm btn-outline-primary me-1"><i class="bi bi-link-45deg"></i></a>` : ''}
+                            <button class="btn btn-sm btn-outline-danger" onclick="removeFromRetryQueue('${entry.entry_id}')">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            entriesDiv.innerHTML = html;
+        } else {
+            retrySection.style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading retry queue:', error);
+    }
+}
+
+async function removeFromRetryQueue(entryId) {
+    if (!confirm(`Remove ${entryId} from retry queue? It will not be retried.`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/retry-queue/${encodeURIComponent(entryId)}`, {
+            method: 'DELETE'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            // Reload retry queue
+            await loadRetryQueue();
+        } else {
+            alert('Failed to remove entry: ' + (result.error || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('Error removing from retry queue:', error);
+        alert('Failed to remove entry: ' + error.message);
+    }
+}
+
 async function refreshStats() {
     try {
+        // Check bot process status
+        await checkBotStatus();
+        
         // Fetch health status
         const healthResponse = await fetch('/api/health');
         const health = await healthResponse.json();
@@ -160,6 +408,9 @@ async function refreshStats() {
         // Fetch statistics
         const statsResponse = await fetch('/api/stats');
         const stats = await statsResponse.json();
+        
+        // Load retry queue
+        await loadRetryQueue();
         
         document.getElementById('processed-24h').textContent = stats.processed_24h;
         document.getElementById('db-size').textContent = 

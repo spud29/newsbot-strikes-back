@@ -13,8 +13,12 @@ from database import Database
 from ollama_client import OllamaClient
 from rss_poller import RSSPoller
 from telegram_poller import TelegramPoller
-from media_handler import MediaHandler
+from media_handler import MediaHandler, GalleryDlFailure
 from discord_poster import DiscordPoster
+from retry_queue import RetryQueue
+from perplexity_client import PerplexityClient
+from vote_tracker import VoteTracker
+from removed_entries import RemovedEntriesDB
 
 class NewsAggregatorBot:
     """Main bot orchestrator"""
@@ -26,17 +30,22 @@ class NewsAggregatorBot:
         logger.info("=" * 80)
         
         self.db = Database()
-        self.ollama = OllamaClient()
+        self.vote_tracker = VoteTracker()
+        self.removed_entries_db = RemovedEntriesDB()
+        self.ollama = OllamaClient(removed_entries_db=self.removed_entries_db)
+        self.perplexity = PerplexityClient()
         self.rss_poller = RSSPoller()
         self.telegram_poller = TelegramPoller()
         self.media_handler = MediaHandler(telegram_client=self.telegram_poller)
-        self.discord_poster = DiscordPoster()
+        self.discord_poster = DiscordPoster(
+            perplexity_client=self.perplexity,
+            database=self.db,
+            vote_tracker=self.vote_tracker,
+            removed_entries_db=self.removed_entries_db
+        )
+        self.retry_queue = RetryQueue(max_retries=3, retry_delay_cycles=2)
         
         self.running = False
-        
-        # Process management for dashboard and ngrok
-        self.uvicorn_process = None
-        self.ngrok_process = None
         
         # Statistics
         self.stats = {
@@ -48,79 +57,24 @@ class NewsAggregatorBot:
         
         logger.info("All components initialized")
     
-    def start_uvicorn(self):
-        """Start uvicorn server for dashboard"""
-        try:
-            logger.info("Starting uvicorn dashboard server...")
-            # Start uvicorn as a subprocess
-            # Don't capture stdout/stderr so logs appear in terminal
-            self.uvicorn_process = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "dashboard:app", "--host", "0.0.0.0", "--port", "8000"],
-                stdout=None,  # Let it go to terminal
-                stderr=None,  # Let it go to terminal
-                cwd=os.getcwd()
-            )
-            logger.info("✓ Dashboard server started on http://0.0.0.0:8000")
-        except Exception as e:
-            logger.error(f"Failed to start uvicorn: {e}")
-    
-    def start_ngrok(self):
-        """Start ngrok tunnel for remote access"""
-        try:
-            logger.info("Starting ngrok tunnel...")
-            # Start ngrok as a subprocess
-            self.ngrok_process = subprocess.Popen(
-                ["ngrok", "http", "8000"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            logger.info("✓ Ngrok tunnel started (check http://127.0.0.1:4040 for public URL)")
-        except Exception as e:
-            logger.error(f"Failed to start ngrok: {e}")
-            logger.info("Note: Make sure ngrok is installed and in your PATH")
-    
-    def stop_uvicorn(self):
-        """Stop uvicorn server"""
-        if self.uvicorn_process:
-            try:
-                logger.info("Stopping uvicorn dashboard server...")
-                self.uvicorn_process.terminate()
-                self.uvicorn_process.wait(timeout=5)
-                logger.info("✓ Dashboard server stopped")
-            except subprocess.TimeoutExpired:
-                logger.warning("Uvicorn didn't stop gracefully, killing process...")
-                self.uvicorn_process.kill()
-            except Exception as e:
-                logger.error(f"Error stopping uvicorn: {e}")
-    
-    def stop_ngrok(self):
-        """Stop ngrok tunnel"""
-        if self.ngrok_process:
-            try:
-                logger.info("Stopping ngrok tunnel...")
-                self.ngrok_process.terminate()
-                self.ngrok_process.wait(timeout=5)
-                logger.info("✓ Ngrok tunnel stopped")
-            except subprocess.TimeoutExpired:
-                logger.warning("Ngrok didn't stop gracefully, killing process...")
-                self.ngrok_process.kill()
-            except Exception as e:
-                logger.error(f"Error stopping ngrok: {e}")
-    
     async def start(self):
         """Start the bot"""
         logger.info("Starting bot...")
+        
+        # Write PID file for dashboard management
+        pid_file = os.path.join("data", "bot.pid")
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(pid_file, "w") as f:
+                f.write(str(os.getpid()))
+            logger.info(f"PID file created: {pid_file} (PID: {os.getpid()})")
+        except Exception as e:
+            logger.error(f"Failed to write PID file: {e}")
         
         # Health check Ollama
         if not self.ollama.health_check():
             logger.error("Ollama health check failed! Please ensure Ollama is running.")
             return
-        
-        # Start uvicorn dashboard
-        self.start_uvicorn()
-        
-        # Start ngrok tunnel
-        self.start_ngrok()
         
         # Start Discord client
         await self.discord_poster.start()
@@ -140,9 +94,14 @@ class NewsAggregatorBot:
         await self.telegram_poller.stop()
         await self.discord_poster.stop()
         
-        # Stop uvicorn and ngrok
-        self.stop_uvicorn()
-        self.stop_ngrok()
+        # Clean up PID file
+        pid_file = os.path.join("data", "bot.pid")
+        try:
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+                logger.info("PID file cleaned up")
+        except Exception as e:
+            logger.error(f"Failed to remove PID file: {e}")
         
         logger.info("Bot stopped")
     
@@ -176,7 +135,18 @@ class NewsAggregatorBot:
             if source_type == 'telegram' and not content and entry.get('has_media'):
                 logger.info(f"Image-only Telegram entry detected, downloading media for OCR...")
                 entry = await self.media_handler.download_telegram_media(entry)
+                media_files = entry.get('media_files', [])
                 ocr_text = entry.get('ocr_text', '')
+                
+                # BUGFIX: If this is an image-only entry but download failed, skip it entirely
+                if not media_files:
+                    logger.error(
+                        f"Image-only Telegram entry has no media files after download! "
+                        f"Entry ID: {entry_id}, has_media: {entry.get('has_media')}, "
+                        f"media_type: {entry.get('media_type')}. Skipping this entry."
+                    )
+                    self.stats['errors'] += 1
+                    return False
                 
                 if ocr_text:
                     # Use OCR text as the content for image-only entries
@@ -188,7 +158,7 @@ class NewsAggregatorBot:
                     # This allows image-only posts to still be processed
                     content = "[Image content - no text extracted]"
                     entry['content'] = content
-                    logger.info(f"No OCR text available, using placeholder content for image-only entry")
+                    logger.info(f"No OCR text available, using placeholder content for image-only entry with {len(media_files)} media file(s)")
             
             if not content:
                 logger.warning(f"No content to process for: {entry_id}")
@@ -273,7 +243,8 @@ class NewsAggregatorBot:
                 content=content,
                 media_files=media_files,
                 video_urls=video_urls,
-                source_type=source_type
+                source_type=source_type,
+                entry_id=entry_id
             )
             
             if success:
@@ -308,7 +279,8 @@ class NewsAggregatorBot:
                         discord_message_id=discord_message_id,
                         content=content,
                         source_url=source_url,
-                        video_urls=entry.get('video_urls', [])
+                        video_urls=entry.get('video_urls', []),
+                        category=category
                     )
                 
                 # Update last message ID for Telegram entries
@@ -331,6 +303,20 @@ class NewsAggregatorBot:
             
             return success
             
+        except GalleryDlFailure as e:
+            # gallery-dl failed to extract content - add to retry queue
+            logger.warning(f"gallery-dl failure for {entry.get('id', 'unknown')}: {e}")
+            self.retry_queue.add_entry(entry)
+            self.stats['errors'] += 1
+            
+            # Clean up on error
+            try:
+                self.media_handler.cleanup_entry_media(entry)
+            except:
+                pass
+            
+            return False
+            
         except Exception as e:
             logger.error(f"Error processing entry {entry.get('id', 'unknown')}: {e}", exc_info=True)
             self.stats['errors'] += 1
@@ -351,6 +337,9 @@ class NewsAggregatorBot:
         
         cycle_start = time.time()
         
+        # Increment retry queue cycle counter
+        self.retry_queue.increment_cycle()
+        
         # Reset per-cycle statistics
         self.stats['duplicates'] = 0
         self.stats['errors'] = 0
@@ -361,16 +350,28 @@ class NewsAggregatorBot:
         logger.info("Cleaning up old database entries...")
         self.db.cleanup_old_entries()
         
+        # Clean up old retry queue entries (older than 24 hours)
+        self.retry_queue.cleanup_old_entries(max_age_hours=24)
+        
         # Clean up old media files (older than 2 days)
         from utils import cleanup_old_media_files
         cleanup_old_media_files(retention_days=2)
         
         # Get database stats
         db_stats = self.db.get_stats()
+        retry_stats = self.retry_queue.get_stats()
         logger.info(f"Database: {db_stats['processed_ids']} IDs, {db_stats['embeddings']} embeddings")
+        if retry_stats['total_entries'] > 0:
+            logger.info(f"Retry Queue: {retry_stats['total_entries']} entries waiting for retry")
         
         # Collect entries from all sources
         all_entries = []
+        
+        # Get entries from retry queue first (priority)
+        retry_entries = self.retry_queue.get_entries_to_retry()
+        if retry_entries:
+            logger.info(f"\n--- Processing retry queue ({len(retry_entries)} entries) ---")
+            all_entries.extend(retry_entries)
         
         # Poll RSS feeds
         try:
@@ -388,7 +389,7 @@ class NewsAggregatorBot:
         except Exception as e:
             logger.error(f"Error polling Telegram channels: {e}")
         
-        logger.info(f"\nTotal entries collected: {len(all_entries)}")
+        logger.info(f"\nTotal entries collected: {len(all_entries)} ({len(retry_entries)} from retry queue)")
         
         # Sort entries by timestamp in reverse chronological order (newest first)
         def get_entry_timestamp(entry):
@@ -423,9 +424,15 @@ class NewsAggregatorBot:
                 if self.db.is_processed(entry['id']):
                     already_seen += 1
                     logger.debug(f"Already processed, skipping: {entry['id']}")
+                    # Remove from retry queue if it was a retry
+                    self.retry_queue.remove_entry(entry['id'], reason="already_processed")
                     continue
                 
-                await self.process_entry(entry)
+                success = await self.process_entry(entry)
+                
+                # If successful and was in retry queue, remove it
+                if success:
+                    self.retry_queue.remove_entry(entry['id'], reason="success")
         
         cycle_duration = time.time() - cycle_start
         
@@ -529,7 +536,7 @@ class NewsAggregatorBot:
             )
             
             if success:
-                # Update the stored content in the mapping (preserve source_url)
+                # Update the stored content in the mapping (preserve source_url and category)
                 self.db.store_message_mapping(
                     telegram_entry_id=entry_id,
                     telegram_message_id=mapping_info['telegram_message_id'],
@@ -537,7 +544,8 @@ class NewsAggregatorBot:
                     discord_message_id=discord_message_id,
                     content=new_content,
                     source_url=mapping_info.get('source_url'),
-                    video_urls=mapping_info.get('video_urls', [])
+                    video_urls=mapping_info.get('video_urls', []),
+                    category=mapping_info.get('category')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

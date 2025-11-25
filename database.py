@@ -186,7 +186,7 @@ class Database:
             'message_mappings': len(self.message_mapping)
         }
     
-    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None):
+    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None):
         """
         Store mapping between Telegram and Discord messages
         
@@ -198,6 +198,7 @@ class Database:
             content: The message content (for edit comparison)
             source_url: Original source URL (Twitter/X.com link, etc.)
             video_urls: List of video URLs (for Twitter entries with videos)
+            category: Category the message was posted to
         """
         mapping_key = telegram_entry_id
         self.message_mapping[mapping_key] = {
@@ -207,10 +208,11 @@ class Database:
             'content': content,
             'source_url': source_url,
             'video_urls': video_urls if video_urls else [],
+            'category': category,
             'timestamp': time.time()
         }
         self._save_json(self.message_mapping_path, self.message_mapping)
-        logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id}")
+        logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id} (category: {category})")
     
     def get_discord_message_info(self, telegram_entry_id):
         """

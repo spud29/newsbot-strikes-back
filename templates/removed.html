@@ -1,0 +1,339 @@
+{% extends "base.html" %}
+
+{% block title %}Removed Entries - NewsBot{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1><i class="bi bi-trash"></i> Removed Entries</h1>
+        <p class="text-muted">Entries removed by user votes - used for feedback learning</p>
+    </div>
+    <div class="col-auto">
+        <button class="btn btn-primary" onclick="loadRemovedEntries()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+</div>
+
+<!-- Statistics -->
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card border-danger">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-trash"></i> Total Removed
+                </h5>
+                <h3 id="total-removed" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card border-warning">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-calendar-week"></i> Last 7 Days
+                </h5>
+                <h3 id="removed-7-days" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card border-info">
+            <div class="card-body">
+                <h5 class="card-title">
+                    <i class="bi bi-check-circle"></i> Feedback Learning
+                </h5>
+                <h3 id="feedback-status" class="text-muted">
+                    <span class="spinner-border spinner-border-sm"></span>
+                </h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Category Breakdown -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-bar-chart"></i> Removed by Category</h5>
+            </div>
+            <div class="card-body">
+                <div id="category-breakdown">
+                    <div class="text-center text-muted">
+                        <span class="spinner-border spinner-border-sm"></span> Loading...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Removed Entries List -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-list"></i> All Removed Entries</h5>
+            </div>
+            <div class="card-body">
+                <div id="removed-entries-list">
+                    <div class="text-center">
+                        <span class="spinner-border"></span>
+                        <p class="text-muted mt-2">Loading removed entries...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Entry Details Modal -->
+<div class="modal fade" id="removedEntryModal" tabindex="-1" aria-labelledby="removedEntryModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="removed-entry-title">Entry Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="removed-entry-body">
+                <div class="text-center">
+                    <span class="spinner-border"></span>
+                    <p class="mt-2">Loading entry details...</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-warning" id="restore-entry-btn" onclick="restoreEntry()">
+                    <i class="bi bi-arrow-counterclockwise"></i> Restore Entry
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentEntryId = null;
+
+async function loadRemovedEntries() {
+    try {
+        const response = await fetch('/api/removed-entries');
+        const data = await response.json();
+        
+        if (!data.success) {
+            console.error('Failed to load removed entries:', data.error);
+            return;
+        }
+        
+        // Update statistics
+        const stats = data.stats;
+        document.getElementById('total-removed').textContent = stats.total_removed_entries;
+        document.getElementById('removed-7-days').textContent = stats.removed_last_7_days;
+        
+        // Feedback learning status
+        const feedbackEnabled = {{ 'true' if config.FEEDBACK_LEARNING_ENABLED else 'false' }};
+        document.getElementById('feedback-status').innerHTML = feedbackEnabled
+            ? '<span class="text-success"><i class="bi bi-check-circle-fill"></i> Enabled</span>'
+            : '<span class="text-warning"><i class="bi bi-x-circle-fill"></i> Disabled</span>';
+        
+        // Category breakdown
+        const categoryDiv = document.getElementById('category-breakdown');
+        if (Object.keys(stats.by_category).length > 0) {
+            let html = '<div class="row">';
+            for (const [category, count] of Object.entries(stats.by_category)) {
+                html += `
+                    <div class="col-md-3 mb-2">
+                        <div class="badge bg-secondary" style="font-size: 1rem; padding: 0.5rem 1rem;">
+                            ${category}: ${count}
+                        </div>
+                    </div>
+                `;
+            }
+            html += '</div>';
+            categoryDiv.innerHTML = html;
+        } else {
+            categoryDiv.innerHTML = '<p class="text-muted">No data</p>';
+        }
+        
+        // Entries list
+        const entriesDiv = document.getElementById('removed-entries-list');
+        if (data.entries.length === 0) {
+            entriesDiv.innerHTML = '<p class="text-muted">No removed entries yet</p>';
+        } else {
+            let html = `
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>Entry ID</th>
+                                <th>Category</th>
+                                <th>Content Preview</th>
+                                <th>Removed</th>
+                                <th>Votes</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.entries.forEach(entry => {
+                const removedDate = new Date(entry.removed_at * 1000).toLocaleString();
+                const contentPreview = entry.content.length > 100 
+                    ? entry.content.substring(0, 100) + '...' 
+                    : entry.content;
+                
+                html += `
+                    <tr>
+                        <td><code class="small">${entry.entry_id}</code></td>
+                        <td><span class="badge bg-secondary">${entry.category}</span></td>
+                        <td class="small">${escapeHtml(contentPreview)}</td>
+                        <td class="small">${removedDate}</td>
+                        <td><span class="badge bg-danger">${entry.voter_ids ? entry.voter_ids.length : 0}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-primary" onclick="showEntryDetails('${entry.entry_id}')">
+                                <i class="bi bi-eye"></i> View
+                            </button>
+                            ${entry.source_url ? `<a href="${entry.source_url}" target="_blank" class="btn btn-sm btn-outline-secondary"><i class="bi bi-link-45deg"></i></a>` : ''}
+                        </td>
+                    </tr>
+                `;
+            });
+            
+            html += '</tbody></table></div>';
+            entriesDiv.innerHTML = html;
+        }
+        
+    } catch (error) {
+        console.error('Error loading removed entries:', error);
+        alert('Failed to load removed entries');
+    }
+}
+
+function showEntryDetails(entryId) {
+    currentEntryId = entryId;
+    
+    // Find the entry in the loaded data
+    fetch('/api/removed-entries')
+        .then(response => response.json())
+        .then(data => {
+            const entry = data.entries.find(e => e.entry_id === entryId);
+            
+            if (!entry) {
+                alert('Entry not found');
+                return;
+            }
+            
+            const modalBody = document.getElementById('removed-entry-body');
+            const removedDate = new Date(entry.removed_at * 1000).toLocaleString();
+            
+            let html = '<div class="row">';
+            
+            // Basic Info
+            html += '<div class="col-md-6 mb-3">';
+            html += '<h6 class="text-muted">Basic Information</h6>';
+            html += '<table class="table table-sm table-borderless">';
+            html += `<tr><th width="40%">Entry ID:</th><td><code>${entry.entry_id}</code></td></tr>`;
+            html += `<tr><th>Category:</th><td><span class="badge bg-secondary">${entry.category}</span></td></tr>`;
+            html += `<tr><th>Removed:</th><td>${removedDate}</td></tr>`;
+            html += `<tr><th>Votes:</th><td>${entry.voter_ids ? entry.voter_ids.length : 0}</td></tr>`;
+            html += '</table>';
+            html += '</div>';
+            
+            // Discord Info
+            html += '<div class="col-md-6 mb-3">';
+            html += '<h6 class="text-muted">Discord Information</h6>';
+            html += '<table class="table table-sm table-borderless">';
+            if (entry.discord_channel_id) {
+                html += `<tr><th width="40%">Channel ID:</th><td><code>${entry.discord_channel_id}</code></td></tr>`;
+            }
+            if (entry.discord_message_id) {
+                html += `<tr><th>Message ID:</th><td><code>${entry.discord_message_id}</code> <small class="text-muted">(deleted)</small></td></tr>`;
+            }
+            html += '</table>';
+            html += '</div>';
+            
+            html += '</div>';
+            
+            // Source URL
+            if (entry.source_url) {
+                html += '<div class="mb-3">';
+                html += '<h6 class="text-muted">Source URL</h6>';
+                html += `<p><a href="${entry.source_url}" target="_blank" rel="noopener noreferrer">${entry.source_url} <i class="bi bi-box-arrow-up-right"></i></a></p>`;
+                html += '</div>';
+            }
+            
+            // Content
+            html += '<div class="mb-3">';
+            html += '<h6 class="text-muted">Full Content</h6>';
+            html += `<div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 0.9em;">${escapeHtml(entry.content)}</div>`;
+            html += '</div>';
+            
+            modalBody.innerHTML = html;
+            
+            document.getElementById('removed-entry-title').textContent = `Removed Entry: ${entryId}`;
+            
+            const modal = new bootstrap.Modal(document.getElementById('removedEntryModal'));
+            modal.show();
+        })
+        .catch(error => {
+            console.error('Error loading entry details:', error);
+            alert('Failed to load entry details');
+        });
+}
+
+async function restoreEntry() {
+    if (!currentEntryId) {
+        alert('No entry selected');
+        return;
+    }
+    
+    if (!confirm(`Restore entry ${currentEntryId}? This will remove it from the removed entries list and stop using it for feedback learning.`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/removed-entries/${encodeURIComponent(currentEntryId)}/restore`, {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            alert('Entry restored successfully');
+            
+            // Close modal
+            const modal = bootstrap.Modal.getInstance(document.getElementById('removedEntryModal'));
+            if (modal) {
+                modal.hide();
+            }
+            
+            // Reload list
+            await loadRemovedEntries();
+        } else {
+            alert('Failed to restore entry: ' + (result.error || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('Error restoring entry:', error);
+        alert('Failed to restore entry: ' + error.message);
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Load entries on page load
+document.addEventListener('DOMContentLoaded', loadRemovedEntries);
+</script>
+{% endblock %}
+
+
+

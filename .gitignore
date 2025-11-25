@@ -37,6 +37,11 @@ data/processed_ids.json
 data/embeddings_cache.json
 data/message_mapping.json
 data/last_message_ids.json
+data/bot.pid
+data/retry_queue.json
+data/vote_tracking.json
+data/statistics.json
+data/bot_stats.json
 
 # Temporary media files
 temp_media/
@@ -45,6 +50,9 @@ temp_media_serve/
 # Telegram session
 *.session
 *.session-journal
+
+# Twitter authentication
+twitter_cookies.txt
 
 # IDE
 .vscode/

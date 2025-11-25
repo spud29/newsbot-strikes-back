@@ -2,8 +2,11 @@
 FastAPI Web Dashboard for Discord News Aggregator Bot
 """
 import os
+import sys
 import json
 import time
+import signal
+import subprocess
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional
@@ -22,6 +25,9 @@ from ollama_client import OllamaClient
 from discord_poster import DiscordPoster
 from media_handler import MediaHandler
 from telegram_poller import TelegramPoller
+from retry_queue import RetryQueue
+from vote_tracker import VoteTracker
+from removed_entries import RemovedEntriesDB
 import config
 from utils import logger
 import re
@@ -54,10 +60,17 @@ if not DASHBOARD_PASSWORD:
 
 # Initialize shared components
 db = Database()
-ollama = OllamaClient()
-discord_poster = DiscordPoster()
+vote_tracker = VoteTracker()
+removed_entries_db = RemovedEntriesDB()
+ollama = OllamaClient(removed_entries_db=removed_entries_db)
+discord_poster = DiscordPoster(
+    database=db,
+    vote_tracker=vote_tracker,
+    removed_entries_db=removed_entries_db
+)
 media_handler = MediaHandler()
 telegram_poller_instance = None  # Will be initialized when needed
+retry_queue = RetryQueue()  # Initialize retry queue
 
 # Thread pool for CPU-bound tasks
 executor = ThreadPoolExecutor(max_workers=2)
@@ -189,6 +202,15 @@ async def database_page(request: Request, username: str = Depends(verify_credent
     })
 
 
+@app.get("/removed", response_class=HTMLResponse)
+async def removed_entries_page(request: Request, username: str = Depends(verify_credentials)):
+    """Removed entries page"""
+    return templates.TemplateResponse("removed.html", {
+        "request": request,
+        "username": username
+    })
+
+
 # API Endpoints
 
 @app.get("/api/health")
@@ -212,6 +234,175 @@ async def health_check(username: str = Depends(verify_credentials)):
         "bot": "active" if bot_active else "inactive",
         "timestamp": time.time()
     }
+
+
+@app.get("/api/bot/status")
+async def get_bot_status(username: str = Depends(verify_credentials)):
+    """Get current bot process status"""
+    pid_file = os.path.join("data", "bot.pid")
+    
+    # Check if PID file exists
+    if not os.path.exists(pid_file):
+        return {
+            "running": False,
+            "status": "stopped",
+            "message": "Bot PID file not found. Bot is not running or was not started with run_bot.py"
+        }
+    
+    try:
+        # Read PID from file
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        
+        # Check if process is running (Windows-compatible)
+        try:
+            import psutil
+            if psutil.pid_exists(pid):
+                process = psutil.Process(pid)
+                # Verify it's actually our bot process
+                if process.is_running():
+                    return {
+                        "running": True,
+                        "status": "running",
+                        "pid": pid,
+                        "message": "Bot is running"
+                    }
+        except ImportError:
+            # Fallback for systems without psutil
+            # On Windows, we can try to use tasklist
+            if sys.platform == "win32":
+                import subprocess
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}"],
+                    capture_output=True,
+                    text=True
+                )
+                if str(pid) in result.stdout:
+                    return {
+                        "running": True,
+                        "status": "running",
+                        "pid": pid,
+                        "message": "Bot is running"
+                    }
+            else:
+                # On Unix, try kill -0
+                try:
+                    os.kill(pid, 0)
+                    return {
+                        "running": True,
+                        "status": "running",
+                        "pid": pid,
+                        "message": "Bot is running"
+                    }
+                except OSError:
+                    pass
+        
+        # If we get here, process is not running
+        return {
+            "running": False,
+            "status": "stopped",
+            "pid": pid,
+            "message": "Bot process is not running (stale PID file)"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking bot status: {e}", exc_info=True)
+        return {
+            "running": False,
+            "status": "error",
+            "message": f"Error checking bot status: {str(e)}"
+        }
+
+
+@app.post("/api/bot/restart")
+async def restart_bot(username: str = Depends(verify_credentials)):
+    """Restart the bot process"""
+    pid_file = os.path.join("data", "bot.pid")
+    
+    try:
+        # Kill existing bot process if running
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r") as f:
+                    old_pid = int(f.read().strip())
+                
+                logger.info(f"Attempting to stop bot process (PID: {old_pid})...")
+                
+                # Try to kill the process
+                try:
+                    import psutil
+                    if psutil.pid_exists(old_pid):
+                        process = psutil.Process(old_pid)
+                        process.terminate()
+                        # Wait for process to terminate
+                        process.wait(timeout=10)
+                        logger.info(f"Bot process {old_pid} terminated")
+                except ImportError:
+                    # Fallback without psutil
+                    if sys.platform == "win32":
+                        subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], check=False)
+                    else:
+                        os.kill(old_pid, signal.SIGTERM)
+                        time.sleep(2)
+                    logger.info(f"Sent termination signal to bot process {old_pid}")
+                
+                # Wait a moment for cleanup
+                time.sleep(2)
+                
+            except Exception as e:
+                logger.warning(f"Error stopping old bot process: {e}")
+        
+        # Start new bot process
+        logger.info("Starting new bot process...")
+        
+        # Start the bot as a subprocess
+        if sys.platform == "win32":
+            # On Windows, use CREATE_NEW_PROCESS_GROUP to detach
+            bot_process = subprocess.Popen(
+                [sys.executable, "run_bot.py"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=os.getcwd(),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            # On Unix, use start_new_session
+            bot_process = subprocess.Popen(
+                [sys.executable, "run_bot.py"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=os.getcwd(),
+                start_new_session=True
+            )
+        
+        # Give it a moment to start
+        time.sleep(3)
+        
+        # Check if process is still running
+        if bot_process.poll() is None:
+            new_pid = bot_process.pid
+            logger.info(f"Bot restarted successfully (new PID: {new_pid})")
+            return {
+                "success": True,
+                "message": "Bot restarted successfully",
+                "new_pid": new_pid
+            }
+        else:
+            # Process died immediately
+            stdout, stderr = bot_process.communicate()
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logger.error(f"Bot failed to start: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Bot failed to start: {error_msg}"
+            }
+        
+    except Exception as e:
+        logger.error(f"Error restarting bot: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @app.get("/api/stats")
@@ -243,12 +434,16 @@ async def get_stats(username: str = Depends(verify_credentials)):
             'source': source_type
         })
     
+    # Get retry queue stats
+    retry_stats = retry_queue.get_stats()
+    
     return {
         'database': db_stats,
         'processed_24h': processed_24h,
         'recent_entries': recent_entries,
         'rss_feeds_count': len(config.RSS_FEEDS),
-        'telegram_channels_count': len(config.TELEGRAM_CHANNELS)
+        'telegram_channels_count': len(config.TELEGRAM_CHANNELS),
+        'retry_queue': retry_stats
     }
 
 
@@ -516,6 +711,73 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
         return {
             "success": False,
             "error": str(e)
+        }
+
+
+@app.get("/api/retry-queue")
+async def get_retry_queue(username: str = Depends(verify_credentials)):
+    """Get retry queue details"""
+    try:
+        # Reload retry queue from file
+        retry_queue.queue = retry_queue._load_queue()
+        
+        # Get all entries with details
+        entries = []
+        for entry_id, retry_info in retry_queue.queue.items():
+            entry_data = retry_info.get('entry', {})
+            entries.append({
+                'entry_id': entry_id,
+                'retry_count': retry_info['retry_count'],
+                'first_attempt_cycle': retry_info['first_attempt_cycle'],
+                'last_attempt_cycle': retry_info['last_attempt_cycle'],
+                'reason': retry_info.get('reason', 'unknown'),
+                'source_type': entry_data.get('source_type', 'unknown'),
+                'source': entry_data.get('source', 'unknown'),
+                'content_preview': entry_data.get('content', '')[:100] + '...' if entry_data.get('content') else 'No content',
+                'link': entry_data.get('link') or entry_data.get('url', '')
+            })
+        
+        # Sort by last attempt (most recent first)
+        entries.sort(key=lambda x: x['last_attempt_cycle'], reverse=True)
+        
+        stats = retry_queue.get_stats()
+        
+        return {
+            'success': True,
+            'stats': stats,
+            'entries': entries
+        }
+    except Exception as e:
+        logger.error(f"Error getting retry queue: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@app.delete("/api/retry-queue/{entry_id}")
+async def remove_from_retry_queue(entry_id: str, username: str = Depends(verify_credentials)):
+    """Manually remove an entry from retry queue"""
+    try:
+        # Reload retry queue
+        retry_queue.queue = retry_queue._load_queue()
+        
+        if entry_id in retry_queue.queue:
+            retry_queue.remove_entry(entry_id, reason="manually_removed")
+            return {
+                'success': True,
+                'message': f'Entry {entry_id} removed from retry queue'
+            }
+        else:
+            return {
+                'success': False,
+                'error': 'Entry not found in retry queue'
+            }
+    except Exception as e:
+        logger.error(f"Error removing from retry queue: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
         }
 
 
@@ -1561,6 +1823,59 @@ async def serve_temp_media(
     except Exception as e:
         logger.error(f"Error serving temp media file: {e}")
         raise HTTPException(status_code=500, detail="Error serving file")
+
+
+@app.get("/api/removed-entries")
+async def get_removed_entries(username: str = Depends(verify_credentials)):
+    """Get all removed entries"""
+    try:
+        # Reload removed entries from file
+        removed_entries_db.entries = removed_entries_db._load_entries()
+        
+        entries = removed_entries_db.get_all_removed_entries()
+        stats = removed_entries_db.get_stats()
+        
+        # Sort by removed_at (newest first)
+        entries_sorted = sorted(entries, key=lambda x: x.get('removed_at', 0), reverse=True)
+        
+        return {
+            'success': True,
+            'entries': entries_sorted,
+            'stats': stats
+        }
+    except Exception as e:
+        logger.error(f"Error getting removed entries: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@app.post("/api/removed-entries/{entry_id}/restore")
+async def restore_removed_entry(entry_id: str, username: str = Depends(verify_credentials)):
+    """Restore a wrongly removed entry"""
+    try:
+        # Reload removed entries
+        removed_entries_db.entries = removed_entries_db._load_entries()
+        
+        success = removed_entries_db.restore_entry(entry_id)
+        
+        if success:
+            return {
+                'success': True,
+                'message': f'Entry {entry_id} restored from removed entries'
+            }
+        else:
+            return {
+                'success': False,
+                'error': 'Entry not found in removed entries'
+            }
+    except Exception as e:
+        logger.error(f"Error restoring entry: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 
 if __name__ == "__main__":

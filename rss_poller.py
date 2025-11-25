@@ -3,7 +3,7 @@ RSS feed poller for Twitter feeds
 """
 import feedparser
 import re
-from utils import logger, retry_with_backoff, extract_urls_from_html
+from utils import logger, retry_with_backoff, extract_urls_from_html, clean_text_content, remove_twitter_attribution
 import config
 
 class RSSPoller:
@@ -96,6 +96,11 @@ class RSSPoller:
             # Example: <a href="https://full-url.com/path">truncated…</a>
             content = description if description else title
             content = extract_urls_from_html(content)
+            
+            # Clean HTML tags (blockquote, p, etc.) and remove Twitter attribution
+            # This prevents raw HTML from appearing in Discord posts
+            content = clean_text_content(content)
+            content = remove_twitter_attribution(content)
             
             # Extract media URLs if present
             media_urls = self._extract_media_urls(entry)

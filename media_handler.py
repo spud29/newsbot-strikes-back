@@ -10,6 +10,10 @@ from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, 
 import config
 from ocr_handler import OCRHandler
 
+class GalleryDlFailure(Exception):
+    """Raised when gallery-dl fails to extract tweet content"""
+    pass
+
 class MediaHandler:
     """Handles media downloads from Twitter and Telegram"""
     
@@ -105,13 +109,18 @@ class MediaHandler:
                 if text_result.stderr:
                     logger.debug(f"gallery-dl stderr: {text_result.stderr[:200]}")
             
-            # FALLBACK: If gallery-dl didn't get text, fall back to RSS content
+            # If gallery-dl didn't get text, fall back to RSS content
             if not full_text:
-                logger.info(f"Falling back to RSS feed content")
+                logger.info(f"gallery-dl returned no content, falling back to RSS feed content")
                 full_text = entry.get('content', '')
                 # Apply basic cleaning to RSS fallback content
-                full_text = clean_text_content(full_text)
-                full_text = resolve_shortened_urls(full_text)
+                if full_text:
+                    full_text = clean_text_content(full_text)
+                    full_text = resolve_shortened_urls(full_text)
+                else:
+                    # Only raise exception if both gallery-dl AND RSS have no content
+                    logger.warning(f"No content available from gallery-dl or RSS for: {link}")
+                    raise GalleryDlFailure(f"No content available from any source for {link}")
             
             # Extract video URLs using gallery-dl -g
             video_urls = []
@@ -206,6 +215,9 @@ class MediaHandler:
             entry['media_files'] = []
             entry['ocr_text'] = ""
             return entry
+        except GalleryDlFailure:
+            # Re-raise GalleryDlFailure so it can be handled by retry queue
+            raise
         except Exception as e:
             logger.error(f"Error downloading Twitter media: {e}")
             entry['media_files'] = []
@@ -223,10 +235,14 @@ class MediaHandler:
             dict: Updated entry with media_files list
         """
         if not entry.get('has_media'):
+            logger.debug(f"Entry has no media flag set, skipping download for: {entry['id']}")
             entry['media_files'] = []
             return entry
         
-        logger.debug(f"Downloading Telegram media for: {entry['id']}")
+        logger.debug(
+            f"Downloading Telegram media for: {entry['id']} "
+            f"(media_type: {entry.get('media_type')}, is_album: {entry.get('is_album', False)})"
+        )
         
         try:
             # Create temporary directory for this download
@@ -239,8 +255,10 @@ class MediaHandler:
             # Check if this is an album
             if entry.get('is_album') and entry.get('album_messages'):
                 # Download all media in the album
+                logger.debug(f"Downloading album with {len(entry['album_messages'])} messages")
                 for i, message in enumerate(entry['album_messages']):
                     if message.media:
+                        logger.debug(f"Downloading album media {i+1}/{len(entry['album_messages'])}")
                         file_path = await self._download_media_file(
                             message,
                             download_dir,
@@ -254,10 +272,23 @@ class MediaHandler:
                             if ext in ['.mp4', '.mov', '.avi']:
                                 # For Telegram videos, we'll just note them but can't get direct URL
                                 video_urls.append(f"telegram_video_{i}")
+                        else:
+                            logger.warning(f"Failed to download album media {i+1}/{len(entry['album_messages'])}")
+                    else:
+                        logger.warning(f"Album message {i+1}/{len(entry['album_messages'])} has no media")
             else:
                 # Single media file
                 message = entry.get('message_obj')
-                if message and message.media:
+                
+                if not message:
+                    logger.warning(f"No message_obj found in entry {entry['id']}, cannot download media")
+                elif not message.media:
+                    logger.warning(
+                        f"message_obj exists but has no media attribute for entry {entry['id']}. "
+                        f"Message type: {type(message)}, has_media flag: {entry.get('has_media')}"
+                    )
+                else:
+                    logger.debug(f"Downloading single media file from message {entry.get('message_id')}")
                     file_path = await self._download_media_file(
                         message,
                         download_dir,
@@ -265,11 +296,14 @@ class MediaHandler:
                     )
                     if file_path:
                         media_files.append(file_path)
+                        logger.debug(f"Successfully downloaded: {file_path}")
                         
                         # Check if it's a video
                         ext = os.path.splitext(file_path)[1].lower()
                         if ext in ['.mp4', '.mov', '.avi']:
                             video_urls.append("telegram_video")
+                    else:
+                        logger.warning(f"Download returned None for entry {entry['id']}")
             
             # Extract text from images using OCR (skip videos)
             ocr_text = ""
@@ -309,19 +343,30 @@ class MediaHandler:
             str: Path to downloaded file or None
         """
         try:
+            logger.debug(f"Calling telegram_client.download_media() to {download_dir}")
             file_path = await self.telegram_client.client.download_media(
                 message,
                 file=download_dir
             )
             
             if file_path:
-                logger.debug(f"Downloaded Telegram media: {file_path}")
+                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                logger.info(f"Downloaded Telegram media: {file_path} ({file_size} bytes)")
                 return file_path
-            
-            return None
+            else:
+                logger.warning(
+                    f"download_media() returned None/empty. "
+                    f"Message ID: {message.id if hasattr(message, 'id') else 'unknown'}, "
+                    f"Has media: {hasattr(message, 'media') and message.media is not None}"
+                )
+                return None
             
         except Exception as e:
-            logger.error(f"Error downloading Telegram media file: {e}")
+            logger.error(
+                f"Error downloading Telegram media file: {e} "
+                f"(Message ID: {message.id if hasattr(message, 'id') else 'unknown'})",
+                exc_info=True
+            )
             return None
     
     def cleanup_entry_media(self, entry):

@@ -190,6 +190,12 @@ async function searchDatabase() {
                                     <code class="text-break">${result.entry_id}</code>
                                 </div>
                                 <div class="btn-group btn-group-sm" role="group">
+                                    <button class="btn btn-outline-primary" 
+                                            onclick="toggleEntryDetails('${result.entry_id}', ${index})"
+                                            id="details-btn-${index}"
+                                            title="View full details and media">
+                                        <i class="bi bi-eye"></i> Details
+                                    </button>
                                     <button class="btn btn-outline-success" 
                                             onclick="reprocessEntryFromSearch('${result.entry_id}')"
                                             title="Reprocess and post to Discord again">
@@ -220,6 +226,12 @@ async function searchDatabase() {
                                     <small>${result.preview}</small>
                                 </div>
                             ` : ''}
+                            <div id="entry-details-${index}" class="mt-3" style="display: none;">
+                                <div class="text-center py-3">
+                                    <span class="spinner-border spinner-border-sm"></span>
+                                    <span class="ms-2">Loading details...</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 `;
@@ -351,6 +363,136 @@ async function exportDatabase() {
         console.error('Error exporting database:', error);
         alert('Failed to export database');
     }
+}
+
+async function toggleEntryDetails(entryId, index) {
+    const detailsDiv = document.getElementById(`entry-details-${index}`);
+    const detailsBtn = document.getElementById(`details-btn-${index}`);
+    
+    // If already visible, just hide it
+    if (detailsDiv.style.display === 'block') {
+        detailsDiv.style.display = 'none';
+        detailsBtn.innerHTML = '<i class="bi bi-eye"></i> Details';
+        return;
+    }
+    
+    // Show the details div
+    detailsDiv.style.display = 'block';
+    detailsBtn.innerHTML = '<i class="bi bi-eye-slash"></i> Hide';
+    
+    // Check if we've already loaded the details (has more than just the spinner)
+    if (detailsDiv.dataset.loaded === 'true') {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/entry/${encodeURIComponent(entryId)}`);
+        const data = await response.json();
+        
+        if (data.found) {
+            detailsDiv.dataset.loaded = 'true';
+            detailsDiv.innerHTML = renderEntryDetails(data);
+        } else {
+            detailsDiv.innerHTML = '<div class="alert alert-warning">Entry details not found</div>';
+        }
+    } catch (error) {
+        console.error('Error fetching entry details:', error);
+        detailsDiv.innerHTML = '<div class="alert alert-danger">Failed to load entry details</div>';
+    }
+}
+
+function renderEntryDetails(data) {
+    let html = '<hr>';
+    
+    // Full content
+    if (data.content) {
+        html += '<div class="mb-3">';
+        html += '<strong>Full Content:</strong>';
+        html += '<div class="mt-2 p-3 bg-light rounded" style="white-space: pre-wrap; font-family: monospace; font-size: 0.9rem; max-height: 300px; overflow-y: auto;">';
+        html += escapeHtml(data.content);
+        html += '</div>';
+        html += '</div>';
+    }
+    
+    // Images
+    if (data.media && data.media.images && data.media.images.length > 0) {
+        html += '<div class="mb-3">';
+        html += '<strong>Images:</strong>';
+        html += '<div class="row g-2 mt-2">';
+        data.media.images.forEach((imageUrl, index) => {
+            html += `<div class="col-md-6">`;
+            html += `<div class="card">`;
+            html += `<img src="${imageUrl}" class="card-img-top" style="max-height: 300px; width: 100%; object-fit: contain; background-color: #f8f9fa; cursor: pointer;" alt="Image ${index + 1}" onclick="window.open('${imageUrl}', '_blank')" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">`;
+            html += `<div style="display: none; padding: 1rem; text-align: center; color: #999;">Image ${index + 1} (failed to load)</div>`;
+            html += `<div class="card-body p-2">`;
+            html += `<small class="text-muted">Image ${index + 1}</small>`;
+            html += `<br><a href="${imageUrl}" target="_blank" rel="noopener noreferrer" class="small">Open in new tab <i class="bi bi-box-arrow-up-right"></i></a>`;
+            html += `</div>`;
+            html += `</div>`;
+            html += `</div>`;
+        });
+        html += '</div>';
+        html += '</div>';
+    }
+    
+    // Videos
+    if (data.media && data.media.videos && data.media.videos.length > 0) {
+        html += '<div class="mb-3">';
+        html += '<strong>Videos:</strong>';
+        html += '<div class="row g-2 mt-2">';
+        data.media.videos.forEach((videoUrl, index) => {
+            html += `<div class="col-md-6">`;
+            html += `<div class="card">`;
+            
+            // Check if it's a URL (external video) or local file
+            if (videoUrl.startsWith('http://') || videoUrl.startsWith('https://')) {
+                // External video URL (Twitter)
+                html += `<div class="card-body">`;
+                html += `<p class="mb-2"><strong>Video ${index + 1}</strong></p>`;
+                html += `<a href="${videoUrl}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-primary">`;
+                html += `<i class="bi bi-play-circle"></i> Open Video`;
+                html += `</a>`;
+                html += `<br><small class="text-muted mt-2 d-block">External video link</small>`;
+                html += `</div>`;
+            } else {
+                // Local video file (Telegram)
+                html += `<video controls class="card-img-top" style="max-height: 400px; width: 100%; background-color: #000;">`;
+                html += `<source src="${videoUrl}" type="video/mp4">`;
+                html += `Your browser does not support the video tag.`;
+                html += `</video>`;
+                html += `<div class="card-body p-2">`;
+                html += `<small class="text-muted">Video ${index + 1}</small>`;
+                html += `<br><a href="${videoUrl}" target="_blank" rel="noopener noreferrer" class="small">Open in new tab <i class="bi bi-box-arrow-up-right"></i></a>`;
+                html += `</div>`;
+            }
+            
+            html += `</div>`;
+            html += `</div>`;
+        });
+        html += '</div>';
+        html += '</div>';
+    }
+    
+    // If no media at all
+    if ((!data.media.images || data.media.images.length === 0) && 
+        (!data.media.videos || data.media.videos.length === 0)) {
+        html += '<div class="alert alert-info mb-0">';
+        html += '<i class="bi bi-info-circle"></i> No media files found for this entry';
+        html += '</div>';
+    }
+    
+    return html;
+}
+
+function escapeHtml(text) {
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return text.replace(/[&<>"']/g, m => map[m]);
 }
 
 // Load stats on page load
