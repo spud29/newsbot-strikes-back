@@ -126,6 +126,18 @@ class RemovedEntriesDB:
                 return entry
         return None
     
+    def is_removed(self, entry_id):
+        """
+        Check if an entry has been removed
+        
+        Args:
+            entry_id: Entry ID to check
+        
+        Returns:
+            bool: True if entry was removed, False otherwise
+        """
+        return self.find_by_entry_id(entry_id) is not None
+    
     def restore_entry(self, entry_id):
         """
         Restore a removed entry (remove from database)

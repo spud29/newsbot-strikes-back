@@ -116,12 +116,48 @@ class PerplexityClient:
                 cleaned_answer = self.clean_response(answer)
                 logger.debug(f"Cleaned answer ({len(cleaned_answer)} chars)")
                 
+                # Try to extract citations from various possible locations in the response
+                citations = []
+                
+                # Check for citations at the response level
+                if hasattr(response, 'citations'):
+                    citations = response.citations
+                    logger.info(f"Found {len(citations)} citations at response level")
+                
+                # Check for citations in the message
+                elif hasattr(response.choices[0].message, 'citations'):
+                    citations = response.choices[0].message.citations
+                    logger.info(f"Found {len(citations)} citations in message")
+                
+                # Check for citations in model_extra or other metadata
+                elif hasattr(response, 'model_extra') and response.model_extra:
+                    if 'citations' in response.model_extra:
+                        citations = response.model_extra['citations']
+                        logger.info(f"Found {len(citations)} citations in model_extra")
+                
+                # Check if response has a dict-like structure
+                try:
+                    if hasattr(response, '__dict__'):
+                        response_dict = response.__dict__
+                        if 'citations' in response_dict:
+                            citations = response_dict['citations']
+                            logger.info(f"Found {len(citations)} citations in response dict")
+                except:
+                    pass
+                
+                # Log citation data for debugging
+                if citations:
+                    logger.debug(f"Citations data: {citations}")
+                else:
+                    logger.debug("No citations found in response")
+                
                 # Perplexity API doesn't provide shareable URLs to perplexity.ai
-                # We return the cleaned answer text directly
+                # We return the cleaned answer text directly with citations
                 return {
                     'success': True,
                     'url': None,  # No shareable URL available from API
                     'answer': cleaned_answer,
+                    'citations': citations,
                     'error': None
                 }
             else:

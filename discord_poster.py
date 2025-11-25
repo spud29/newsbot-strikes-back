@@ -13,6 +13,186 @@ from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
 
 
+class CitationsView(View):
+    """Discord UI View containing a Citations display button"""
+    
+    def __init__(self, citations, entry_hash):
+        """
+        Initialize the view with a citations button
+        
+        Args:
+            citations: List of citation objects/strings from Perplexity
+            entry_hash: Unique hash of the entry for tracking
+        """
+        super().__init__(timeout=None)  # No timeout for persistent views
+        self.citations = citations
+        self.entry_hash = entry_hash
+        self.citations_shown = False
+        
+        # Get button configuration from config
+        button_label = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_LABEL', 'View Citations')
+        button_emoji = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_EMOJI', '📚')
+        
+        # Map string style to discord.ButtonStyle
+        style_map = {
+            'primary': discord.ButtonStyle.primary,
+            'secondary': discord.ButtonStyle.secondary,
+            'success': discord.ButtonStyle.success,
+            'danger': discord.ButtonStyle.danger,
+        }
+        button_style_str = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_STYLE', 'secondary')
+        button_style = style_map.get(button_style_str, discord.ButtonStyle.secondary)
+        
+        # Create the button with custom_id for persistence
+        button = Button(
+            style=button_style,
+            label=button_label,
+            emoji=button_emoji,
+            custom_id=f"perplexity_citations:{entry_hash}"
+        )
+        button.callback = self.button_callback
+        self.add_item(button)
+    
+    async def button_callback(self, interaction: discord.Interaction):
+        """
+        Handle button click - display citations
+        
+        Args:
+            interaction: Discord interaction from button click
+        """
+        try:
+            # Check if citations were already shown
+            if self.citations_shown:
+                await interaction.response.send_message(
+                    "Citations have already been displayed.",
+                    ephemeral=True
+                )
+                return
+            
+            # Defer the response to show loading state
+            await interaction.response.defer(ephemeral=False)
+            
+            logger.info(f"Citations button clicked for entry hash: {self.entry_hash}")
+            
+            # Check if we have citations
+            if not self.citations:
+                await interaction.followup.send(
+                    "❌ No citations are available for this response.",
+                    ephemeral=True
+                )
+                return
+            
+            # Format citations
+            citations_text = ""
+            
+            # Handle different citation formats
+            if isinstance(self.citations, list):
+                for i, citation in enumerate(self.citations, 1):
+                    if isinstance(citation, dict):
+                        # Citation is a dictionary with url and possibly title/name
+                        url = citation.get('url', citation.get('link', ''))
+                        title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
+                        if url:
+                            citations_text += f"{i}. [{title}]({url})\n"
+                        else:
+                            citations_text += f"{i}. {title}\n"
+                    elif isinstance(citation, str):
+                        # Citation is just a URL string
+                        citations_text += f"{i}. {citation}\n"
+                    else:
+                        # Unknown format, try to convert to string
+                        citations_text += f"{i}. {str(citation)}\n"
+            elif isinstance(self.citations, dict):
+                # Citations might be a dictionary
+                for i, (key, value) in enumerate(self.citations.items(), 1):
+                    if isinstance(value, str):
+                        citations_text += f"{i}. {key}: {value}\n"
+                    else:
+                        citations_text += f"{i}. {key}\n"
+            else:
+                citations_text = str(self.citations)
+            
+            # Create a thread on the original message for the citations
+            thread_name = "📚 Sources & Citations"
+            
+            try:
+                # Create a public thread on the original message
+                thread = await interaction.message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440  # Archive after 24 hours of inactivity
+                )
+                logger.info(f"Created thread {thread.id} for citations")
+                
+                # Truncate if too long (Discord embed description limit is 4096)
+                max_length = 3900
+                truncated = False
+                if len(citations_text) > max_length:
+                    citations_text = citations_text[:max_length] + "..."
+                    truncated = True
+                
+                # Create an embed for citations
+                embed = discord.Embed(
+                    title="📚 Sources & Citations",
+                    description=citations_text if citations_text else "No citations available.",
+                    color=discord.Color.green()
+                )
+                
+                if truncated:
+                    embed.set_footer(text="⚠️ Citation list truncated due to length")
+                else:
+                    embed.set_footer(text=f"{len(self.citations)} source(s)")
+                
+                # Send the embed in the thread
+                await thread.send(embed=embed)
+                
+                # Disable the button in the message
+                for item in self.children:
+                    if isinstance(item, Button):
+                        item.disabled = True
+                
+                # Update the message to disable the button
+                try:
+                    await interaction.message.edit(view=self)
+                except Exception as e:
+                    logger.warning(f"Failed to disable citations button: {e}")
+                
+                # Mark as shown
+                self.citations_shown = True
+                
+                # Send a notification that thread was created
+                await interaction.followup.send(
+                    f"✅ Citations posted in thread: {thread.mention}",
+                    ephemeral=True
+                )
+                
+                logger.info(f"Citations posted in thread {thread.id}")
+            
+            except discord.Forbidden:
+                logger.error("Bot lacks permission to create threads")
+                await interaction.followup.send(
+                    "❌ Unable to create thread. Bot may lack thread permissions.",
+                    ephemeral=True
+                )
+            except discord.HTTPException as e:
+                logger.error(f"Failed to create thread: {e}")
+                await interaction.followup.send(
+                    f"❌ Failed to create thread: {str(e)}",
+                    ephemeral=True
+                )
+            
+            logger.info(f"Citations displayed for entry hash: {self.entry_hash}")
+        
+        except Exception as e:
+            logger.error(f"Error in Citations button callback: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    f"❌ An error occurred while displaying citations: {str(e)}",
+                    ephemeral=True
+                )
+            except:
+                pass
+
+
 class PerplexitySearchView(View):
     """Discord UI View containing a Perplexity search button"""
     
@@ -110,29 +290,99 @@ class PerplexitySearchView(View):
                 
                 # Send the response
                 if result.get('answer'):
-                    # Send the answer text using a Discord embed for better formatting
+                    # Create a thread on the original message for the Perplexity answer
                     answer = result['answer']
                     
-                    # Discord embed description has 4096 char limit, but we'll keep it shorter
-                    max_length = 3900
-                    truncated = False
-                    if len(answer) > max_length:
-                        answer = answer[:max_length] + "..."
-                        truncated = True
+                    # Create thread name (max 100 chars)
+                    thread_name = "🔍 Additional Context"
                     
-                    # Create an embed for better presentation
-                    embed = discord.Embed(
-                        title="🔍 Additional Context from Perplexity AI",
-                        description=answer,
-                        color=discord.Color.blue()
-                    )
+                    try:
+                        # Create a public thread on the original message
+                        thread = await interaction.message.create_thread(
+                            name=thread_name,
+                            auto_archive_duration=1440  # Archive after 24 hours of inactivity
+                        )
+                        logger.info(f"Created thread {thread.id} for Perplexity answer")
+                        
+                        # Discord embed description has 4096 char limit
+                        max_length = 3900
+                        truncated = False
+                        if len(answer) > max_length:
+                            answer = answer[:max_length] + "..."
+                            truncated = True
+                        
+                        # Create an embed for better presentation
+                        embed = discord.Embed(
+                            title="Additional Context from Perplexity AI",
+                            description=answer,
+                            color=discord.Color.blue()
+                        )
+                        
+                        if truncated:
+                            embed.set_footer(text="⚠️ Answer truncated due to length")
+                        else:
+                            embed.set_footer(text="Powered by Perplexity AI")
+                        
+                        # Send the embed in the thread
+                        await thread.send(embed=embed)
+                        
+                        # Check if we have citations and should show them
+                        citations = result.get('citations', [])
+                        
+                        if citations:
+                            logger.info(f"Adding {len(citations)} citations to thread")
+                            
+                            # Format citations
+                            citations_text = ""
+                            if isinstance(citations, list):
+                                for i, citation in enumerate(citations, 1):
+                                    if isinstance(citation, dict):
+                                        url = citation.get('url', citation.get('link', ''))
+                                        title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
+                                        if url:
+                                            citations_text += f"{i}. [{title}]({url})\n"
+                                        else:
+                                            citations_text += f"{i}. {title}\n"
+                                    elif isinstance(citation, str):
+                                        citations_text += f"{i}. {citation}\n"
+                                    else:
+                                        citations_text += f"{i}. {str(citation)}\n"
+                            
+                            # Split citations if too long for one embed (4096 limit)
+                            if len(citations_text) > 3900:
+                                citations_text = citations_text[:3900] + "..."
+                            
+                            # Create citations embed
+                            citations_embed = discord.Embed(
+                                title="📚 Sources & Citations",
+                                description=citations_text if citations_text else "No citations available.",
+                                color=discord.Color.green()
+                            )
+                            citations_embed.set_footer(text=f"{len(citations)} source(s)")
+                            
+                            # Send citations in the thread
+                            await thread.send(embed=citations_embed)
+                        
+                        # Send a notification in main channel that thread was created
+                        await interaction.followup.send(
+                            f"✅ Additional context posted in thread: {thread.mention}",
+                            ephemeral=True
+                        )
+                        
+                        logger.info(f"Perplexity answer and citations posted in thread {thread.id}")
                     
-                    if truncated:
-                        embed.set_footer(text="⚠️ Answer truncated due to length")
-                    else:
-                        embed.set_footer(text="Powered by Perplexity AI")
-                    
-                    await interaction.followup.send(embed=embed)
+                    except discord.Forbidden:
+                        logger.error("Bot lacks permission to create threads")
+                        await interaction.followup.send(
+                            "❌ Unable to create thread. Bot may lack thread permissions.",
+                            ephemeral=True
+                        )
+                    except discord.HTTPException as e:
+                        logger.error(f"Failed to create thread: {e}")
+                        await interaction.followup.send(
+                            f"❌ Failed to create thread: {str(e)}",
+                            ephemeral=True
+                        )
                 else:
                     # Fallback: create a search URL
                     search_url = self.perplexity_client.format_search_url(self.content[:200])
@@ -435,11 +685,180 @@ class DiscordPoster:
         async def on_ready():
             self.ready = True
             logger.info(f'Discord client logged in as {self.client.user}')
+            logger.info("Persistent button interaction handler is active")
             
             # Verify channel access after connection is established
             if not self._verified_channels:
                 await self._verify_channel_access()
                 self._verified_channels = True
+        
+        @self.client.event
+        async def on_interaction(interaction: discord.Interaction):
+            """Handle button interactions for persistent views after bot restart"""
+            # Only handle component (button) interactions
+            if interaction.type != discord.InteractionType.component:
+                return
+            
+            custom_id = interaction.data.get('custom_id', '')
+            
+            # Check if this is one of our button types
+            if not (custom_id.startswith('not_valuable:') or 
+                    custom_id.startswith('perplexity_search:') or
+                    custom_id.startswith('perplexity_citations:')):
+                return
+            
+            # Check if already responded (prevent double-processing)
+            if interaction.response.is_done():
+                logger.debug(f"Interaction {interaction.id} already processed, skipping")
+                return
+            
+            try:
+                logger.debug(f"Handling persistent button interaction: {custom_id}")
+                
+                # Handle Not Valuable button
+                if custom_id.startswith('not_valuable:'):
+                    entry_hash = custom_id.split(':', 1)[1]
+                    content = interaction.message.content
+                    discord_message_id = interaction.message.id
+                    discord_channel_id = interaction.channel.id
+                    
+                    # Find entry data from database
+                    entry_id = None
+                    category = None
+                    
+                    if self.database:
+                        for eid, mapping in self.database.message_mapping.items():
+                            if mapping.get('discord_message_id') == discord_message_id:
+                                entry_id = eid
+                                category = mapping.get('category', 'unknown')
+                                break
+                    
+                    if not entry_id:
+                        entry_id = f"unknown_{discord_message_id}"
+                        category = "unknown"
+                    
+                    # Check if message has both buttons (combined view) or just one
+                    has_perplexity_button = False
+                    
+                    if interaction.message.components:
+                        for action_row in interaction.message.components:
+                            for component in action_row.children:
+                                if hasattr(component, 'custom_id') and component.custom_id:
+                                    if component.custom_id.startswith('perplexity_search:'):
+                                        has_perplexity_button = True
+                                        break
+                    
+                    # Reconstruct the appropriate view
+                    if has_perplexity_button:
+                        # Need to create combined view to preserve both buttons
+                        perplexity_view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
+                        not_valuable_view = NotValuableView(
+                            entry_id=entry_id,
+                            content=content,
+                            category=category,
+                            discord_channel_id=discord_channel_id,
+                            vote_tracker=self.vote_tracker,
+                            removed_entries_db=self.removed_entries_db,
+                            database=self.database,
+                            entry_hash=entry_hash
+                        )
+                        # Create combined view with parent references
+                        combined_view = CombinedButtonView(perplexity_view, not_valuable_view)
+                        # Call the Not Valuable button callback
+                        await not_valuable_view.button_callback(interaction)
+                    else:
+                        # Just the Not Valuable button
+                        view = NotValuableView(
+                            entry_id=entry_id,
+                            content=content,
+                            category=category,
+                            discord_channel_id=discord_channel_id,
+                            vote_tracker=self.vote_tracker,
+                            removed_entries_db=self.removed_entries_db,
+                            database=self.database,
+                            entry_hash=entry_hash
+                        )
+                        await view.button_callback(interaction)
+                
+                # Handle Perplexity search button
+                elif custom_id.startswith('perplexity_search:'):
+                    entry_hash = custom_id.split(':', 1)[1]
+                    content = interaction.message.content
+                    discord_message_id = interaction.message.id
+                    discord_channel_id = interaction.channel.id
+                    
+                    # Check if message has both buttons (combined view) or just one
+                    has_not_valuable_button = False
+                    
+                    if interaction.message.components:
+                        for action_row in interaction.message.components:
+                            for component in action_row.children:
+                                if hasattr(component, 'custom_id') and component.custom_id:
+                                    if component.custom_id.startswith('not_valuable:'):
+                                        has_not_valuable_button = True
+                                        break
+                    
+                    # Reconstruct the appropriate view
+                    if has_not_valuable_button:
+                        # Need to create combined view to preserve both buttons
+                        # Find entry data from database for Not Valuable button
+                        entry_id = None
+                        category = None
+                        
+                        if self.database:
+                            for eid, mapping in self.database.message_mapping.items():
+                                if mapping.get('discord_message_id') == discord_message_id:
+                                    entry_id = eid
+                                    category = mapping.get('category', 'unknown')
+                                    break
+                        
+                        if not entry_id:
+                            entry_id = f"unknown_{discord_message_id}"
+                            category = "unknown"
+                        
+                        perplexity_view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
+                        not_valuable_view = NotValuableView(
+                            entry_id=entry_id,
+                            content=content,
+                            category=category,
+                            discord_channel_id=discord_channel_id,
+                            vote_tracker=self.vote_tracker,
+                            removed_entries_db=self.removed_entries_db,
+                            database=self.database,
+                            entry_hash=entry_hash
+                        )
+                        # Create combined view with parent references
+                        combined_view = CombinedButtonView(perplexity_view, not_valuable_view)
+                        # Call the Perplexity button callback
+                        await perplexity_view.button_callback(interaction)
+                    else:
+                        # Just the Perplexity button
+                        view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
+                        await view.button_callback(interaction)
+                
+                # Handle Citations button
+                elif custom_id.startswith('perplexity_citations:'):
+                    entry_hash = custom_id.split(':', 1)[1]
+                    # Citations functionality not currently implemented
+                    logger.debug(f"Citations button clicked: {custom_id}")
+                
+            except discord.errors.InteractionResponded:
+                # Interaction was already responded to - this is fine, just log it
+                logger.debug(f"Interaction {interaction.id} was already responded to (likely double-click)")
+            except discord.errors.NotFound:
+                # Interaction expired - this is fine for old buttons
+                logger.debug(f"Interaction {interaction.id} expired or not found")
+            except Exception as e:
+                logger.error(f"Error handling button interaction: {e}", exc_info=True)
+                # Try to send error message if we haven't responded yet
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "❌ An error occurred while processing your request.",
+                            ephemeral=True
+                        )
+                except:
+                    pass
         
         @self.client.event
         async def on_message(message):

@@ -23,6 +23,12 @@ PERPLEXITY_BUTTON_LABEL = "Get More Info"
 PERPLEXITY_BUTTON_EMOJI = "🔍"
 PERPLEXITY_BUTTON_STYLE = "primary"  # primary (blue), secondary (gray), success (green), danger (red)
 
+# Citations button configuration (appears after Perplexity search completes)
+PERPLEXITY_CITATIONS_BUTTON_ENABLED = True  # Enable/disable citations button
+PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"
+PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"
+PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # primary (blue), secondary (gray), success (green), danger (red)
+
 # RSS Feed URLs
 RSS_FEEDS = {
     "unusual_whales": "https://rss.app/feeds/MRsE23OX1FDxCdJ6.xml",
@@ -36,17 +42,17 @@ RSS_FEEDS = {
 
 # Discord Channel IDs for each category
 DISCORD_CHANNELS = {
-    "crypto": 1317592423962251275,
-    "news/politics": 1317592486927007784,
-    "stocks": 1317592539192229918,
-    "artificial intelligence": 1317592582368268338,
-    "video games": 1317592652044046347,
-    "sports": 1317592748005654688,
-    "food": 1317592771258749078,
-    "technology": 1317592703554420796,
-    "music": 1343736462939783259,
-    "fashion": 1344412433552248973,
-    "pop culture": 1442779289526472774,
+    "crypto": 775513484221743124,
+    "news/politics": 1379921787629867138,
+    "stocks": 854937605590220810,
+    "artificial intelligence": 985273104483885137,
+    "video games": 846045909002354739,
+    "sports": 845809605934317639,
+    "food": 852256197494046731,
+    "technology": 928462998228598794,
+    "music": 1300884069583687800,
+    "fashion": 867223341626294282,
+    "pop culture": 1432086691862024403,
     "ignore": 1344410355224547441
 }
 

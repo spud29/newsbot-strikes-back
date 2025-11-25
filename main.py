@@ -127,6 +127,11 @@ class NewsAggregatorBot:
                 logger.debug(f"Already processed, skipping: {entry_id}")
                 return False
             
+            # Check if previously removed via voting
+            if self.removed_entries_db.is_removed(entry_id):
+                logger.debug(f"Entry was previously removed by voting, skipping: {entry_id}")
+                return False
+            
             # Get initial content for duplicate check (before downloading media)
             content = entry.get('content', '')
             
