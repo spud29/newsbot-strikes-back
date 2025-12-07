@@ -18,16 +18,21 @@ PERPLEXITY_BASE_URL = "https://api.perplexity.ai"
 # Common models: sonar-small-online, sonar-medium-online, sonar-pro
 # See https://docs.perplexity.ai/getting-started/models for full list
 PERPLEXITY_MODEL = "sonar-reasoning-pro"  # Model with web search capability
-PERPLEXITY_BUTTON_ENABLED = True  # Enable/disable Perplexity search buttons on Discord posts
-PERPLEXITY_BUTTON_LABEL = "Get More Info"
-PERPLEXITY_BUTTON_EMOJI = "🔍"
-PERPLEXITY_BUTTON_STYLE = "primary"  # primary (blue), secondary (gray), success (green), danger (red)
 
-# Citations button configuration (appears after Perplexity search completes)
-PERPLEXITY_CITATIONS_BUTTON_ENABLED = True  # Enable/disable citations button
-PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"
-PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"
-PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # primary (blue), secondary (gray), success (green), danger (red)
+# Context Menu Commands (Right-click on bot messages → Apps → Command Name)
+# Note: These replaced buttons for a cleaner UI. Users right-click bot messages to access features.
+PERPLEXITY_BUTTON_ENABLED = True  # Enable/disable "Get More Info" context menu command
+# The following button appearance configs are kept for backward compatibility but are no longer used
+# (Context menu commands use simple text names)
+PERPLEXITY_BUTTON_LABEL = "Get More Info"  # Not used by context menu
+PERPLEXITY_BUTTON_EMOJI = "🔍"  # Not used by context menu
+PERPLEXITY_BUTTON_STYLE = "primary"  # Not used by context menu
+
+# Citations are now automatically included in the "Get More Info" thread response
+PERPLEXITY_CITATIONS_BUTTON_ENABLED = True  # Not used (citations always shown if available)
+PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"  # Not used by context menu
+PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"  # Not used by context menu
+PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # Not used by context menu
 
 # RSS Feed URLs
 RSS_FEEDS = {
@@ -42,17 +47,17 @@ RSS_FEEDS = {
 
 # Discord Channel IDs for each category
 DISCORD_CHANNELS = {
-    "crypto": 775513484221743124,
-    "news/politics": 1379921787629867138,
-    "stocks": 854937605590220810,
-    "artificial intelligence": 985273104483885137,
-    "video games": 846045909002354739,
-    "sports": 845809605934317639,
-    "food": 852256197494046731,
-    "technology": 928462998228598794,
-    "music": 1300884069583687800,
-    "fashion": 867223341626294282,
-    "pop culture": 1432086691862024403,
+    "crypto": 1317592423962251275,
+    "news/politics": 1317592486927007784,
+    "stocks": 1317592539192229918,
+    "artificial intelligence": 1317592582368268338,
+    "video games": 1317592652044046347,
+    "sports": 1317592748005654688,
+    "food": 1317592771258749078,
+    "technology": 1317592703554420796,
+    "music": 1343736462939783259,
+    "fashion": 1344412433552248973,
+    "pop culture": 1442779289526472774,
     "ignore": 1344410355224547441
 }
 
@@ -256,14 +261,29 @@ DISCORD_FILE_SIZE_LIMIT_MB = 25
 # Feedback Learning Configuration
 FEEDBACK_LEARNING_ENABLED = True  # Enable learning from user feedback (removed entries)
 FEEDBACK_EXAMPLES_COUNT = 20  # Number of removed entries to include in system prompt
-NOT_VALUABLE_BUTTON_ENABLED = True  # Enable "Not Valuable" button on Discord posts
-NOT_VALUABLE_BUTTON_LABEL = "Not Valuable"
-NOT_VALUABLE_BUTTON_EMOJI = "🗑️"
-NOT_VALUABLE_BUTTON_STYLE = "danger"  # primary (blue), secondary (gray), success (green), danger (red)
+
+# "Not Valuable" Context Menu Command (Right-click on bot messages → Apps → "Not Valuable")
+# Note: This replaced the button for a cleaner UI. Users right-click bot messages to vote.
+NOT_VALUABLE_BUTTON_ENABLED = True  # Enable/disable "Not Valuable" context menu command
+# The following button appearance configs are kept for backward compatibility but are no longer used
+NOT_VALUABLE_BUTTON_LABEL = "Not Valuable"  # Not used by context menu
+NOT_VALUABLE_BUTTON_EMOJI = "🗑️"  # Not used by context menu
+NOT_VALUABLE_BUTTON_STYLE = "danger"  # Not used by context menu
 NOT_VALUABLE_VOTES_REQUIRED = 2  # Number of unique votes needed to remove entry
 
-# Re-categorize command configuration
-RECATEGORIZE_COMMAND_ENABLED = True  # Enable text command for re-categorizing entries
-RECATEGORIZE_COMMAND_PREFIX = "!recategorize"  # Command prefix (e.g., "!recategorize crypto")
+# Re-categorize Context Menu Command (Right-click on bot messages → Apps → "Re-categorize")
+# Note: This is a restricted command that only specific users can access
+RECATEGORIZE_COMMAND_ENABLED = True  # Enable/disable "Re-categorize" context menu command
 RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed to re-categorize entries
 
+# Newsworthiness Filter Configuration
+# Filters out mundane/routine news by rating surprise, impact, and actionability
+# Only posts that score ABOVE the threshold will be posted to their category
+# Posts below threshold go to the 'ignore' channel for review
+NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the newsworthiness filter
+NEWSWORTHINESS_THRESHOLD = 7.0  # STRICT: 1-10 scale, only high-quality news gets through
+NEWSWORTHINESS_WEIGHTS = {
+    'surprising': 0.45,   # 45% weight - must be genuinely unexpected, not routine
+    'impact': 0.35,       # 35% weight - must affect many people significantly  
+    'actionable': 0.20    # 20% weight - should prompt action or attention
+}

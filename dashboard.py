@@ -314,6 +314,96 @@ async def get_bot_status(username: str = Depends(verify_credentials)):
         }
 
 
+@app.post("/api/bot/kill")
+async def kill_bot(username: str = Depends(verify_credentials)):
+    """Kill the bot process without restarting"""
+    pid_file = os.path.join("data", "bot.pid")
+    
+    try:
+        # Check if PID file exists
+        if not os.path.exists(pid_file):
+            return {
+                "success": False,
+                "error": "Bot PID file not found. Bot may not be running."
+            }
+        
+        # Read PID from file
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        
+        logger.info(f"Attempting to kill bot process (PID: {pid})...")
+        
+        # Try to kill the process
+        try:
+            import psutil
+            if psutil.pid_exists(pid):
+                process = psutil.Process(pid)
+                process.terminate()
+                # Wait for process to terminate
+                try:
+                    process.wait(timeout=10)
+                    logger.info(f"Bot process {pid} terminated successfully")
+                except psutil.TimeoutExpired:
+                    # Force kill if it doesn't terminate
+                    process.kill()
+                    logger.warning(f"Bot process {pid} force killed")
+            else:
+                logger.warning(f"Process {pid} does not exist (stale PID file)")
+                # Remove stale PID file
+                os.remove(pid_file)
+                return {
+                    "success": False,
+                    "error": f"Process {pid} not found (removed stale PID file)"
+                }
+        except ImportError:
+            # Fallback without psutil
+            if sys.platform == "win32":
+                result = subprocess.run(["taskkill", "/F", "/PID", str(pid)], 
+                                      capture_output=True, text=True)
+                if result.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"Failed to kill process: {result.stderr}"
+                    }
+            else:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(2)
+                    # Try SIGKILL if still running
+                    try:
+                        os.kill(pid, 0)  # Check if still alive
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass  # Process already dead
+                except OSError as e:
+                    return {
+                        "success": False,
+                        "error": f"Failed to kill process: {str(e)}"
+                    }
+            
+            logger.info(f"Sent termination signal to bot process {pid}")
+        
+        # Remove PID file
+        try:
+            os.remove(pid_file)
+            logger.info("Removed bot PID file")
+        except Exception as e:
+            logger.warning(f"Failed to remove PID file: {e}")
+        
+        return {
+            "success": True,
+            "message": f"Bot process {pid} terminated successfully",
+            "pid": pid
+        }
+        
+    except Exception as e:
+        logger.error(f"Error killing bot: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 @app.post("/api/bot/restart")
 async def restart_bot(username: str = Depends(verify_credentials)):
     """Restart the bot process"""
@@ -672,11 +762,13 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
             new_entry_id = f"manual_reprocess_{int(time.time())}"
             db.add_embedding(content, embedding, entry_id=new_entry_id)
             db.mark_processed(new_entry_id)
-            # Try to preserve video_urls from original entry if available
+            # Try to preserve video_urls and source_type from original entry if available
             original_video_urls = []
+            original_source_type = None
             if original_entry_id in db.message_mapping:
                 original_mapping = db.message_mapping[original_entry_id]
                 original_video_urls = original_mapping.get('video_urls', [])
+                original_source_type = original_mapping.get('source_type')
             
             db.store_message_mapping(
                 telegram_entry_id=new_entry_id,
@@ -685,7 +777,8 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
                 discord_message_id=discord_message_id,
                 content=content,
                 source_url=source_url,
-                video_urls=original_video_urls
+                video_urls=original_video_urls,
+                source_type=original_source_type
             )
             
             logger.info(f"Successfully reprocessed {entry_id} as {new_entry_id}")
@@ -1082,6 +1175,7 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
             "discord_channel_id": None,
             "discord_message_id": None,
             "telegram_message_id": None,
+            "category": None,
             "embedding_info": None,
             "media": {
                 "images": [],
@@ -1107,6 +1201,7 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
                 result["discord_channel_id"] = mapping_data.get('discord_channel_id')
                 result["discord_message_id"] = mapping_data.get('discord_message_id')
                 result["telegram_message_id"] = mapping_data.get('telegram_message_id')
+                result["category"] = mapping_data.get('category')
                 telegram_message_id = mapping_data.get('telegram_message_id')
                 # Get video URLs from message mapping (for Twitter entries)
                 video_urls = mapping_data.get('video_urls', [])
@@ -1145,6 +1240,7 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
                         result["discord_channel_id"] = mapping_data.get('discord_channel_id')
                         result["discord_message_id"] = mapping_data.get('discord_message_id')
                         result["telegram_message_id"] = mapping_data.get('telegram_message_id')
+                        result["category"] = mapping_data.get('category')
                         telegram_message_id = mapping_data.get('telegram_message_id')
                         # Get video URLs from message mapping (for Twitter entries)
                         video_urls = mapping_data.get('video_urls', [])
@@ -1872,6 +1968,184 @@ async def restore_removed_entry(entry_id: str, username: str = Depends(verify_cr
             }
     except Exception as e:
         logger.error(f"Error restoring entry: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@app.post("/api/entry/{entry_id}/recategorize-from-ignore")
+async def recategorize_from_ignore(entry_id: str, username: str = Depends(verify_credentials)):
+    """
+    Re-categorize an entry from the ignore category
+    
+    This endpoint:
+    1. Verifies the entry is currently in the "ignore" category
+    2. Re-runs AI categorization with "ignore" blocked
+    3. Deletes the old Discord message
+    4. Posts to the new category
+    5. Updates database records
+    6. Removes from removed_entries if present
+    
+    Args:
+        entry_id: Entry ID to re-categorize
+        username: Authenticated username
+    
+    Returns:
+        dict: Success status and details
+    """
+    try:
+        logger.info(f"Re-categorize from ignore requested for entry: {entry_id}")
+        
+        # Reload databases to get fresh data
+        db.processed_ids = db._load_json(db.processed_ids_path, {})
+        db.message_mapping = db._load_json(db.message_mapping_path, {})
+        removed_entries_db.entries = removed_entries_db._load_entries()
+        
+        # Check if entry exists
+        if entry_id not in db.message_mapping:
+            return {
+                'success': False,
+                'error': 'Entry not found in message mapping'
+            }
+        
+        mapping_data = db.message_mapping[entry_id]
+        current_category = mapping_data.get('category')
+        
+        # Verify entry is in ignore category
+        if current_category != 'ignore':
+            return {
+                'success': False,
+                'error': f'Entry is not in ignore category (current category: {current_category})'
+            }
+        
+        # Get entry details
+        content = mapping_data.get('content')
+        if not content:
+            return {
+                'success': False,
+                'error': 'No content found for this entry'
+            }
+        
+        source_url = mapping_data.get('source_url')
+        video_urls = mapping_data.get('video_urls', [])
+        old_discord_channel_id = mapping_data.get('discord_channel_id')
+        old_discord_message_id = mapping_data.get('discord_message_id')
+        telegram_message_id = mapping_data.get('telegram_message_id', 0)
+        
+        # Parse source type from entry_id
+        parts = entry_id.split('_')
+        source_type = parts[0] if parts else 'unknown'
+        
+        logger.info(f"Entry details: content_length={len(content)}, source_type={source_type}, old_category={current_category}")
+        
+        # Step 1: Re-categorize with "ignore" excluded
+        logger.info("Running AI categorization with 'ignore' excluded...")
+        new_category = ollama.categorize(content, exclude_categories=['ignore'])
+        logger.info(f"New category determined: {new_category}")
+        
+        # Safety check: ensure we didn't get "ignore" again
+        if new_category == 'ignore':
+            logger.error("AI still returned 'ignore' despite exclusion, forcing to news/politics")
+            new_category = 'news/politics'
+        
+        # Get Discord channel for new category
+        new_discord_channel_id = config.DISCORD_CHANNELS.get(new_category)
+        if not new_discord_channel_id:
+            return {
+                'success': False,
+                'error': f'No Discord channel configured for category: {new_category}'
+            }
+        
+        # Step 2: Find and prepare media files
+        media_files = []
+        telegram_message_id_for_media = telegram_message_id if telegram_message_id and telegram_message_id != 0 else None
+        
+        # Try to find media files in temp_media directory
+        media_info = find_media_files_for_entry(
+            entry_id,
+            source_type,
+            telegram_message_id_for_media
+        )
+        
+        # Convert media URLs to file paths
+        from pathlib import Path
+        temp_media_dir = Path("temp_media")
+        
+        for image_url in media_info.get('images', []):
+            # Extract path from URL (format: /api/temp-media/path)
+            if image_url.startswith('/api/temp-media/'):
+                rel_path = image_url.replace('/api/temp-media/', '')
+                file_path = temp_media_dir / rel_path
+                if file_path.exists():
+                    media_files.append(str(file_path))
+        
+        logger.info(f"Found {len(media_files)} media files for re-posting")
+        
+        # Step 3: Delete old Discord message
+        if old_discord_channel_id and old_discord_message_id:
+            try:
+                old_channel = discord_poster.client.get_channel(old_discord_channel_id)
+                if old_channel:
+                    old_message = await old_channel.fetch_message(old_discord_message_id)
+                    await old_message.delete()
+                    logger.info(f"Deleted old Discord message {old_discord_message_id} from channel {old_discord_channel_id}")
+                else:
+                    logger.warning(f"Could not find old Discord channel {old_discord_channel_id}")
+            except Exception as e:
+                logger.error(f"Error deleting old Discord message: {e}")
+                # Continue anyway - we still want to post to new category
+        
+        # Step 4: Post to new category
+        logger.info(f"Posting to new category '{new_category}' with {len(media_files)} media files...")
+        success, new_discord_message_id, returned_channel_id = await discord_poster.post_message(
+            category=new_category,
+            content=content,
+            media_files=media_files if media_files else None,
+            video_urls=video_urls if video_urls else None,
+            source_type=source_type,
+            entry_id=entry_id
+        )
+        
+        if not success or not new_discord_message_id:
+            return {
+                'success': False,
+                'error': 'Failed to post message to Discord in new category'
+            }
+        
+        logger.info(f"Successfully posted to new category, Discord message ID: {new_discord_message_id}")
+        
+        # Step 5: Update message mapping
+        db.store_message_mapping(
+            telegram_entry_id=entry_id,
+            telegram_message_id=telegram_message_id,
+            discord_channel_id=returned_channel_id,
+            discord_message_id=new_discord_message_id,
+            content=content,
+            source_url=source_url,
+            video_urls=video_urls,
+            category=new_category,
+            source_type=source_type
+        )
+        
+        # Step 6: Remove from removed_entries if present
+        if removed_entries_db.is_removed(entry_id):
+            removed_entries_db.restore_entry(entry_id)
+            logger.info(f"Removed entry {entry_id} from removed_entries database")
+        
+        logger.info(f"Successfully re-categorized {entry_id} from '{current_category}' to '{new_category}'")
+        
+        return {
+            'success': True,
+            'old_category': current_category,
+            'new_category': new_category,
+            'discord_message_id': new_discord_message_id,
+            'discord_channel_id': returned_channel_id,
+            'message': f'Successfully re-categorized from {current_category} to {new_category}'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error re-categorizing entry: {e}", exc_info=True)
         return {
             'success': False,
             'error': str(e)

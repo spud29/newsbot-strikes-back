@@ -109,7 +109,10 @@
                         <div id="bot-process-details" class="mt-2 small text-muted"></div>
                     </div>
                     <div class="col-md-6 text-md-end mt-3 mt-md-0">
-                        <button id="restart-bot-btn" class="btn btn-danger btn-lg" onclick="restartBot()" disabled>
+                        <button id="kill-bot-btn" class="btn btn-danger btn-lg me-2" onclick="killBot()" disabled>
+                            <i class="bi bi-x-circle"></i> Kill Bot
+                        </button>
+                        <button id="restart-bot-btn" class="btn btn-warning btn-lg" onclick="restartBot()" disabled>
                             <i class="bi bi-arrow-clockwise"></i> Restart Bot
                         </button>
                     </div>
@@ -188,6 +191,11 @@
                 </div>
             </div>
             <div class="modal-footer">
+                <div id="recategorize-button-container" style="display: none;">
+                    <button type="button" class="btn btn-warning" id="recategorize-btn" onclick="recategorizeEntry()">
+                        <i class="bi bi-arrow-repeat"></i> Re-categorize & Repost
+                    </button>
+                </div>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
             </div>
         </div>
@@ -206,22 +214,93 @@ async function checkBotStatus() {
         const statusDiv = document.getElementById('bot-process-status');
         const detailsDiv = document.getElementById('bot-process-details');
         const restartBtn = document.getElementById('restart-bot-btn');
+        const killBtn = document.getElementById('kill-bot-btn');
         
         if (status.running) {
             statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-success"><i class="bi bi-check-circle-fill"></i> Running</span></h5>';
             detailsDiv.textContent = `Process ID: ${status.pid || 'N/A'}`;
             restartBtn.disabled = false;
+            killBtn.disabled = false;
         } else {
             statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-x-circle-fill"></i> Stopped</span></h5>';
             detailsDiv.textContent = status.message || 'Bot is not running';
             restartBtn.disabled = false;
             restartBtn.innerHTML = '<i class="bi bi-play-fill"></i> Start Bot';
+            killBtn.disabled = true;
         }
     } catch (error) {
         console.error('Error checking bot status:', error);
         const statusDiv = document.getElementById('bot-process-status');
         statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-warning"><i class="bi bi-exclamation-triangle-fill"></i> Unknown</span></h5>';
         document.getElementById('restart-bot-btn').disabled = true;
+        document.getElementById('kill-bot-btn').disabled = true;
+    }
+}
+
+async function killBot() {
+    if (!confirm('Are you sure you want to kill the bot? This will immediately terminate the bot process without restarting it. You will need to manually restart it.')) {
+        return;
+    }
+    
+    const statusDiv = document.getElementById('bot-process-status');
+    const killBtn = document.getElementById('kill-bot-btn');
+    const restartBtn = document.getElementById('restart-bot-btn');
+    
+    // Show loading state
+    statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-warning"><i class="bi bi-x-circle"></i> Killing...</span></h5>';
+    killBtn.disabled = true;
+    killBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Killing...';
+    restartBtn.disabled = true;
+    
+    try {
+        const response = await fetch('/api/bot/kill', {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-x-circle-fill"></i> Killed</span></h5>';
+            document.getElementById('bot-process-details').textContent = `Process ${result.pid} terminated`;
+            
+            // Show success alert
+            const alertHtml = `
+                <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                    <i class="bi bi-check-circle-fill"></i> <strong>Success!</strong> Bot process has been terminated.
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            document.querySelector('.card-body .alert-warning').insertAdjacentHTML('afterend', alertHtml);
+            
+            // Wait a moment then refresh status
+            setTimeout(() => {
+                checkBotStatus();
+            }, 2000);
+        } else {
+            statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-exclamation-circle-fill"></i> Kill Failed</span></h5>';
+            document.getElementById('bot-process-details').textContent = result.error || 'Unknown error';
+            
+            // Show error alert
+            const alertHtml = `
+                <div class="alert alert-danger alert-dismissible fade show mt-3" role="alert">
+                    <i class="bi bi-x-circle-fill"></i> <strong>Error!</strong> ${result.error || 'Failed to kill bot'}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            document.querySelector('.card-body .alert-warning').insertAdjacentHTML('afterend', alertHtml);
+            
+            killBtn.disabled = false;
+            killBtn.innerHTML = '<i class="bi bi-x-circle"></i> Kill Bot';
+            restartBtn.disabled = false;
+        }
+    } catch (error) {
+        console.error('Error killing bot:', error);
+        statusDiv.innerHTML = '<h5 class="mb-0"><span class="text-danger"><i class="bi bi-exclamation-circle-fill"></i> Error</span></h5>';
+        document.getElementById('bot-process-details').textContent = 'Failed to communicate with server';
+        killBtn.disabled = false;
+        killBtn.innerHTML = '<i class="bi bi-x-circle"></i> Kill Bot';
+        restartBtn.disabled = false;
+        
+        alert('Failed to kill bot: ' + error.message);
     }
 }
 
@@ -475,6 +554,20 @@ async function showEntryDetails(entryId) {
         // Format timestamp
         const timestamp = data.timestamp ? new Date(data.timestamp * 1000).toLocaleString() : 'N/A';
         
+        // Store entry data for recategorization
+        window.currentEntryData = {
+            entry_id: data.entry_id,
+            category: data.category
+        };
+        
+        // Show/hide re-categorize button based on category
+        const recategorizeContainer = document.getElementById('recategorize-button-container');
+        if (data.category === 'ignore') {
+            recategorizeContainer.style.display = 'block';
+        } else {
+            recategorizeContainer.style.display = 'none';
+        }
+        
         // Build details HTML
         let html = '<div class="row">';
         
@@ -484,6 +577,7 @@ async function showEntryDetails(entryId) {
         html += '<table class="table table-sm table-borderless">';
         html += `<tr><th width="40%">Entry ID:</th><td><code>${data.entry_id}</code></td></tr>`;
         html += `<tr><th>Source Type:</th><td><span class="badge bg-secondary">${data.source_type || 'N/A'}</span></td></tr>`;
+        html += `<tr><th>Category:</th><td><span class="badge bg-${data.category === 'ignore' ? 'warning' : 'info'}">${data.category || 'N/A'}</span></td></tr>`;
         html += `<tr><th>Processed:</th><td>${timestamp}</td></tr>`;
         html += '</table>';
         html += '</div>';
@@ -633,6 +727,91 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+async function recategorizeEntry() {
+    if (!window.currentEntryData || !window.currentEntryData.entry_id) {
+        alert('Error: No entry data available');
+        return;
+    }
+    
+    const entryId = window.currentEntryData.entry_id;
+    const currentCategory = window.currentEntryData.category;
+    
+    if (!confirm(`Re-categorize this entry from "${currentCategory}"?\n\nThe AI will automatically determine the best category (excluding "ignore"), delete the old message, and post to the new category.`)) {
+        return;
+    }
+    
+    const recategorizeBtn = document.getElementById('recategorize-btn');
+    const originalBtnHtml = recategorizeBtn.innerHTML;
+    
+    // Show loading state
+    recategorizeBtn.disabled = true;
+    recategorizeBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Re-categorizing...';
+    
+    try {
+        const response = await fetch(`/api/entry/${encodeURIComponent(entryId)}/recategorize-from-ignore`, {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            // Show success message
+            const alertHtml = `
+                <div class="alert alert-success alert-dismissible fade show mb-3" role="alert">
+                    <i class="bi bi-check-circle-fill"></i> <strong>Success!</strong> 
+                    Entry re-categorized from <strong>${result.old_category}</strong> to <strong>${result.new_category}</strong>.
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            
+            const modalBody = document.getElementById('entry-details-body');
+            modalBody.insertAdjacentHTML('afterbegin', alertHtml);
+            
+            // Refresh entry details to show new category
+            setTimeout(() => {
+                showEntryDetails(entryId);
+            }, 2000);
+            
+            // Also refresh the main stats
+            setTimeout(() => {
+                refreshStats();
+            }, 2500);
+        } else {
+            // Show error message
+            const alertHtml = `
+                <div class="alert alert-danger alert-dismissible fade show mb-3" role="alert">
+                    <i class="bi bi-x-circle-fill"></i> <strong>Error!</strong> 
+                    ${result.error || 'Failed to re-categorize entry'}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            `;
+            
+            const modalBody = document.getElementById('entry-details-body');
+            modalBody.insertAdjacentHTML('afterbegin', alertHtml);
+            
+            // Re-enable button
+            recategorizeBtn.disabled = false;
+            recategorizeBtn.innerHTML = originalBtnHtml;
+        }
+    } catch (error) {
+        console.error('Error re-categorizing entry:', error);
+        
+        const alertHtml = `
+            <div class="alert alert-danger alert-dismissible fade show mb-3" role="alert">
+                <i class="bi bi-x-circle-fill"></i> <strong>Error!</strong> 
+                Failed to re-categorize: ${error.message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        `;
+        
+        const modalBody = document.getElementById('entry-details-body');
+        modalBody.insertAdjacentHTML('afterbegin', alertHtml);
+        
+        // Re-enable button
+        recategorizeBtn.disabled = false;
+        recategorizeBtn.innerHTML = originalBtnHtml;
+    }
 }
 
 // Load stats on page load

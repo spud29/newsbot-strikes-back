@@ -237,6 +237,21 @@ class NewsAggregatorBot:
                 category = self.ollama.categorize(combined_content)
                 logger.info(f"Category: {category}")
             
+            # Apply newsworthiness filter (only for non-forced, non-ignore categories)
+            if not force_category and category != 'ignore':
+                if getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
+                    logger.debug("Rating newsworthiness...")
+                    newsworthiness = self.ollama.rate_newsworthiness(combined_content, category)
+                    
+                    if not newsworthiness['passed']:
+                        original_category = category
+                        category = 'ignore'
+                        logger.info(
+                            f"Newsworthiness filter: {newsworthiness['score']:.1f}/10 below threshold "
+                            f"- routing from '{original_category}' to 'ignore' "
+                            f"(reason: {newsworthiness['reasoning']})"
+                        )
+            
             # Post to Discord
             media_files = entry.get('media_files', [])
             video_urls = entry.get('video_urls', [])
@@ -285,7 +300,8 @@ class NewsAggregatorBot:
                         content=content,
                         source_url=source_url,
                         video_urls=entry.get('video_urls', []),
-                        category=category
+                        category=category,
+                        source_type=source_type
                     )
                 
                 # Update last message ID for Telegram entries
@@ -541,7 +557,7 @@ class NewsAggregatorBot:
             )
             
             if success:
-                # Update the stored content in the mapping (preserve source_url and category)
+                # Update the stored content in the mapping (preserve source_url, category, and source_type)
                 self.db.store_message_mapping(
                     telegram_entry_id=entry_id,
                     telegram_message_id=mapping_info['telegram_message_id'],
@@ -550,7 +566,8 @@ class NewsAggregatorBot:
                     content=new_content,
                     source_url=mapping_info.get('source_url'),
                     video_urls=mapping_info.get('video_urls', []),
-                    category=mapping_info.get('category')
+                    category=mapping_info.get('category'),
+                    source_type=mapping_info.get('source_type', 'telegram')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

@@ -1,8 +1,9 @@
 """
 Discord poster for sending messages with media attachments
+Now using context menu commands instead of buttons for cleaner UI
 """
 import discord
-from discord.ui import Button, View, Select
+from discord import app_commands
 import os
 import asyncio
 import re
@@ -13,305 +14,310 @@ from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
 
 
-class CitationsView(View):
-    """Discord UI View containing a Citations display button"""
+class DiscordPoster:
+    """Posts messages to Discord channels with context menu command support"""
     
-    def __init__(self, citations, entry_hash):
+    def __init__(self, perplexity_client=None, database=None, vote_tracker=None, removed_entries_db=None):
         """
-        Initialize the view with a citations button
+        Initialize Discord client with app commands support
         
         Args:
-            citations: List of citation objects/strings from Perplexity
-            entry_hash: Unique hash of the entry for tracking
+            perplexity_client: Optional PerplexityClient instance for search commands
+            database: Optional Database instance for entry removal
+            vote_tracker: Optional VoteTracker instance
+            removed_entries_db: Optional RemovedEntriesDB instance
         """
-        super().__init__(timeout=None)  # No timeout for persistent views
-        self.citations = citations
-        self.entry_hash = entry_hash
-        self.citations_shown = False
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True  # Ensure we can see guilds/channels
         
-        # Get button configuration from config
-        button_label = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_LABEL', 'View Citations')
-        button_emoji = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_EMOJI', '📚')
+        self.client = discord.Client(intents=intents)
+        self.tree = app_commands.CommandTree(self.client)
         
-        # Map string style to discord.ButtonStyle
-        style_map = {
-            'primary': discord.ButtonStyle.primary,
-            'secondary': discord.ButtonStyle.secondary,
-            'success': discord.ButtonStyle.success,
-            'danger': discord.ButtonStyle.danger,
-        }
-        button_style_str = getattr(config, 'PERPLEXITY_CITATIONS_BUTTON_STYLE', 'secondary')
-        button_style = style_map.get(button_style_str, discord.ButtonStyle.secondary)
-        
-        # Create the button with custom_id for persistence
-        button = Button(
-            style=button_style,
-            label=button_label,
-            emoji=button_emoji,
-            custom_id=f"perplexity_citations:{entry_hash}"
-        )
-        button.callback = self.button_callback
-        self.add_item(button)
-    
-    async def button_callback(self, interaction: discord.Interaction):
-        """
-        Handle button click - display citations
-        
-        Args:
-            interaction: Discord interaction from button click
-        """
-        try:
-            # Check if citations were already shown
-            if self.citations_shown:
-                await interaction.response.send_message(
-                    "Citations have already been displayed.",
-                    ephemeral=True
-                )
-                return
-            
-            # Defer the response to show loading state
-            await interaction.response.defer(ephemeral=False)
-            
-            logger.info(f"Citations button clicked for entry hash: {self.entry_hash}")
-            
-            # Check if we have citations
-            if not self.citations:
-                await interaction.followup.send(
-                    "❌ No citations are available for this response.",
-                    ephemeral=True
-                )
-                return
-            
-            # Format citations
-            citations_text = ""
-            
-            # Handle different citation formats
-            if isinstance(self.citations, list):
-                for i, citation in enumerate(self.citations, 1):
-                    if isinstance(citation, dict):
-                        # Citation is a dictionary with url and possibly title/name
-                        url = citation.get('url', citation.get('link', ''))
-                        title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
-                        if url:
-                            citations_text += f"{i}. [{title}]({url})\n"
-                        else:
-                            citations_text += f"{i}. {title}\n"
-                    elif isinstance(citation, str):
-                        # Citation is just a URL string
-                        citations_text += f"{i}. {citation}\n"
-                    else:
-                        # Unknown format, try to convert to string
-                        citations_text += f"{i}. {str(citation)}\n"
-            elif isinstance(self.citations, dict):
-                # Citations might be a dictionary
-                for i, (key, value) in enumerate(self.citations.items(), 1):
-                    if isinstance(value, str):
-                        citations_text += f"{i}. {key}: {value}\n"
-                    else:
-                        citations_text += f"{i}. {key}\n"
-            else:
-                citations_text = str(self.citations)
-            
-            # Create a thread on the original message for the citations
-            thread_name = "📚 Sources & Citations"
-            
-            try:
-                # Create a public thread on the original message
-                thread = await interaction.message.create_thread(
-                    name=thread_name,
-                    auto_archive_duration=1440  # Archive after 24 hours of inactivity
-                )
-                logger.info(f"Created thread {thread.id} for citations")
-                
-                # Truncate if too long (Discord embed description limit is 4096)
-                max_length = 3900
-                truncated = False
-                if len(citations_text) > max_length:
-                    citations_text = citations_text[:max_length] + "..."
-                    truncated = True
-                
-                # Create an embed for citations
-                embed = discord.Embed(
-                    title="📚 Sources & Citations",
-                    description=citations_text if citations_text else "No citations available.",
-                    color=discord.Color.green()
-                )
-                
-                if truncated:
-                    embed.set_footer(text="⚠️ Citation list truncated due to length")
-                else:
-                    embed.set_footer(text=f"{len(self.citations)} source(s)")
-                
-                # Send the embed in the thread
-                await thread.send(embed=embed)
-                
-                # Disable the button in the message
-                for item in self.children:
-                    if isinstance(item, Button):
-                        item.disabled = True
-                
-                # Update the message to disable the button
-                try:
-                    await interaction.message.edit(view=self)
-                except Exception as e:
-                    logger.warning(f"Failed to disable citations button: {e}")
-                
-                # Mark as shown
-                self.citations_shown = True
-                
-                # Send a notification that thread was created
-                await interaction.followup.send(
-                    f"✅ Citations posted in thread: {thread.mention}",
-                    ephemeral=True
-                )
-                
-                logger.info(f"Citations posted in thread {thread.id}")
-            
-            except discord.Forbidden:
-                logger.error("Bot lacks permission to create threads")
-                await interaction.followup.send(
-                    "❌ Unable to create thread. Bot may lack thread permissions.",
-                    ephemeral=True
-                )
-            except discord.HTTPException as e:
-                logger.error(f"Failed to create thread: {e}")
-                await interaction.followup.send(
-                    f"❌ Failed to create thread: {str(e)}",
-                    ephemeral=True
-                )
-            
-            logger.info(f"Citations displayed for entry hash: {self.entry_hash}")
-        
-        except Exception as e:
-            logger.error(f"Error in Citations button callback: {e}", exc_info=True)
-            try:
-                await interaction.followup.send(
-                    f"❌ An error occurred while displaying citations: {str(e)}",
-                    ephemeral=True
-                )
-            except:
-                pass
-
-
-class PerplexitySearchView(View):
-    """Discord UI View containing a Perplexity search button"""
-    
-    def __init__(self, content, perplexity_client, entry_hash):
-        """
-        Initialize the view with a search button
-        
-        Args:
-            content: The entry content/headline to search for
-            perplexity_client: Instance of PerplexityClient
-            entry_hash: Unique hash of the entry for tracking
-        """
-        super().__init__(timeout=None)  # No timeout for persistent views
-        self.content = content
+        # Store reference to self for command closures  
+        _poster_ref = self
+        self.token = config.DISCORD_TOKEN
+        self.channels = config.DISCORD_CHANNELS
+        self.ready = False
+        self._verified_channels = False
+        self._client_task = None
         self.perplexity_client = perplexity_client
-        self.entry_hash = entry_hash
-        self.search_performed = False
-        self.parent_view = None  # Reference to parent CombinedButtonView if exists
         
-        # Get button configuration from config
-        button_label = getattr(config, 'PERPLEXITY_BUTTON_LABEL', 'Get More Info')
-        button_emoji = getattr(config, 'PERPLEXITY_BUTTON_EMOJI', '🔍')
+        # Initialize vote tracking and removed entries if not provided
+        self.database = database
+        self.vote_tracker = vote_tracker if vote_tracker else VoteTracker()
+        self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
         
-        # Map string style to discord.ButtonStyle
-        style_map = {
-            'primary': discord.ButtonStyle.primary,
-            'secondary': discord.ButtonStyle.secondary,
-            'success': discord.ButtonStyle.success,
-            'danger': discord.ButtonStyle.danger,
-        }
-        button_style_str = getattr(config, 'PERPLEXITY_BUTTON_STYLE', 'primary')
-        button_style = style_map.get(button_style_str, discord.ButtonStyle.primary)
+        # Register context menu commands
+        self._register_commands()
         
-        # Create the button with custom_id for persistence
-        # Discord custom_id has 100 character limit, so we use a hash
-        button = Button(
-            style=button_style,
-            label=button_label,
-            emoji=button_emoji,
-            custom_id=f"perplexity_search:{entry_hash}"
-        )
-        button.callback = self.button_callback
-        self.add_item(button)
+        # Add error handler for app commands
+        @self.tree.error
+        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            logger.error(f"App command error: {error}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"❌ An error occurred: {str(error)}",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"❌ An error occurred: {str(error)}",
+                        ephemeral=True
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send error message: {e}")
+        
+        @self.client.event
+        async def on_ready():
+            self.ready = True
+            logger.info(f'Discord client logged in as {self.client.user}')
+            
+            # Sync commands with Discord
+            try:
+                logger.info("Syncing application commands with Discord...")
+                # Log registered commands before sync
+                logger.debug(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
+                synced = await self.tree.sync()
+                logger.info(f"Successfully synced {len(synced)} application command(s)")
+                for cmd in synced:
+                    logger.debug(f"  - {cmd.name} (type: {cmd.type})")
+            except Exception as e:
+                logger.error(f"Failed to sync commands: {e}", exc_info=True)
+            
+            # Verify channel access after connection is established
+            if not self._verified_channels:
+                await self._verify_channel_access()
+                self._verified_channels = True
+        
+        @self.client.event
+        async def on_interaction(interaction: discord.Interaction):
+            """Handle all interactions (for logging/debugging)"""
+            logger.debug(f"Interaction received: type={interaction.type}, data={interaction.data}")
+            # App commands (context menus) are handled automatically by the command tree
+            # This is just for logging
+        
+        @self.client.event
+        async def on_message(message):
+            """Handle incoming messages (currently unused but kept for future extensibility)"""
+            # Ignore messages from the bot itself
+            if message.author == self.client.user:
+                return
+        
+        logger.info("Discord poster initialized with app commands support")
     
-    async def button_callback(self, interaction: discord.Interaction):
+    def _generate_thread_title(self, content):
         """
-        Handle button click - perform Perplexity search and respond
+        Generate a concise thread title from content using Ollama
         
         Args:
-            interaction: Discord interaction from button click
+            content: The content to summarize
+            
+        Returns:
+            str: A short thread title (max 100 chars for Discord)
         """
         try:
-            # Check if search was already performed
-            if self.search_performed:
-                await interaction.response.send_message(
-                    "This search has already been performed.",
-                    ephemeral=True
-                )
-                return
+            # Use Ollama to generate a very short summary for the thread title
+            import requests
             
-            # Defer the response to show loading state
-            await interaction.response.defer(ephemeral=False)
+            prompt = f"""Summarize this news headline in 5-8 words for a thread title. Be concise and capture the main topic. 
+
+IMPORTANT RULES:
+- Use ONLY plain text words (no emojis, no special characters)
+- Do not use quotes or punctuation at the end
+- Keep it simple and descriptive
+- Example: "Company Layoffs Increase 44 Percent"
+
+News: {content[:500]}
+
+Thread title:"""
             
-            logger.info(f"Perplexity search button clicked for entry hash: {self.entry_hash}")
+            payload = {
+                "model": config.OLLAMA_CATEGORIZATION_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": 30  # Limit tokens for short response
+                }
+            }
             
-            # Check if Perplexity client is available
-            if not self.perplexity_client or not self.perplexity_client.is_available():
-                await interaction.followup.send(
-                    "❌ Perplexity search is not available. API key may not be configured.",
-                    ephemeral=True
-                )
-                return
+            response = requests.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json=payload,
+                timeout=10
+            )
             
-            # Perform the search
-            result = self.perplexity_client.search(self.content)
-            
-            if result['success']:
-                # Disable the button in the original message
-                # Use parent view if this is part of a combined view, otherwise use self
-                view_to_update = self.parent_view if self.parent_view else self
+            if response.status_code == 200:
+                result = response.json()
+                title = result.get('response', '').strip()
                 
-                # Disable the Perplexity button
-                for item in view_to_update.children:
-                    if isinstance(item, Button) and hasattr(item, 'custom_id') and item.custom_id and item.custom_id.startswith("perplexity_search:"):
-                        item.disabled = True
+                # Clean up the title
+                title = title.replace('"', '').replace("'", "").strip()
                 
-                # Update the original message to disable the button
-                try:
-                    await interaction.message.edit(view=view_to_update)
-                except Exception as e:
-                    logger.warning(f"Failed to disable button: {e}")
+                # Remove any leading/trailing emojis and validate it contains actual text
+                # Check if title is empty or contains only emojis/special chars
+                import re
+                # Remove all emojis and special characters to check if there's actual text
+                text_only = re.sub(r'[^\w\s]', '', title)
                 
-                # Mark search as performed
-                self.search_performed = True
+                if not text_only.strip():
+                    # Title is empty or only contains emojis/special chars
+                    logger.warning(f"Ollama returned invalid title (no text): '{title}', using fallback")
+                    # Fallback to simple truncation of content
+                    simple_title = content[:70].strip()
+                    if len(content) > 70:
+                        simple_title += "..."
+                    return f"🔍 {simple_title}"
                 
-                # Send the response
-                if result.get('answer'):
-                    # Create a thread on the original message for the Perplexity answer
+                # Ensure it fits Discord's 100 char limit (with emoji prefix)
+                max_length = 97  # Leave room for emoji
+                if len(title) > max_length:
+                    title = title[:max_length-3] + "..."
+                
+                # Add emoji and return
+                return f"🔍 {title}"
+            else:
+                logger.warning(f"Failed to generate thread title, using default")
+                return "🔍 Additional Context"
+                
+        except Exception as e:
+            logger.error(f"Error generating thread title: {e}")
+            # Fallback to simple truncation of content
+            simple_title = content[:70].strip()
+            if len(content) > 70:
+                simple_title += "..."
+            return f"🔍 {simple_title}"
+    
+    async def _extract_thread_perplexity_content(self, thread):
+        """
+        Extract Perplexity AI response from a thread
+        
+        Args:
+            thread: Discord thread object
+        
+        Returns:
+            dict or None: {
+                'thread_name': str,
+                'answer_embed': discord.Embed,
+                'citations_embed': discord.Embed or None
+            }
+        """
+        try:
+            logger.debug(f"Extracting Perplexity content from thread {thread.id} (name: {thread.name})")
+            
+            answer_embed = None
+            citations_embed = None
+            thread_name = thread.name
+            
+            # Fetch messages from the thread
+            message_count = 0
+            async for message in thread.history(limit=50):
+                message_count += 1
+                
+                # Check if message has embeds
+                if message.embeds:
+                    for embed in message.embeds:
+                        # Look for Perplexity answer embed
+                        if embed.title == "Additional Context from Perplexity AI":
+                            logger.debug(f"Found Perplexity answer embed in thread {thread.id}")
+                            answer_embed = embed
+                        
+                        # Look for citations embed
+                        elif embed.title == "📚 Sources & Citations":
+                            logger.debug(f"Found citations embed in thread {thread.id}")
+                            citations_embed = embed
+            
+            logger.debug(f"Scanned {message_count} messages in thread {thread.id}")
+            
+            # Return data if we found Perplexity content
+            if answer_embed:
+                result = {
+                    'thread_name': thread_name,
+                    'answer_embed': answer_embed,
+                    'citations_embed': citations_embed
+                }
+                logger.info(f"Successfully extracted Perplexity content from thread {thread.id}")
+                return result
+            else:
+                logger.debug(f"No Perplexity content found in thread {thread.id}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error extracting thread content: {e}", exc_info=True)
+            return None
+    
+    def _register_commands(self):
+        """Register context menu commands"""
+        
+        # Store reference to self for use in command closures
+        poster = self
+        
+        # Define the command function
+        async def get_more_info(interaction: discord.Interaction, message: discord.Message):
+            """Context menu command to get additional information via Perplexity AI"""
+            logger.debug(f"'Get More Info' command triggered by user {interaction.user.id} on message {message.id}")
+            try:
+                # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
+                logger.debug("Deferring interaction response...")
+                await interaction.response.defer(ephemeral=True)
+                logger.debug("Interaction deferred successfully")
+                
+                # Check if Perplexity is enabled
+                enable_perplexity = getattr(config, 'PERPLEXITY_BUTTON_ENABLED', True)
+                if not enable_perplexity or not poster.perplexity_client or not poster.perplexity_client.is_available():
+                    await interaction.followup.send(
+                        "❌ Perplexity search is not available. API key may not be configured.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check if message is from the bot
+                if message.author != poster.client.user:
+                    await interaction.followup.send(
+                        "❌ This command only works on messages posted by the bot.",
+                        ephemeral=True
+                    )
+                    return
+                
+                content = message.content
+                if not content:
+                    await interaction.followup.send(
+                        "❌ No content found in message.",
+                        ephemeral=True
+                    )
+                    return
+                
+                logger.info(f"'Get More Info' command invoked by user {interaction.user.id} on message {message.id}")
+                
+                # Perform the Perplexity search
+                result = poster.perplexity_client.search(content)
+                
+                if result['success'] and result.get('answer'):
                     answer = result['answer']
+                    citations = result.get('citations', [])
                     
-                    # Create thread name (max 100 chars)
-                    thread_name = "🔍 Additional Context"
+                    # Generate a descriptive thread name based on content
+                    logger.debug("Generating thread title from content...")
+                    thread_name = poster._generate_thread_title(content)
+                    logger.debug(f"Generated thread title: {thread_name}")
                     
                     try:
-                        # Create a public thread on the original message
-                        thread = await interaction.message.create_thread(
+                        thread = await message.create_thread(
                             name=thread_name,
-                            auto_archive_duration=1440  # Archive after 24 hours of inactivity
+                            auto_archive_duration=1440  # 24 hours
                         )
-                        logger.info(f"Created thread {thread.id} for Perplexity answer")
+                        logger.info(f"Created thread {thread.id} for Perplexity response")
                         
-                        # Discord embed description has 4096 char limit
+                        # Truncate if needed
                         max_length = 3900
                         truncated = False
                         if len(answer) > max_length:
                             answer = answer[:max_length] + "..."
                             truncated = True
                         
-                        # Create an embed for better presentation
+                        # Create embed for answer
                         embed = discord.Embed(
                             title="Additional Context from Perplexity AI",
                             description=answer,
@@ -323,17 +329,13 @@ class PerplexitySearchView(View):
                         else:
                             embed.set_footer(text="Powered by Perplexity AI")
                         
-                        # Send the embed in the thread
                         await thread.send(embed=embed)
                         
-                        # Check if we have citations and should show them
-                        citations = result.get('citations', [])
-                        
+                        # Add citations if available
                         if citations:
                             logger.info(f"Adding {len(citations)} citations to thread")
-                            
-                            # Format citations
                             citations_text = ""
+                            
                             if isinstance(citations, list):
                                 for i, citation in enumerate(citations, 1):
                                     if isinstance(citation, dict):
@@ -348,29 +350,23 @@ class PerplexitySearchView(View):
                                     else:
                                         citations_text += f"{i}. {str(citation)}\n"
                             
-                            # Split citations if too long for one embed (4096 limit)
                             if len(citations_text) > 3900:
                                 citations_text = citations_text[:3900] + "..."
                             
-                            # Create citations embed
                             citations_embed = discord.Embed(
                                 title="📚 Sources & Citations",
                                 description=citations_text if citations_text else "No citations available.",
                                 color=discord.Color.green()
                             )
                             citations_embed.set_footer(text=f"{len(citations)} source(s)")
-                            
-                            # Send citations in the thread
                             await thread.send(embed=citations_embed)
                         
-                        # Send a notification in main channel that thread was created
                         await interaction.followup.send(
                             f"✅ Additional context posted in thread: {thread.mention}",
                             ephemeral=True
                         )
+                        logger.info(f"Successfully posted Perplexity response in thread {thread.id}")
                         
-                        logger.info(f"Perplexity answer and citations posted in thread {thread.id}")
-                    
                     except discord.Forbidden:
                         logger.error("Bot lacks permission to create threads")
                         await interaction.followup.send(
@@ -384,604 +380,386 @@ class PerplexitySearchView(View):
                             ephemeral=True
                         )
                 else:
-                    # Fallback: create a search URL
-                    search_url = self.perplexity_client.format_search_url(self.content[:200])
-                    response_text = f"🔍 **Search on Perplexity:**\n{search_url}"
-                    await interaction.followup.send(response_text)
-                
-                logger.info(f"Perplexity search completed for entry hash: {self.entry_hash}")
-            else:
-                # Search failed
-                error_msg = result.get('error', 'Unknown error')
-                await interaction.followup.send(
-                    f"❌ Search failed: {error_msg}",
-                    ephemeral=True
-                )
-                logger.error(f"Perplexity search failed: {error_msg}")
-        
-        except Exception as e:
-            logger.error(f"Error in Perplexity button callback: {e}", exc_info=True)
-            try:
-                await interaction.followup.send(
-                    f"❌ An error occurred while processing your search: {str(e)}",
-                    ephemeral=True
-                )
-            except:
-                pass
-
-
-class NotValuableView(View):
-    """Discord UI View containing a 'Not Valuable' voting button"""
-    
-    def __init__(self, entry_id, content, category, discord_channel_id, 
-                 vote_tracker, removed_entries_db, database, entry_hash):
-        """
-        Initialize the view with a voting button
-        
-        Args:
-            entry_id: Entry ID for tracking
-            content: The entry content
-            category: Category it was posted to
-            discord_channel_id: Discord channel ID
-            vote_tracker: VoteTracker instance
-            removed_entries_db: RemovedEntriesDB instance
-            database: Database instance (for removal)
-            entry_hash: Unique hash for button custom_id
-        """
-        super().__init__(timeout=None)  # No timeout for persistent views
-        self.entry_id = entry_id
-        self.content = content
-        self.category = category
-        self.discord_channel_id = discord_channel_id
-        self.vote_tracker = vote_tracker
-        self.removed_entries_db = removed_entries_db
-        self.database = database
-        self.entry_hash = entry_hash
-        self.parent_view = None  # Reference to parent CombinedButtonView if exists
-        
-        # Get button configuration from config
-        button_label = getattr(config, 'NOT_VALUABLE_BUTTON_LABEL', 'Not Valuable')
-        button_emoji = getattr(config, 'NOT_VALUABLE_BUTTON_EMOJI', '🗑️')
-        
-        # Map string style to discord.ButtonStyle
-        style_map = {
-            'primary': discord.ButtonStyle.primary,
-            'secondary': discord.ButtonStyle.secondary,
-            'success': discord.ButtonStyle.success,
-            'danger': discord.ButtonStyle.danger,
-        }
-        button_style_str = getattr(config, 'NOT_VALUABLE_BUTTON_STYLE', 'danger')
-        button_style = style_map.get(button_style_str, discord.ButtonStyle.danger)
-        
-        # Create the button with custom_id for persistence
-        button = Button(
-            style=button_style,
-            label=button_label,
-            emoji=button_emoji,
-            custom_id=f"not_valuable:{entry_hash}"
-        )
-        button.callback = self.button_callback
-        self.add_item(button)
-    
-    async def button_callback(self, interaction: discord.Interaction):
-        """
-        Handle button click - track vote and delete if threshold reached
-        
-        Args:
-            interaction: Discord interaction from button click
-        """
-        try:
-            # Defer the response to show loading state
-            await interaction.response.defer(ephemeral=True)
-            
-            voter_user_id = str(interaction.user.id)
-            discord_message_id = str(interaction.message.id)
-            
-            logger.info(f"Not Valuable button clicked by user {voter_user_id} on message {discord_message_id}")
-            
-            # Add vote and get current count
-            entry_data = {
-                'entry_id': self.entry_id,
-                'content': self.content,
-                'category': self.category,
-                'discord_channel_id': self.discord_channel_id,
-                'discord_message_id': int(discord_message_id)
-            }
-            
-            vote_count, is_duplicate = self.vote_tracker.add_vote(
-                discord_message_id, 
-                voter_user_id, 
-                entry_data
-            )
-            
-            # Check if user already voted
-            if is_duplicate:
-                await interaction.followup.send(
-                    "⚠️ You have already voted on this entry.",
-                    ephemeral=True
-                )
-                return
-            
-            votes_required = getattr(config, 'NOT_VALUABLE_VOTES_REQUIRED', 2)
-            
-            # Update button label to show vote count
-            # Use parent view if this is part of a combined view, otherwise use self
-            view_to_update = self.parent_view if self.parent_view else self
-            
-            # Update the Not Valuable button label
-            for item in view_to_update.children:
-                if isinstance(item, Button) and item.custom_id.startswith("not_valuable:"):
-                    item.label = f"Not Valuable ({vote_count}/{votes_required})"
-            
-            try:
-                await interaction.message.edit(view=view_to_update)
-            except Exception as e:
-                logger.warning(f"Failed to update button label: {e}")
-            
-            # Check if threshold reached
-            if vote_count >= votes_required:
-                logger.info(f"Vote threshold reached ({vote_count}/{votes_required}) for message {discord_message_id}")
-                
-                # Get voter IDs
-                vote_data = self.vote_tracker.get_votes(discord_message_id)
-                voter_ids = vote_data.get('voters', []) if vote_data else []
-                
-                # Delete the Discord message
-                try:
-                    await interaction.message.delete()
-                    logger.info(f"Deleted Discord message {discord_message_id}")
-                except Exception as e:
-                    logger.error(f"Failed to delete Discord message: {e}")
+                    error_msg = result.get('error', 'Unknown error')
                     await interaction.followup.send(
-                        f"❌ Failed to delete message: {str(e)}",
+                        f"❌ Search failed: {error_msg}",
                         ephemeral=True
                     )
-                    return
-                
-                # Remove from database
-                try:
-                    if self.entry_id in self.database.processed_ids:
-                        del self.database.processed_ids[self.entry_id]
-                        self.database._save_json(self.database.processed_ids_path, self.database.processed_ids)
+                    logger.error(f"Perplexity search failed: {error_msg}")
                     
-                    if self.entry_id in self.database.message_mapping:
-                        del self.database.message_mapping[self.entry_id]
-                        self.database._save_json(self.database.message_mapping_path, self.database.message_mapping)
-                    
-                    # Also remove embedding if it exists
-                    content_hash = hashlib.md5(self.content.encode('utf-8')).hexdigest()
-                    if content_hash in self.database.embeddings:
-                        del self.database.embeddings[content_hash]
-                        self.database._save_json(self.database.embeddings_path, self.database.embeddings)
-                    
-                    logger.info(f"Removed entry {self.entry_id} from database")
-                except Exception as e:
-                    logger.error(f"Error removing entry from database: {e}", exc_info=True)
-                
-                # Store in removed entries database
-                try:
-                    self.removed_entries_db.add_removed_entry(
-                        entry_id=self.entry_id,
-                        content=self.content,
-                        category=self.category,
-                        voter_ids=voter_ids,
-                        discord_message_id=int(discord_message_id),
-                        discord_channel_id=self.discord_channel_id
-                    )
-                    logger.info(f"Added entry {self.entry_id} to removed entries database")
-                except Exception as e:
-                    logger.error(f"Error adding to removed entries: {e}", exc_info=True)
-                
-                # Clean up vote tracking
-                self.vote_tracker.remove_tracking(discord_message_id)
-                
-                # Send confirmation (to the last voter, since message is deleted)
-                try:
-                    await interaction.followup.send(
-                        f"✅ Entry removed successfully after {vote_count} votes. This content will be used to improve future categorization.",
-                        ephemeral=True
-                    )
-                except:
-                    pass  # Message might already be deleted
-                
-                logger.info(f"Successfully processed removal of entry {self.entry_id}")
-            else:
-                # Not enough votes yet
-                await interaction.followup.send(
-                    f"✅ Vote recorded ({vote_count}/{votes_required}). Need {votes_required - vote_count} more vote(s) to remove.",
-                    ephemeral=True
-                )
-        
-        except Exception as e:
-            logger.error(f"Error in Not Valuable button callback: {e}", exc_info=True)
-            try:
-                await interaction.followup.send(
-                    f"❌ An error occurred: {str(e)}",
-                    ephemeral=True
-                )
-            except:
-                pass
-
-
-
-
-class CombinedButtonView(View):
-    """Combined view with Perplexity search and Not Valuable buttons"""
-    
-    def __init__(self, perplexity_view=None, not_valuable_view=None):
-        """
-        Initialize combined view
-        
-        Args:
-            perplexity_view: PerplexitySearchView instance (optional)
-            not_valuable_view: NotValuableView instance (optional)
-        """
-        super().__init__(timeout=None)
-        
-        # Store references to child views and set their parent reference
-        self.perplexity_view = perplexity_view
-        self.not_valuable_view = not_valuable_view
-        
-        # Add Perplexity button if provided
-        if perplexity_view:
-            # Set parent reference so child can update combined view
-            perplexity_view.parent_view = self
-            for item in perplexity_view.children:
-                self.add_item(item)
-            # Copy callback references
-            self.perplexity_content = perplexity_view.content
-            self.perplexity_client = perplexity_view.perplexity_client
-            self.perplexity_entry_hash = perplexity_view.entry_hash
-            self.perplexity_search_performed = False
-        
-        # Add Not Valuable button if provided
-        if not_valuable_view:
-            # Set parent reference so child can update combined view
-            not_valuable_view.parent_view = self
-            for item in not_valuable_view.children:
-                self.add_item(item)
-            # Copy callback references
-            self.entry_id = not_valuable_view.entry_id
-            self.content = not_valuable_view.content
-            self.category = not_valuable_view.category
-            self.discord_channel_id = not_valuable_view.discord_channel_id
-            self.vote_tracker = not_valuable_view.vote_tracker
-            self.removed_entries_db = not_valuable_view.removed_entries_db
-            self.database = not_valuable_view.database
-            self.entry_hash = not_valuable_view.entry_hash
-
-
-class DiscordPoster:
-    """Posts messages to Discord channels"""
-    
-    def __init__(self, perplexity_client=None, database=None, vote_tracker=None, removed_entries_db=None):
-        """
-        Initialize Discord client
-        
-        Args:
-            perplexity_client: Optional PerplexityClient instance for search buttons
-            database: Optional Database instance for entry removal
-            vote_tracker: Optional VoteTracker instance
-            removed_entries_db: Optional RemovedEntriesDB instance
-        """
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.guilds = True  # Ensure we can see guilds/channels
-        
-        self.client = discord.Client(intents=intents)
-        self.token = config.DISCORD_TOKEN
-        self.channels = config.DISCORD_CHANNELS
-        self.ready = False
-        self._verified_channels = False
-        self._client_task = None
-        self.perplexity_client = perplexity_client
-        
-        # Initialize vote tracking and removed entries if not provided
-        self.database = database
-        self.vote_tracker = vote_tracker if vote_tracker else VoteTracker()
-        self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
-        
-        @self.client.event
-        async def on_ready():
-            self.ready = True
-            logger.info(f'Discord client logged in as {self.client.user}')
-            logger.info("Persistent button interaction handler is active")
-            
-            # Verify channel access after connection is established
-            if not self._verified_channels:
-                await self._verify_channel_access()
-                self._verified_channels = True
-        
-        @self.client.event
-        async def on_interaction(interaction: discord.Interaction):
-            """Handle button interactions for persistent views after bot restart"""
-            # Only handle component (button) interactions
-            if interaction.type != discord.InteractionType.component:
-                return
-            
-            custom_id = interaction.data.get('custom_id', '')
-            
-            # Check if this is one of our button types
-            if not (custom_id.startswith('not_valuable:') or 
-                    custom_id.startswith('perplexity_search:') or
-                    custom_id.startswith('perplexity_citations:')):
-                return
-            
-            # Check if already responded (prevent double-processing)
-            if interaction.response.is_done():
-                logger.debug(f"Interaction {interaction.id} already processed, skipping")
-                return
-            
-            try:
-                logger.debug(f"Handling persistent button interaction: {custom_id}")
-                
-                # Handle Not Valuable button
-                if custom_id.startswith('not_valuable:'):
-                    entry_hash = custom_id.split(':', 1)[1]
-                    content = interaction.message.content
-                    discord_message_id = interaction.message.id
-                    discord_channel_id = interaction.channel.id
-                    
-                    # Find entry data from database
-                    entry_id = None
-                    category = None
-                    
-                    if self.database:
-                        for eid, mapping in self.database.message_mapping.items():
-                            if mapping.get('discord_message_id') == discord_message_id:
-                                entry_id = eid
-                                category = mapping.get('category', 'unknown')
-                                break
-                    
-                    if not entry_id:
-                        entry_id = f"unknown_{discord_message_id}"
-                        category = "unknown"
-                    
-                    # Check if message has both buttons (combined view) or just one
-                    has_perplexity_button = False
-                    
-                    if interaction.message.components:
-                        for action_row in interaction.message.components:
-                            for component in action_row.children:
-                                if hasattr(component, 'custom_id') and component.custom_id:
-                                    if component.custom_id.startswith('perplexity_search:'):
-                                        has_perplexity_button = True
-                                        break
-                    
-                    # Reconstruct the appropriate view
-                    if has_perplexity_button:
-                        # Need to create combined view to preserve both buttons
-                        perplexity_view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
-                        not_valuable_view = NotValuableView(
-                            entry_id=entry_id,
-                            content=content,
-                            category=category,
-                            discord_channel_id=discord_channel_id,
-                            vote_tracker=self.vote_tracker,
-                            removed_entries_db=self.removed_entries_db,
-                            database=self.database,
-                            entry_hash=entry_hash
-                        )
-                        # Create combined view with parent references
-                        combined_view = CombinedButtonView(perplexity_view, not_valuable_view)
-                        # Call the Not Valuable button callback
-                        await not_valuable_view.button_callback(interaction)
-                    else:
-                        # Just the Not Valuable button
-                        view = NotValuableView(
-                            entry_id=entry_id,
-                            content=content,
-                            category=category,
-                            discord_channel_id=discord_channel_id,
-                            vote_tracker=self.vote_tracker,
-                            removed_entries_db=self.removed_entries_db,
-                            database=self.database,
-                            entry_hash=entry_hash
-                        )
-                        await view.button_callback(interaction)
-                
-                # Handle Perplexity search button
-                elif custom_id.startswith('perplexity_search:'):
-                    entry_hash = custom_id.split(':', 1)[1]
-                    content = interaction.message.content
-                    discord_message_id = interaction.message.id
-                    discord_channel_id = interaction.channel.id
-                    
-                    # Check if message has both buttons (combined view) or just one
-                    has_not_valuable_button = False
-                    
-                    if interaction.message.components:
-                        for action_row in interaction.message.components:
-                            for component in action_row.children:
-                                if hasattr(component, 'custom_id') and component.custom_id:
-                                    if component.custom_id.startswith('not_valuable:'):
-                                        has_not_valuable_button = True
-                                        break
-                    
-                    # Reconstruct the appropriate view
-                    if has_not_valuable_button:
-                        # Need to create combined view to preserve both buttons
-                        # Find entry data from database for Not Valuable button
-                        entry_id = None
-                        category = None
-                        
-                        if self.database:
-                            for eid, mapping in self.database.message_mapping.items():
-                                if mapping.get('discord_message_id') == discord_message_id:
-                                    entry_id = eid
-                                    category = mapping.get('category', 'unknown')
-                                    break
-                        
-                        if not entry_id:
-                            entry_id = f"unknown_{discord_message_id}"
-                            category = "unknown"
-                        
-                        perplexity_view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
-                        not_valuable_view = NotValuableView(
-                            entry_id=entry_id,
-                            content=content,
-                            category=category,
-                            discord_channel_id=discord_channel_id,
-                            vote_tracker=self.vote_tracker,
-                            removed_entries_db=self.removed_entries_db,
-                            database=self.database,
-                            entry_hash=entry_hash
-                        )
-                        # Create combined view with parent references
-                        combined_view = CombinedButtonView(perplexity_view, not_valuable_view)
-                        # Call the Perplexity button callback
-                        await perplexity_view.button_callback(interaction)
-                    else:
-                        # Just the Perplexity button
-                        view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
-                        await view.button_callback(interaction)
-                
-                # Handle Citations button
-                elif custom_id.startswith('perplexity_citations:'):
-                    entry_hash = custom_id.split(':', 1)[1]
-                    # Citations functionality not currently implemented
-                    logger.debug(f"Citations button clicked: {custom_id}")
-                
-            except discord.errors.InteractionResponded:
-                # Interaction was already responded to - this is fine, just log it
-                logger.debug(f"Interaction {interaction.id} was already responded to (likely double-click)")
-            except discord.errors.NotFound:
-                # Interaction expired - this is fine for old buttons
-                logger.debug(f"Interaction {interaction.id} expired or not found")
             except Exception as e:
-                logger.error(f"Error handling button interaction: {e}", exc_info=True)
-                # Try to send error message if we haven't responded yet
+                logger.error(f"Error in 'Get More Info' command: {e}", exc_info=True)
                 try:
-                    if not interaction.response.is_done():
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                    else:
                         await interaction.response.send_message(
-                            "❌ An error occurred while processing your request.",
+                            f"❌ An error occurred: {str(e)}",
                             ephemeral=True
                         )
                 except:
                     pass
         
-        @self.client.event
-        async def on_message(message):
-            """Handle incoming messages for recategorize command"""
-            # Ignore messages from the bot itself
-            if message.author == self.client.user:
-                return
-            
-            # Check if recategorize command is enabled
-            if not getattr(config, 'RECATEGORIZE_COMMAND_ENABLED', True):
-                return
-            
-            # Check if message is a reply
-            if not message.reference or not message.reference.message_id:
-                return
-            
-            # Check if user is allowed to recategorize
-            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
-            if message.author.id not in allowed_user_ids:
-                return
-            
-            # Check if message starts with recategorize command
-            command_prefix = getattr(config, 'RECATEGORIZE_COMMAND_PREFIX', '!recategorize')
-            if not message.content.strip().lower().startswith(command_prefix.lower()):
-                return
-            
-            # Parse the command to get the new category
-            parts = message.content.strip().split(maxsplit=1)
-            if len(parts) < 2:
-                await message.reply(
-                    f"❌ Please specify a category. Usage: `{command_prefix} <category>`\n"
-                    f"Available categories: {', '.join(sorted(config.DISCORD_CHANNELS.keys()))}"
-                )
-                return
-            
-            new_category = parts[1].strip().lower()
-            
-            # Validate the category
-            if new_category not in config.DISCORD_CHANNELS:
-                await message.reply(
-                    f"❌ Invalid category: `{new_category}`\n"
-                    f"Available categories: {', '.join(sorted(config.DISCORD_CHANNELS.keys()))}"
-                )
-                return
-            
-            # Get the message being replied to
+        # Manually add the command to the tree
+        get_more_info_cmd = app_commands.ContextMenu(
+            name="Get More Info",
+            callback=get_more_info
+        )
+        self.tree.add_command(get_more_info_cmd)
+        logger.debug("Registered 'Get More Info' context menu command")
+        
+        # Define the Not Valuable command function
+        async def not_valuable(interaction: discord.Interaction, message: discord.Message):
+            """Context menu command to vote that a message is not valuable"""
+            logger.debug(f"'Not Valuable' command triggered by user {interaction.user.id} on message {message.id}")
             try:
-                replied_message = await message.channel.fetch_message(message.reference.message_id)
-            except discord.NotFound:
-                await message.reply("❌ Could not find the message to re-categorize.")
-                return
-            except Exception as e:
-                logger.error(f"Error fetching replied message: {e}")
-                await message.reply(f"❌ Error fetching message: {str(e)}")
-                return
-            
-            # Check if the replied message is from the bot
-            if replied_message.author != self.client.user:
-                await message.reply("❌ You can only re-categorize messages posted by the bot.")
-                return
-            
-            # Find the entry in the database
-            entry_id = None
-            entry_data = None
-            current_category = None
-            
-            # Search message_mapping for this Discord message ID
-            if self.database:
-                for eid, mapping in self.database.message_mapping.items():
-                    if mapping.get('discord_message_id') == replied_message.id:
-                        entry_id = eid
-                        entry_data = mapping
-                        current_category = mapping.get('category', 'unknown')
-                        break
-            
-            if not entry_id or not entry_data:
-                await message.reply("❌ Could not find entry data for this message in the database.")
-                return
-            
-            # Check if it's already in the target category
-            if current_category == new_category:
-                await message.reply(f"⚠️ This entry is already in the **{new_category}** category.")
-                return
-            
-            logger.info(
-                f"Re-categorize command from user {message.author.id}: "
-                f"Moving entry {entry_id} from {current_category} to {new_category}"
-            )
-            
-            # Send a "processing" message
-            processing_msg = await message.reply(f"⏳ Re-categorizing from **{current_category}** to **{new_category}**...")
-            
-            # Perform the re-categorization
-            try:
-                success, new_message_id, new_channel_id, error_msg = await self.recategorize_entry(
-                    message_id=replied_message.id,
-                    channel_id=replied_message.channel.id,
-                    new_category=new_category,
-                    entry_id=entry_id,
-                    content=entry_data.get('content', replied_message.content),
-                    media_files=None,  # Will download from original message
-                    video_urls=entry_data.get('video_urls', []),
-                    source_type=None  # Not needed for recategorization
+                # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
+                logger.debug("Deferring interaction response...")
+                await interaction.response.defer(ephemeral=True)
+                logger.debug("Interaction deferred successfully")
+                
+                # Check if Not Valuable is enabled
+                enable_not_valuable = getattr(config, 'NOT_VALUABLE_BUTTON_ENABLED', True)
+                if not enable_not_valuable:
+                    await interaction.followup.send(
+                        "❌ This feature is not enabled.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check if message is from the bot
+                if message.author != poster.client.user:
+                    await interaction.followup.send(
+                        "❌ This command only works on messages posted by the bot.",
+                        ephemeral=True
+                    )
+                    return
+                
+                voter_user_id = str(interaction.user.id)
+                discord_message_id = str(message.id)
+                discord_channel_id = message.channel.id
+                content = message.content
+                
+                logger.info(f"'Not Valuable' command invoked by user {voter_user_id} on message {discord_message_id}")
+                
+                # Find entry data from database
+                entry_id = None
+                category = None
+                
+                if poster.database:
+                    for eid, mapping in poster.database.message_mapping.items():
+                        if mapping.get('discord_message_id') == message.id:
+                            entry_id = eid
+                            category = mapping.get('category', 'unknown')
+                            break
+                
+                if not entry_id:
+                    entry_id = f"unknown_{discord_message_id}"
+                    category = "unknown"
+                
+                # Add vote and get current count
+                entry_data = {
+                    'entry_id': entry_id,
+                    'content': content,
+                    'category': category,
+                    'discord_channel_id': discord_channel_id,
+                    'discord_message_id': int(discord_message_id)
+                }
+                
+                vote_count, is_duplicate = poster.vote_tracker.add_vote(
+                    discord_message_id,
+                    voter_user_id,
+                    entry_data
                 )
                 
-                if success:
-                    await processing_msg.edit(
-                        content=f"✅ Successfully re-categorized from **{current_category}** to **{new_category}**!\n"
-                        f"New message ID: {new_message_id}"
+                # Check if user already voted
+                if is_duplicate:
+                    await interaction.followup.send(
+                        "⚠️ You have already voted on this entry.",
+                        ephemeral=True
                     )
-                    logger.info(f"Successfully re-categorized entry {entry_id} to {new_category}")
+                    return
+                
+                votes_required = getattr(config, 'NOT_VALUABLE_VOTES_REQUIRED', 2)
+                
+                # Check if threshold reached
+                if vote_count >= votes_required:
+                    logger.info(f"Vote threshold reached ({vote_count}/{votes_required}) for message {discord_message_id}")
+                    
+                    # Get voter IDs
+                    vote_data = poster.vote_tracker.get_votes(discord_message_id)
+                    voter_ids = vote_data.get('voters', []) if vote_data else []
+                    
+                    # Delete the Discord message
+                    try:
+                        await message.delete()
+                        logger.info(f"Deleted Discord message {discord_message_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete Discord message: {e}")
+                        await interaction.followup.send(
+                            f"❌ Failed to delete message: {str(e)}",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # Remove from database
+                    try:
+                        if entry_id in poster.database.processed_ids:
+                            del poster.database.processed_ids[entry_id]
+                            poster.database._save_json(poster.database.processed_ids_path, poster.database.processed_ids)
+                        
+                        if entry_id in poster.database.message_mapping:
+                            del poster.database.message_mapping[entry_id]
+                            poster.database._save_json(poster.database.message_mapping_path, poster.database.message_mapping)
+                        
+                        # Also remove embedding if it exists
+                        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                        if content_hash in poster.database.embeddings:
+                            del poster.database.embeddings[content_hash]
+                            poster.database._save_json(poster.database.embeddings_path, poster.database.embeddings)
+                        
+                        logger.info(f"Removed entry {entry_id} from database")
+                    except Exception as e:
+                        logger.error(f"Error removing entry from database: {e}", exc_info=True)
+                    
+                    # Store in removed entries database
+                    try:
+                        poster.removed_entries_db.add_removed_entry(
+                            entry_id=entry_id,
+                            content=content,
+                            category=category,
+                            voter_ids=voter_ids,
+                            discord_message_id=int(discord_message_id),
+                            discord_channel_id=discord_channel_id
+                        )
+                        logger.info(f"Added entry {entry_id} to removed entries database")
+                    except Exception as e:
+                        logger.error(f"Error adding to removed entries: {e}", exc_info=True)
+                    
+                    # Clean up vote tracking
+                    poster.vote_tracker.remove_tracking(discord_message_id)
+                    
+                    # Send confirmation
+                    try:
+                        await interaction.followup.send(
+                            f"✅ Entry removed successfully after {vote_count} votes. This content will be used to improve future categorization.",
+                            ephemeral=True
+                        )
+                    except:
+                        pass  # Message might already be deleted
+                    
+                    logger.info(f"Successfully processed removal of entry {entry_id}")
                 else:
-                    await processing_msg.edit(
-                        content=f"❌ Failed to re-categorize: {error_msg}"
+                    # Not enough votes yet
+                    await interaction.followup.send(
+                        f"✅ Vote recorded ({vote_count}/{votes_required}). Need {votes_required - vote_count} more vote(s) to remove.",
+                        ephemeral=True
                     )
-                    logger.error(f"Failed to re-categorize entry {entry_id}: {error_msg}")
+                    
             except Exception as e:
-                logger.error(f"Error during re-categorization: {e}", exc_info=True)
-                await processing_msg.edit(
-                    content=f"❌ An error occurred: {str(e)}"
-                )
+                logger.error(f"Error in 'Not Valuable' command: {e}", exc_info=True)
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                except:
+                    pass
         
-        logger.info("Discord poster initialized")
+        # Manually add the Not Valuable command to the tree
+        not_valuable_cmd = app_commands.ContextMenu(
+            name="Not Valuable",
+            callback=not_valuable
+        )
+        self.tree.add_command(not_valuable_cmd)
+        logger.debug("Registered 'Not Valuable' context menu command")
+        
+        # Define the Re-categorize command function
+        async def recategorize(interaction: discord.Interaction, message: discord.Message):
+            """Context menu command to re-categorize a bot message"""
+            logger.debug(f"'Re-categorize' command triggered by user {interaction.user.id} on message {message.id}")
+            try:
+                # Check if re-categorize is enabled
+                enable_recategorize = getattr(config, 'RECATEGORIZE_COMMAND_ENABLED', True)
+                if not enable_recategorize:
+                    await interaction.response.send_message(
+                        "❌ This feature is not enabled.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check if user is authorized
+                allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+                if interaction.user.id not in allowed_user_ids:
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command.",
+                        ephemeral=True
+                    )
+                    logger.warning(f"Unauthorized re-categorize attempt by user {interaction.user.id}")
+                    return
+                
+                # Check if message is from the bot
+                if message.author != poster.client.user:
+                    await interaction.response.send_message(
+                        "❌ This command only works on messages posted by the bot.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Find the entry in the database
+                entry_id = None
+                entry_data = None
+                current_category = None
+                
+                if poster.database:
+                    for eid, mapping in poster.database.message_mapping.items():
+                        if mapping.get('discord_message_id') == message.id:
+                            entry_id = eid
+                            entry_data = mapping
+                            current_category = mapping.get('category', 'unknown')
+                            break
+                
+                if not entry_id or not entry_data:
+                    await interaction.response.send_message(
+                        "❌ Could not find entry data for this message in the database.",
+                        ephemeral=True
+                    )
+                    return
+                
+                logger.info(
+                    f"Re-categorize command from user {interaction.user.id}: "
+                    f"Entry {entry_id} currently in {current_category}"
+                )
+                
+                # Create a modal with a select dropdown for categories
+                class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
+                    def __init__(self, current_cat, available_categories):
+                        super().__init__()
+                        self.current_category = current_cat
+                        self.available_categories = available_categories
+                        
+                        # Create a text input for category (since Select can't be in Modal directly)
+                        self.category_input = discord.ui.TextInput(
+                            label="New Category",
+                            placeholder=f"Currently: {current_cat}",
+                            required=True,
+                            max_length=50,
+                            style=discord.TextStyle.short
+                        )
+                        self.add_item(self.category_input)
+                    
+                    async def on_submit(self, modal_interaction: discord.Interaction):
+                        """Handle modal submission"""
+                        new_category = self.category_input.value.strip().lower()
+                        
+                        # Validate the category
+                        if new_category not in self.available_categories:
+                            await modal_interaction.response.send_message(
+                                f"❌ Invalid category: `{new_category}`\n"
+                                f"Available categories: {', '.join(sorted(self.available_categories))}",
+                                ephemeral=True
+                            )
+                            return
+                        
+                        # Check if it's the same category
+                        if new_category == self.current_category:
+                            await modal_interaction.response.send_message(
+                                f"⚠️ This entry is already in the **{new_category}** category.",
+                                ephemeral=True
+                            )
+                            return
+                        
+                        # Defer response for the recategorization process
+                        await modal_interaction.response.defer(ephemeral=True)
+                        
+                        # Check if the message has a thread before re-categorizing
+                        has_thread = message.thread is not None
+                        
+                        # Parse source type from entry_id (e.g., "twitter_123" -> "twitter")
+                        source_type = entry_id.split('_')[0] if entry_id else None
+                        
+                        logger.info(
+                            f"Re-categorizing entry {entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
+                        )
+                        
+                        # Perform the re-categorization
+                        try:
+                            success, new_message_id, new_channel_id, error_msg = await poster.recategorize_entry(
+                                message_id=message.id,
+                                channel_id=message.channel.id,
+                                new_category=new_category,
+                                entry_id=entry_id,
+                                content=entry_data.get('content', message.content),
+                                media_files=None,  # Will download from original message
+                                video_urls=entry_data.get('video_urls', []),
+                                source_type=source_type
+                            )
+                            
+                            if success:
+                                success_msg = f"✅ Successfully re-categorized from **{self.current_category}** to **{new_category}**!\n"
+                                success_msg += f"New message ID: {new_message_id}"
+                                
+                                # Add note about thread preservation if applicable
+                                if has_thread:
+                                    success_msg += "\n🧵 Thread with Perplexity content preserved!"
+                                
+                                await modal_interaction.followup.send(
+                                    success_msg,
+                                    ephemeral=True
+                                )
+                                logger.info(f"Successfully re-categorized entry {entry_id} to {new_category}")
+                            else:
+                                await modal_interaction.followup.send(
+                                    f"❌ Failed to re-categorize: {error_msg}",
+                                    ephemeral=True
+                                )
+                                logger.error(f"Failed to re-categorize entry {entry_id}: {error_msg}")
+                        except Exception as e:
+                            logger.error(f"Error during re-categorization: {e}", exc_info=True)
+                            await modal_interaction.followup.send(
+                                f"❌ An error occurred: {str(e)}",
+                                ephemeral=True
+                            )
+                
+                # Get available categories
+                available_categories = list(config.DISCORD_CHANNELS.keys())
+                
+                # Show the modal
+                modal = RecategorizeModal(current_category, available_categories)
+                await interaction.response.send_modal(modal)
+                
+            except Exception as e:
+                logger.error(f"Error in 'Re-categorize' command: {e}", exc_info=True)
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                except:
+                    pass
+        
+        # Manually add the Re-categorize command to the tree
+        recategorize_cmd = app_commands.ContextMenu(
+            name="Re-categorize",
+            callback=recategorize
+        )
+        self.tree.add_command(recategorize_cmd)
+        logger.debug("Registered 'Re-categorize' context menu command")
     
     async def start(self):
         """Start the Discord client"""
@@ -1017,7 +795,7 @@ class DiscordPoster:
     async def post_message(self, category, content, media_files=None, video_urls=None, source_type=None, 
                           enable_perplexity_button=None, enable_not_valuable_button=None, entry_id=None):
         """
-        Post a message to Discord channel
+        Post a message to Discord channel (now without buttons - using context menu commands)
         
         Args:
             category: Category name (maps to channel ID)
@@ -1025,9 +803,9 @@ class DiscordPoster:
             media_files: List of file paths to attach
             video_urls: List of video URLs to hide in message
             source_type: Type of source ('twitter' or 'telegram') to determine URL embedding
-            enable_perplexity_button: Whether to add Perplexity search button (default: from config)
-            enable_not_valuable_button: Whether to add Not Valuable button (default: from config)
-            entry_id: Entry ID for tracking (required for Not Valuable button)
+            enable_perplexity_button: Ignored (kept for backward compatibility)
+            enable_not_valuable_button: Ignored (kept for backward compatibility)
+            entry_id: Entry ID for tracking
         
         Returns:
             tuple: (success: bool, discord_message_id: int or None, discord_channel_id: int or None)
@@ -1095,56 +873,11 @@ class DiscordPoster:
                         except Exception as e:
                             logger.error(f"Error preparing file {file_path}: {e}")
             
-            # Create combined button view with Perplexity and/or Not Valuable buttons
-            view = None
-            perplexity_view = None
-            not_valuable_view = None
-            
-            # Determine if buttons should be enabled
-            if enable_perplexity_button is None:
-                enable_perplexity_button = getattr(config, 'PERPLEXITY_BUTTON_ENABLED', True)
-            if enable_not_valuable_button is None:
-                enable_not_valuable_button = getattr(config, 'NOT_VALUABLE_BUTTON_ENABLED', True)
-            
-            # Generate a hash for button custom_id
-            entry_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:16]
-            
-            # Create Perplexity view if enabled
-            if enable_perplexity_button and self.perplexity_client and self.perplexity_client.is_available():
-                perplexity_view = PerplexitySearchView(content, self.perplexity_client, entry_hash)
-                logger.debug(f"Adding Perplexity search button to message")
-            
-            # Create Not Valuable view if enabled and entry_id provided
-            if (enable_not_valuable_button and entry_id and self.database and 
-                self.vote_tracker and self.removed_entries_db):
-                not_valuable_view = NotValuableView(
-                    entry_id=entry_id,
-                    content=content,
-                    category=category,
-                    discord_channel_id=channel_id,
-                    vote_tracker=self.vote_tracker,
-                    removed_entries_db=self.removed_entries_db,
-                    database=self.database,
-                    entry_hash=entry_hash
-                )
-                logger.debug(f"Adding Not Valuable button to message")
-            
-            # Combine views based on which are enabled
-            views_list = [v for v in [perplexity_view, not_valuable_view] if v is not None]
-            
-            if len(views_list) >= 2:
-                # Use CombinedButtonView for multiple buttons
-                view = CombinedButtonView(perplexity_view, not_valuable_view)
-            elif len(views_list) == 1:
-                # Use single view directly
-                view = views_list[0]
-            
-            # Send the message with embed suppression setting and optional button view
+            # Send the message (no view/buttons needed - using context menu commands)
             sent_message = await channel.send(
                 content=message_text, 
                 files=files, 
-                suppress_embeds=suppress_embeds,
-                view=view
+                suppress_embeds=suppress_embeds
             )
             
             logger.info(
@@ -1198,6 +931,20 @@ class DiscordPoster:
                 return False, None, None, f"Original message not found: {message_id}"
             except Exception as e:
                 return False, None, None, f"Error fetching original message: {str(e)}"
+            
+            # Check if the message has a thread and extract Perplexity content
+            thread_data = None
+            if original_message.thread:
+                logger.info(f"Message {message_id} has a thread: {original_message.thread.id}")
+                try:
+                    thread_data = await self._extract_thread_perplexity_content(original_message.thread)
+                    if thread_data:
+                        logger.info(f"Extracted Perplexity content from thread {original_message.thread.id}")
+                    else:
+                        logger.debug(f"Thread {original_message.thread.id} exists but contains no Perplexity content")
+                except Exception as e:
+                    logger.error(f"Error extracting thread content: {e}", exc_info=True)
+                    # Continue with re-categorization even if thread extraction fails
             
             # Download attachments if media_files not provided
             downloaded_files = []
@@ -1257,6 +1004,42 @@ class DiscordPoster:
             
             if not success:
                 return False, None, None, "Error posting to new channel"
+            
+            # Recreate thread with Perplexity content if it was extracted
+            if thread_data:
+                try:
+                    logger.info(f"Recreating thread on new message {new_message_id} with Perplexity content")
+                    
+                    # Get the new channel and message
+                    new_channel = self.client.get_channel(new_channel_id)
+                    if new_channel:
+                        new_message = await new_channel.fetch_message(new_message_id)
+                        
+                        # Create thread with original name
+                        thread = await new_message.create_thread(
+                            name=thread_data['thread_name'],
+                            auto_archive_duration=1440  # 24 hours
+                        )
+                        logger.info(f"Created thread {thread.id} on new message")
+                        
+                        # Post the answer embed
+                        await thread.send(embed=thread_data['answer_embed'])
+                        logger.debug("Posted answer embed to new thread")
+                        
+                        # Post citations embed if it exists
+                        if thread_data.get('citations_embed'):
+                            await thread.send(embed=thread_data['citations_embed'])
+                            logger.debug("Posted citations embed to new thread")
+                        
+                        logger.info(f"Successfully recreated thread with Perplexity content on message {new_message_id}")
+                    else:
+                        logger.error(f"Could not find new channel {new_channel_id} to recreate thread")
+                        
+                except discord.Forbidden:
+                    logger.error("Bot lacks permission to create threads on new message")
+                except Exception as e:
+                    logger.error(f"Error recreating thread: {e}", exc_info=True)
+                    # Don't fail the whole operation if thread recreation fails
             
             # Update database message mapping
             if self.database and entry_id:
@@ -1419,4 +1202,3 @@ class DiscordPoster:
         except Exception as e:
             logger.error(f"Error getting channel info: {e}")
             return None
-
