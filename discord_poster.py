@@ -430,7 +430,7 @@ Thread title:"""
                     
                     # Generate a descriptive thread name based on content
                     logger.debug("Generating thread title from content...")
-                    thread_name = poster._generate_thread_title(content)
+                    thread_name = await asyncio.to_thread(poster._generate_thread_title, content)
                     logger.debug(f"Generated thread title: {thread_name}")
                     
                     try:
@@ -977,18 +977,27 @@ Thread title:"""
             # Prepare file attachments
             files = []
             if media_files:
+                # Use the server's actual file size limit (based on boost level) instead of hardcoded config
+                guild = channel.guild
+                if guild:
+                    max_size = guild.filesize_limit
+                    logger.info(
+                        f"Server '{guild.name}' boost level: {guild.premium_tier}, "
+                        f"actual file size limit: {max_size / 1024 / 1024:.1f}MB"
+                    )
+                else:
+                    max_size = config.DISCORD_FILE_SIZE_LIMIT_MB * 1024 * 1024
+                    logger.warning(f"Could not determine guild, using config limit: {config.DISCORD_FILE_SIZE_LIMIT_MB}MB")
+                
                 for file_path in media_files:
                     if os.path.exists(file_path):
                         try:
                             file_size = os.path.getsize(file_path)
                             
-                            # Discord has 25MB limit for free, 50MB for level 2 boost, 100MB for level 3 boost
-                            # Check against configured limit
-                            max_size = config.DISCORD_FILE_SIZE_LIMIT_MB * 1024 * 1024
                             if file_size > max_size:
                                 logger.warning(
                                     f"File too large ({file_size} bytes = {file_size / 1024 / 1024:.1f}MB, "
-                                    f"limit: {config.DISCORD_FILE_SIZE_LIMIT_MB}MB), skipping: {file_path}"
+                                    f"server limit: {max_size / 1024 / 1024:.1f}MB), skipping: {file_path}"
                                 )
                                 continue
                             
@@ -1015,6 +1024,28 @@ Thread title:"""
             if e.status == 429:  # Rate limit
                 logger.error(f"Discord rate limit hit: {e}")
                 raise  # Let retry decorator handle it
+            elif e.status == 413:  # Payload too large
+                logger.error(
+                    f"Discord rejected upload as too large (413): {e}\n"
+                    f"  Entry: {entry_id}\n"
+                    f"  Files attempted: {media_files}\n"
+                    f"  This is a permanent error - the file(s) exceed the server's upload limit."
+                )
+                # Try posting without the files so the text content still gets through
+                try:
+                    logger.info(f"Retrying post for {entry_id} without file attachments...")
+                    sent_message = await channel.send(
+                        content=message_text,
+                        suppress_embeds=suppress_embeds
+                    )
+                    logger.info(
+                        f"Successfully posted to {category} (without files): "
+                        f"{len(content)} chars, Discord ID: {sent_message.id}"
+                    )
+                    return True, sent_message.id, channel_id
+                except Exception as fallback_error:
+                    logger.error(f"Fallback post without files also failed: {fallback_error}")
+                    return False, None, None
             else:
                 logger.error(f"Discord HTTP error: {e}")
                 return False, None, None
