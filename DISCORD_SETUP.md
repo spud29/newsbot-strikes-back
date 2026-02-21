@@ -6,7 +6,7 @@ When you run the bot, you see:
 ```
 Inaccessible channels (11/11):
   ✗ crypto: ID 1317592423962251275 (NOT FOUND)
-  ✗ news/politics: ID 1317592486927007784 (NOT FOUND)
+  ✗ politics: ID 1317592486927007784 (NOT FOUND)
   ... etc
 ```
 
@@ -68,7 +68,7 @@ After inviting the bot, you need to update `config.py` with your actual channel 
    ```python
    DISCORD_CHANNELS = {
        "crypto": YOUR_CRYPTO_CHANNEL_ID,
-       "news/politics": YOUR_NEWS_CHANNEL_ID,
+       "politics": YOUR_NEWS_CHANNEL_ID,
        "stocks": YOUR_STOCKS_CHANNEL_ID,
        "artificial intelligence": YOUR_AI_CHANNEL_ID,
        "video games": YOUR_GAMES_CHANNEL_ID,
@@ -92,7 +92,7 @@ Discord client connected and ready!
 Verifying Discord channel access...
 Accessible channels (11/11):
   ✓ crypto: #crypto-news (1234567890)
-  ✓ news/politics: #politics (1234567891)
+  ✓ politics: #politics (1234567891)
   ... etc
 ```
 

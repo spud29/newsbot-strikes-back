@@ -120,7 +120,7 @@ uvicorn dashboard:app --reload --port 8000
 
 The bot can categorize content into:
 - crypto
-- news/politics
+- politics
 - stocks
 - artificial intelligence
 - video games
@@ -137,7 +137,7 @@ Configure your Discord channel IDs in `config.py`:
 ```python
 DISCORD_CHANNELS = {
     "crypto": 1317592423962251275,
-    "news/politics": 1317592486927007784,
+    "politics": 1317592486927007784,
     # ... etc
 }
 ```

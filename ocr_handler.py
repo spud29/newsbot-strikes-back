@@ -2,10 +2,92 @@
 OCR handler for extracting text from images using Tesseract
 """
 import os
+import re
 import pytesseract
 from PIL import Image
 from utils import logger
 import config
+
+# Patterns that indicate TradingView chart OCR garbage
+TRADINGVIEW_GARBAGE_PATTERNS = [
+    r'TradingView',  # TradingView watermark
+    r'(?i)binance|coinbase|kraken|bybit|okx|kucoin',  # Exchange names in chart context
+    r'SELL\s*BUY|BUY\s*SELL',  # Order book buttons
+    r'Vol[-\s]*[A-Z]{2,5}',  # Volume indicators like "Vol- ETH"
+    r'\d{1,2}:\d{2}\s*\d{1,2}:\d{2}',  # Multiple time stamps (chart time axis)
+    r'[A-Z]+\s*/\s*U\.?S\.?\s*Dollar',  # Trading pair format "ETH / U.S. Dollar"
+    r'\b[OHLC]\s*[\d,]+\.\d+',  # OHLC data (Open, High, Low, Close)
+]
+
+# Minimum ratio of "garbage" patterns to total content that indicates OCR garbage
+GARBAGE_PATTERN_THRESHOLD = 0.3
+
+def is_tradingview_chart_ocr(text):
+    """
+    Detect if OCR text appears to be garbage from a TradingView chart image.
+    
+    These charts produce nonsensical text when OCR'd because they contain:
+    - Price numbers scattered everywhere
+    - Time axis labels
+    - Trading pair names
+    - Exchange branding
+    - Button text (SELL, BUY)
+    - Volume indicators
+    
+    Args:
+        text: OCR extracted text
+        
+    Returns:
+        bool: True if this appears to be TradingView chart garbage
+    """
+    if not text or len(text) < 50:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Quick check for TradingView watermark - strong indicator
+    if 'tradingview' in text_lower:
+        logger.info("TradingView chart OCR detected (watermark found)")
+        return True
+    
+    # Count how many garbage patterns are present
+    garbage_matches = 0
+    for pattern in TRADINGVIEW_GARBAGE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            garbage_matches += 1
+    
+    # Check for high density of numbers (charts have lots of price/time numbers)
+    # Count digit characters vs alphabetic characters
+    digit_count = sum(1 for c in text if c.isdigit())
+    alpha_count = sum(1 for c in text if c.isalpha())
+    
+    # Charts typically have very high number density
+    number_ratio = digit_count / max(alpha_count, 1)
+    
+    # If multiple garbage patterns AND high number density, it's likely a chart
+    if garbage_matches >= 3 and number_ratio > 0.5:
+        logger.info(
+            f"TradingView chart OCR detected: {garbage_matches} patterns matched, "
+            f"number ratio {number_ratio:.2f}"
+        )
+        return True
+    
+    # Check for fragmented text (OCR from charts produces lots of short fragments)
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if lines:
+        avg_line_length = sum(len(l) for l in lines) / len(lines)
+        short_lines = sum(1 for l in lines if len(l) < 15)
+        short_line_ratio = short_lines / len(lines)
+        
+        # Charts produce many short, disconnected text fragments
+        if short_line_ratio > 0.7 and avg_line_length < 20 and garbage_matches >= 2:
+            logger.info(
+                f"TradingView chart OCR detected: high fragmentation "
+                f"(avg line: {avg_line_length:.1f}, {short_line_ratio:.0%} short lines)"
+            )
+            return True
+    
+    return False
 
 class OCRHandler:
     """Handles OCR text extraction from images"""
@@ -92,7 +174,7 @@ class OCRHandler:
             image_paths: List of paths to image files
         
         Returns:
-            str: Combined extracted text from all images
+            str: Combined extracted text from all images (empty if detected as chart garbage)
         """
         if not self.enabled:
             return ""
@@ -111,6 +193,14 @@ class OCRHandler:
         combined_text = "\n\n".join(extracted_texts)
         
         if combined_text:
+            # Check if this is TradingView chart garbage
+            if is_tradingview_chart_ocr(combined_text):
+                logger.warning(
+                    f"Rejecting OCR text as TradingView chart garbage "
+                    f"({len(combined_text)} chars from {len(image_paths)} images)"
+                )
+                return ""
+            
             logger.info(f"OCR extracted total of {len(combined_text)} characters from {len(image_paths)} images")
         
         return combined_text

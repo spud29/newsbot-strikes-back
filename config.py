@@ -47,19 +47,28 @@ RSS_FEEDS = {
 
 # Discord Channel IDs for each category
 DISCORD_CHANNELS = {
-    "crypto": 1317592423962251275,
-    "news/politics": 1317592486927007784,
-    "stocks": 1317592539192229918,
+    "crypto": 775513484221743124,
+    "politics": 1379921787629867138,
+    # "stocks": 1317592539192229918,
     "artificial intelligence": 1317592582368268338,
     "video games": 1317592652044046347,
     "sports": 1317592748005654688,
-    "food": 1317592771258749078,
+    # "food": 1317592771258749078,
     "technology": 1317592703554420796,
     "music": 1343736462939783259,
     "fashion": 1344412433552248973,
     "pop culture": 1442779289526472774,
     "ignore": 1344410355224547441
 }
+
+# All valid categories the AI can return (used for validation)
+# This is separate from DISCORD_CHANNELS so the AI's correct answers
+# aren't rejected just because a channel is disabled
+VALID_CATEGORIES = [
+    "crypto", "politics", "stocks", "artificial intelligence",
+    "video games", "sports", "food", "technology",
+    "music", "fashion", "pop culture", "ignore"
+]
 
 # Default category for uncertain/unmatched content
 DEFAULT_CATEGORY = "ignore"
@@ -92,7 +101,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Crypto exchanges, trading, regulations
 - Crypto market analysis and price movements
 
-### news/politics
+### politics
 - Political events, elections, government policies
 - International relations, diplomacy, geopolitics
 - Social issues, protests, activism
@@ -184,6 +193,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Duplicate or redundant information
 - Memes without substantive news value
 - When uncertain about relevance or quality
+- Content from or mentioning @BTC_Tick (always ignore regardless of topic)
 
 ## CATEGORIZATION GUIDELINES
 
@@ -216,7 +226,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "OpenAI releases GPT-5 with improved reasoning" → artificial intelligence
 "New MacBook Pro features M4 chip" → technology
 "Bitcoin reaches new all-time high" → crypto
-"Fed raises interest rates by 0.25%" → news/politics
+"Fed raises interest rates by 0.25%" → politics
 "Call of Duty releases new battle pass" → video games
 "LeBron James scores 40 points in playoff game" → sports
 "Taylor Swift announces new album release date" → pop culture
@@ -227,16 +237,17 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Engineers create breakthrough in autonomous navigation" → artificial intelligence
 "Random meme with no context" → ignore
 "Incomplete sentence..." → ignore
+"JUST IN : Bitcoin hits $67,000 @BTC_Tick" → ignore
 
 ## OUTPUT FORMAT
 
 Respond with ONLY the category name exactly as listed above. No explanation, no punctuation, no extra text.
 
-Valid responses: crypto, news/politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, ignore"""
+Valid responses: crypto, politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, ignore"""
 
 # Duplicate detection thresholds (cosine similarity)
 DUPLICATE_THRESHOLD = 0.95  # Exact duplicates only (>0.95 similarity)
-SIMILARITY_THRESHOLD = 0.70  # Similar content - route to ignore channel
+SIMILARITY_THRESHOLD = 0.60  # Similar content - route to ignore channel
 
 # Database paths
 DB_PROCESSED_IDS = "data/processed_ids.json"
@@ -280,7 +291,7 @@ RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed
 # Filters out mundane/routine news by rating surprise, impact, and actionability
 # Only posts that score ABOVE the threshold will be posted to their category
 # Posts below threshold go to the 'ignore' channel for review
-NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the newsworthiness filter
+NEWSWORTHINESS_FILTER_ENABLED = False  # Enable/disable the newsworthiness filter
 NEWSWORTHINESS_THRESHOLD = 7.0  # STRICT: 1-10 scale, only high-quality news gets through
 NEWSWORTHINESS_WEIGHTS = {
     'surprising': 0.45,   # 45% weight - must be genuinely unexpected, not routine

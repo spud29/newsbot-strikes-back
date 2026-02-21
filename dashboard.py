@@ -544,15 +544,15 @@ async def test_categorization(
 ):
     """Test categorization without posting"""
     try:
-        category = ollama.categorize(text)
+        category, _reasoning = ollama.categorize(text)
         
         # Generate embedding and check for duplicates
         embedding = ollama.generate_embedding(text)
-        is_duplicate, similarity, match_preview = db.find_similar(
+        is_duplicate, similarity, match_preview, _ = db.find_similar(
             embedding, 
             threshold=config.DUPLICATE_THRESHOLD
         )
-        is_similar, similar_score, similar_preview = db.find_similar(
+        is_similar, similar_score, similar_preview, _ = db.find_similar(
             embedding,
             threshold=config.SIMILARITY_THRESHOLD
         )
@@ -720,12 +720,12 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
         logger.info(f"Reprocessing entry {entry_id} with content length: {len(content)}")
         
         # 1. Categorize the content
-        category = ollama.categorize(content)
+        category, _reasoning = ollama.categorize(content)
         logger.info(f"Categorized as: {category}")
         
         # 2. Check for duplicates (but don't block - just warn)
         embedding = ollama.generate_embedding(content)
-        is_duplicate, similarity, match_preview = db.find_similar(
+        is_duplicate, similarity, match_preview, _ = db.find_similar(
             embedding, 
             threshold=config.DUPLICATE_THRESHOLD
         )
@@ -1457,14 +1457,14 @@ def process_twitter_url(status_id: str, url: str) -> dict:
         step_start = time.time()
         try:
             logger.debug("Checking for duplicates...")
-            is_duplicate, duplicate_similarity, match_preview = db.find_similar(
+            is_duplicate, duplicate_similarity, match_preview, _ = db.find_similar(
                 embedding, 
                 threshold=config.DUPLICATE_THRESHOLD
             )
             logger.debug(f"Duplicate check: {is_duplicate}")
             
             logger.debug("Checking for similar content...")
-            is_similar, similar_similarity, similar_preview = db.find_similar(
+            is_similar, similar_similarity, similar_preview, _ = db.find_similar(
                 embedding,
                 threshold=config.SIMILARITY_THRESHOLD
             )
@@ -1499,7 +1499,7 @@ def process_twitter_url(status_id: str, url: str) -> dict:
         step_start = time.time()
         try:
             logger.debug("Categorizing content...")
-            category = ollama.categorize(combined_content)
+            category, _reasoning = ollama.categorize(combined_content)
             logger.debug(f"Categorized as: {category}")
             result['category'] = category
             result['steps'].append({
@@ -1688,12 +1688,12 @@ async def process_telegram_url(channel: str, message_id: int, url: str) -> dict:
         # Step 4: Check for duplicates
         step_start = time.time()
         try:
-            is_duplicate, duplicate_similarity, match_preview = db.find_similar(
+            is_duplicate, duplicate_similarity, match_preview, _ = db.find_similar(
                 embedding, 
                 threshold=config.DUPLICATE_THRESHOLD
             )
             
-            is_similar, similar_similarity, similar_preview = db.find_similar(
+            is_similar, similar_similarity, similar_preview, _ = db.find_similar(
                 embedding,
                 threshold=config.SIMILARITY_THRESHOLD
             )
@@ -1725,7 +1725,7 @@ async def process_telegram_url(channel: str, message_id: int, url: str) -> dict:
         # Step 5: Categorize content
         step_start = time.time()
         try:
-            category = ollama.categorize(combined_content)
+            category, _reasoning = ollama.categorize(combined_content)
             result['category'] = category
             result['steps'].append({
                 'name': 'Categorization',
@@ -2041,13 +2041,13 @@ async def recategorize_from_ignore(entry_id: str, username: str = Depends(verify
         
         # Step 1: Re-categorize with "ignore" excluded
         logger.info("Running AI categorization with 'ignore' excluded...")
-        new_category = ollama.categorize(content, exclude_categories=['ignore'])
+        new_category, _reasoning = ollama.categorize(content, exclude_categories=['ignore'])
         logger.info(f"New category determined: {new_category}")
         
         # Safety check: ensure we didn't get "ignore" again
         if new_category == 'ignore':
-            logger.error("AI still returned 'ignore' despite exclusion, forcing to news/politics")
-            new_category = 'news/politics'
+            logger.error("AI still returned 'ignore' despite exclusion, forcing to politics")
+            new_category = 'politics'
         
         # Get Discord channel for new category
         new_discord_channel_id = config.DISCORD_CHANNELS.get(new_category)

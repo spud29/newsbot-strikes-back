@@ -504,6 +504,35 @@ def remove_xcom_urls(text):
     
     return text
 
+def ensure_url_on_own_line(text):
+    """
+    Ensure URLs that are directly preceded by non-whitespace are placed on their own line.
+    
+    This fixes cases where emoji removal or text cleaning causes URLs to be
+    glued to the preceding text, e.g.:
+        "raised the entry age to 25https://example.com"
+    becomes:
+        "raised the entry age to 25
+        https://example.com"
+    
+    Args:
+        text: Text potentially containing URLs glued to preceding text
+    
+    Returns:
+        str: Text with URLs properly separated on their own line
+    """
+    if not text:
+        return text
+    
+    import re
+    
+    # Insert a newline before any URL (http:// or https://) that is directly
+    # preceded by a non-whitespace character
+    text = re.sub(r'(\S)(https?://)', r'\1\n\2', text)
+    
+    return text
+
+
 def remove_telegram_formatting(text, channel_name=None):
     """
     Remove Telegram formatting markup and channel usernames

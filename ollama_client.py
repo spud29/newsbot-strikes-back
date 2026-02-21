@@ -94,7 +94,7 @@ class OllamaClient:
             exclude_categories: List of category names to exclude from results
         
         Returns:
-            str: Category name (defaults to 'ignore' if unclear)
+            tuple: (category_name, reasoning) where reasoning is a brief explanation
         """
         logger.debug(f"Categorizing content: {content[:100]}...")
         if exclude_categories:
@@ -109,8 +109,12 @@ class OllamaClient:
                 exclusion_note = f"\n\nIMPORTANT: Do NOT categorize this content as any of the following: {', '.join(exclude_categories)}. Choose the next most appropriate category."
                 system_prompt += exclusion_note
             
-            # Prepare the prompt
-            prompt = f"{system_prompt}\n\nContent to categorize:\n{content}"
+            # Prepare the prompt - request JSON with category and reasoning
+            prompt = (
+                f"{system_prompt}\n\n"
+                f"Content to categorize:\n{content}\n\n"
+                f"Respond with ONLY valid JSON: {{\"category\": \"<name>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
+            )
             
             # Call Ollama API
             response = requests.post(
@@ -118,7 +122,11 @@ class OllamaClient:
                 json={
                     "model": self.categorization_model,
                     "prompt": prompt,
-                    "stream": False
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 300
+                    }
                 },
                 timeout=60
             )
@@ -126,13 +134,45 @@ class OllamaClient:
             response.raise_for_status()
             result = response.json()
             
-            # Extract category from response
-            category_raw = result.get('response', '').strip().lower()
+            # Extract category and reasoning from response
+            response_text = result.get('response', '').strip()
+            category_raw = ''
+            reasoning = None
+            
+            # Strategy 1: Try full JSON parse
+            try:
+                json_match = re.search(r'\{[^}]+\}', response_text)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    category_raw = parsed.get('category', '').lower().strip()
+                    reasoning = parsed.get('reasoning', None)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            
+            # Strategy 2: Extract category from truncated JSON (e.g. {"category":"politics","reasoning":"the...
+            if not category_raw:
+                cat_field = re.search(r'"category"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                if cat_field:
+                    category_raw = cat_field.group(1).lower().strip()
+                    # Also try to extract partial reasoning from truncated JSON
+                    reason_field = re.search(r'"reasoning"\s*:\s*"([^"]*)', response_text, re.IGNORECASE)
+                    if reason_field:
+                        reasoning = reason_field.group(1).strip() or None
+                    logger.debug(f"Extracted category from truncated JSON: '{category_raw}'")
+            
+            # Strategy 3: Plain text fallback — use first meaningful word/phrase
+            if not category_raw:
+                first_line = response_text.split('\n')[0].strip().lower()
+                category_raw = first_line.split(',')[0].split('.')[0].strip()
+                if category_raw:
+                    logger.warning(f"JSON parse failed, using first line as category: '{category_raw}'")
+            
             category = self._parse_category(category_raw)
             
             # If the returned category is in the exclusion list, force to a different default
             if exclude_categories and category in exclude_categories:
                 logger.warning(f"AI returned excluded category '{category}', forcing to alternative")
+                reasoning = f"AI suggested '{category}' but it was excluded"
                 # Try to find a suitable fallback category
                 valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys() 
                                    if cat not in exclude_categories]
@@ -140,9 +180,9 @@ class OllamaClient:
                 if config.DEFAULT_CATEGORY not in exclude_categories:
                     category = config.DEFAULT_CATEGORY
                 elif valid_categories:
-                    # Find the most generic category (prefer 'news/politics' or first available)
-                    if 'news/politics' in valid_categories:
-                        category = 'news/politics'
+                    # Find the most generic category (prefer 'politics' or first available)
+                    if 'politics' in valid_categories:
+                        category = 'politics'
                     else:
                         category = valid_categories[0]
                     logger.info(f"Using fallback category: {category}")
@@ -150,8 +190,8 @@ class OllamaClient:
                     logger.error("All categories excluded! Using DEFAULT_CATEGORY anyway")
                     category = config.DEFAULT_CATEGORY
             
-            logger.info(f"Categorized as: {category} (raw: {category_raw})")
-            return category
+            logger.info(f"Categorized as: {category} (raw: {category_raw}, reasoning: {reasoning})")
+            return category, reasoning
             
         except Exception as e:
             logger.error(f"Error categorizing content: {e}")
@@ -159,8 +199,9 @@ class OllamaClient:
             if exclude_categories and config.DEFAULT_CATEGORY in exclude_categories:
                 valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys() 
                                    if cat not in exclude_categories]
-                return valid_categories[0] if valid_categories else config.DEFAULT_CATEGORY
-            return config.DEFAULT_CATEGORY
+                fallback = valid_categories[0] if valid_categories else config.DEFAULT_CATEGORY
+                return fallback, f"Error during categorization: {str(e)[:50]}"
+            return config.DEFAULT_CATEGORY, f"Error during categorization: {str(e)[:50]}"
     
     def _parse_category(self, category_raw):
         """
@@ -170,26 +211,95 @@ class OllamaClient:
             category_raw: Raw category string from model
         
         Returns:
-            str: Validated category name
+            str: Validated category name (mapped to a configured Discord channel)
         """
         # Clean up the response
         category = category_raw.lower().strip()
         
-        # Check if it matches any valid category
-        valid_categories = list(config.DISCORD_CHANNELS.keys())
+        # Validate against ALL known categories (not just active Discord channels)
+        # This prevents correct AI answers from being rejected when a channel is disabled
+        valid_categories = getattr(config, 'VALID_CATEGORIES', list(config.DISCORD_CHANNELS.keys()))
         
         if category in valid_categories:
-            return category
+            # Category is valid — route to its channel if configured, otherwise default
+            if category in config.DISCORD_CHANNELS:
+                return category
+            else:
+                logger.info(f"Category '{category}' is valid but has no Discord channel, routing to '{config.DEFAULT_CATEGORY}'")
+                return config.DEFAULT_CATEGORY
         
-        # Try partial matching
-        for valid_cat in valid_categories:
-            if valid_cat in category or category in valid_cat:
-                logger.debug(f"Partial match: '{category}' -> '{valid_cat}'")
-                return valid_cat
+        # Only do partial matching if the string is short and non-empty
+        # (avoids matching reasoning text, and prevents "" from matching everything)
+        if category and len(category) < 50:
+            for valid_cat in valid_categories:
+                if valid_cat in category or category in valid_cat:
+                    mapped = valid_cat if valid_cat in config.DISCORD_CHANNELS else config.DEFAULT_CATEGORY
+                    logger.debug(f"Partial match: '{category}' -> '{valid_cat}' -> channel: '{mapped}'")
+                    return mapped
         
         # Default to ignore if no match
         logger.warning(f"Unknown category '{category}', defaulting to '{config.DEFAULT_CATEGORY}'")
         return config.DEFAULT_CATEGORY
+    
+    @retry_with_backoff(max_retries=2, initial_delay=1)
+    def verify_similarity(self, new_content, existing_content):
+        """
+        Use the LLM to verify whether two pieces of content are about the same specific
+        event or story, not just the same general topic.
+        
+        This is used as a second pass after embedding cosine similarity flags a potential
+        match, to reduce false positives (e.g. two unrelated political headlines both
+        involving world leaders).
+        
+        Args:
+            new_content: Full text of the new entry
+            existing_content: Full text of the existing entry that was flagged as similar
+        
+        Returns:
+            bool: True if the LLM confirms they are about the same event/story
+        """
+        logger.debug(f"LLM verifying similarity between entries...")
+        
+        prompt = (
+            "You are a duplicate news detector. Determine if these two headlines/articles "
+            "are about the SAME specific event or story — not just the same general topic "
+            "or category.\n\n"
+            "For example:\n"
+            "- Two articles about Macron commenting on free speech = SAME story = yes\n"
+            "- One article about Macron on free speech and another about Khamenei on warships = DIFFERENT stories = no\n"
+            "- Two articles about Bitcoin hitting $100k = SAME story = yes\n"
+            "- One article about Bitcoin price and another about Ethereum upgrade = DIFFERENT stories = no\n\n"
+            f"ARTICLE A:\n{new_content[:500]}\n\n"
+            f"ARTICLE B:\n{existing_content[:500]}\n\n"
+            "Are these about the SAME specific event or story? Answer ONLY \"yes\" or \"no\"."
+        )
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.categorization_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 10
+                    }
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            result = response.json().get('response', '').strip().lower()
+            
+            is_same = result.startswith('yes')
+            logger.info(f"LLM similarity verdict: {'SAME story' if is_same else 'DIFFERENT stories'} (raw: '{result}')")
+            return is_same
+            
+        except Exception as e:
+            logger.error(f"Error verifying similarity via LLM: {e}")
+            # Fail safe: if the LLM check fails, assume they ARE similar
+            # (preserves the old behavior of trusting the embedding match)
+            return True
     
     @retry_with_backoff(max_retries=3, initial_delay=2)
     def generate_embedding(self, content):
@@ -263,76 +373,18 @@ class OllamaClient:
             }
         
         try:
-            # Build the rating prompt with strict filtering criteria
-            prompt = f"""You are a strict news editor. Rate this content's newsworthiness on three criteria (1-10 each).
-BE VERY HARSH - most content is noise. Only truly significant news should score 7+.
+            # Build the rating prompt — kept concise so the model reliably returns JSON
+            prompt = f"""Rate this news content's newsworthiness from 1-10 on three criteria.
 
-## AUTOMATIC LOW SCORES (1-3) - These are NOISE, not news:
-
-ADVERTISEMENTS & PROMOTIONS (score 1 - absolute garbage):
-- Product feature updates ("We added X to our tool")
-- Sales and promotions ("Black Friday Sale", "discount", "sale ends today")
-- Self-promotional content from financial services
-- Tool/platform announcements ("generate your own scanners at...")
-- Links to products or services being sold
-
-STOCKS/FINANCE NOISE:
-- Daily market summaries ("Market tide today", daily heatmaps)
-- ETF/fund regulatory filings and paperwork (Form S-1, withdrawals)
-- Token unlock schedules or vesting announcements
-- Individual whale/trader positions or trades
-- TVL rankings, "top projects" lists without major news
-- Routine price updates without record-breaking context
-
-NEWS/POLITICS NOISE:
-- Poll results and approval ratings (e.g., "Congress has 14% approval")
-- Survey results (e.g., "86% of Americans support X")
-- Scheduled diplomatic visits (e.g., "Putin to visit India on Dec 4")
-- Someone expressing interest/willingness (e.g., "X says he'd be happy to serve as Y")
-- Resource or mineral discoveries (routine geological news)
-- Routine economic data releases without major surprise
-- Politicians pushing for things they always push for (ongoing battles)
-
-GENERAL NOISE:
-- Generic "JUST IN" headlines with no real substance
-- Scheduled announcements or expected events
-- Minor partnership announcements
-- Daily/weekly statistics without significant change
-- Ongoing stories without new major developments
-
-## HIGH SCORES (7-10) - Actual newsworthy content:
-- RECORD-BREAKING: "highest ever", "lowest ever", "first time in history"
-- Major institutional research/projections (Goldman, Morgan Stanley, etc. with specific forecasts)
-- Significant investor sentiment from major banks (BoA, JPMorgan surveys with striking findings)
-- ACTIONS TAKEN: Someone actually DID something significant (not just said they would)
-- Major policy decisions or executive orders with immediate effect
-- Unprecedented moves (closing airspace, military action, major legal rulings)
-- Government scandals, fraud investigations, corruption charges
-- Economic warnings from officials (recession, negative GDP)
-- Events that would make someone say "holy shit, really?"
-
-## SCORING CRITERIA:
-
-1. SURPRISING (be strict - most things are predictable):
-   - 1-3: Expected, routine, polls, surveys, scheduled events, expressions of interest
-   - 4-6: Somewhat notable but not shocking
-   - 7-10: Genuinely unexpected, actual action taken, would make someone say "what the fuck"
-
-2. IMPACT (who actually cares?):
-   - 1-3: Niche audience, statistics nerds only, doesn't affect average person
-   - 4-6: Industry-relevant but limited broader impact
-   - 7-10: Affects many people directly, major implications, changes the game
-
-3. ACTIONABLE (does anyone need to DO something?):
-   - 1-3: Pure information/statistics, no action needed, just interesting trivia
-   - 4-6: Good to know for future reference
-   - 7-10: Requires immediate attention, affects travel/money/safety
+Score 1-3 for routine/mundane news (polls, surveys, scheduled events, minor updates, ads, promotions, daily stats, ongoing stories without new developments).
+Score 4-6 for moderately notable news (industry-relevant, limited broader impact).
+Score 7-10 for genuinely surprising, high-impact, or urgent news that would make someone say "wow".
 
 Category: {category}
-Content: {content[:1500]}
+Content: {content[:1000]}
 
-Respond with ONLY valid JSON, no other text:
-{{"surprising": X, "impact": X, "actionable": X, "reasoning": "brief 10-word max explanation"}}"""
+Respond with ONLY this JSON, no other text:
+{{"surprising": 5, "impact": 5, "actionable": 5, "reasoning": "brief explanation"}}"""
 
             # Call Ollama API
             response = requests.post(
@@ -343,7 +395,7 @@ Respond with ONLY valid JSON, no other text:
                     "stream": False,
                     "options": {
                         "temperature": 0.3,  # Lower temperature for more consistent ratings
-                        "num_predict": 100   # Limit response length
+                        "num_predict": 200   # Give model enough room for JSON response
                     }
                 },
                 timeout=60
@@ -406,25 +458,25 @@ Respond with ONLY valid JSON, no other text:
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse newsworthiness JSON: {e}")
-            # Return a middle score on parse error (let it through but log the issue)
+            # On parse error, fail closed — route to ignore for manual review
             return {
-                'score': 6.0,
-                'surprising': 6,
-                'impact': 6,
-                'actionable': 6,
-                'reasoning': 'JSON parse error - defaulting to pass',
-                'passed': True
+                'score': 0.0,
+                'surprising': 0,
+                'impact': 0,
+                'actionable': 0,
+                'reasoning': 'JSON parse error - defaulting to fail',
+                'passed': False
             }
         except Exception as e:
             logger.error(f"Error rating newsworthiness: {e}")
-            # On error, default to passing (don't block news due to rating failures)
+            # On error, fail closed — route to ignore for manual review
             return {
-                'score': 6.0,
-                'surprising': 6,
-                'impact': 6,
-                'actionable': 6,
+                'score': 0.0,
+                'surprising': 0,
+                'impact': 0,
+                'actionable': 0,
                 'reasoning': f'Rating error: {str(e)[:50]}',
-                'passed': True
+                'passed': False
             }
     
     def health_check(self):

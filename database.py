@@ -87,7 +87,8 @@ class Database:
         self.embeddings[content_hash] = {
             'embedding': embedding if isinstance(embedding, list) else embedding.tolist(),
             'timestamp': time.time(),
-            'preview': content[:100],  # Store preview for debugging
+            'preview': content[:100],  # Store preview for logging
+            'content': content,  # Store full content for LLM similarity verification
             'entry_id': entry_id  # Store entry_id to link back to message_mapping
         }
         
@@ -105,10 +106,10 @@ class Database:
             threshold: Similarity threshold (0.0-1.0)
         
         Returns:
-            tuple: (is_duplicate, similarity_score, matching_preview) or (False, 0.0, None)
+            tuple: (is_match, similarity_score, matching_preview, full_content) or (False, 0.0, None, None)
         """
         if not self.embeddings:
-            return False, 0.0, None
+            return False, 0.0, None, None
         
         embedding_array = np.array(embedding)
         
@@ -118,9 +119,11 @@ class Database:
             
             if similarity >= threshold:
                 logger.info(f"Duplicate detected! Similarity: {similarity:.3f} - {data['preview']}")
-                return True, similarity, data['preview']
+                # Return full content if available, fall back to preview for older entries
+                full_content = data.get('content', data['preview'])
+                return True, similarity, data['preview'], full_content
         
-        return False, 0.0, None
+        return False, 0.0, None, None
     
     def _cosine_similarity(self, vec1, vec2):
         """
@@ -186,7 +189,7 @@ class Database:
             'message_mappings': len(self.message_mapping)
         }
     
-    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None):
+    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None):
         """
         Store mapping between Telegram and Discord messages
         
@@ -200,6 +203,7 @@ class Database:
             video_urls: List of video URLs (for Twitter entries with videos)
             category: Category the message was posted to
             source_type: Source type ('twitter', 'telegram', etc.) for re-categorization
+            reasoning: Brief explanation of why this category was chosen
         """
         mapping_key = telegram_entry_id
         self.message_mapping[mapping_key] = {
@@ -211,9 +215,15 @@ class Database:
             'video_urls': video_urls if video_urls else [],
             'category': category,
             'source_type': source_type,
+            'reasoning': reasoning,
             'timestamp': time.time()
         }
         self._save_json(self.message_mapping_path, self.message_mapping)
+        
+        # Update reverse index if it exists
+        if hasattr(self, '_discord_msg_to_entry') and discord_message_id:
+            self._discord_msg_to_entry[discord_message_id] = mapping_key
+        
         logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id} (category: {category}, source_type: {source_type})")
     
     def get_discord_message_info(self, telegram_entry_id):
@@ -227,4 +237,37 @@ class Database:
             dict: Discord message info or None if not found
         """
         return self.message_mapping.get(telegram_entry_id)
+    
+    def get_entry_id_by_discord_message(self, discord_message_id):
+        """
+        Fast reverse lookup: get entry ID from Discord message ID
+        
+        This is optimized for speed to avoid interaction timeouts in Discord commands.
+        
+        Args:
+            discord_message_id: Discord message ID (int)
+        
+        Returns:
+            str: Entry ID or None if not found
+        """
+        # Build reverse index on first call or if it doesn't exist
+        if not hasattr(self, '_discord_msg_to_entry'):
+            self._rebuild_reverse_index()
+        
+        # Try the index first
+        entry_id = self._discord_msg_to_entry.get(discord_message_id)
+        if entry_id:
+            return entry_id
+        
+        # If not found in index, rebuild and try again (in case of new entries)
+        self._rebuild_reverse_index()
+        return self._discord_msg_to_entry.get(discord_message_id)
+    
+    def _rebuild_reverse_index(self):
+        """Rebuild the reverse lookup index for discord_message_id -> entry_id"""
+        self._discord_msg_to_entry = {}
+        for entry_id, mapping in self.message_mapping.items():
+            msg_id = mapping.get('discord_message_id')
+            if msg_id:
+                self._discord_msg_to_entry[msg_id] = entry_id
 

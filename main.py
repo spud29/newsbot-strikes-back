@@ -19,6 +19,7 @@ from retry_queue import RetryQueue
 from perplexity_client import PerplexityClient
 from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
+from ocr_handler import is_tradingview_chart_ocr
 
 class NewsAggregatorBot:
     """Main bot orchestrator"""
@@ -46,6 +47,7 @@ class NewsAggregatorBot:
         self.retry_queue = RetryQueue(max_retries=3, retry_delay_cycles=2)
         
         self.running = False
+        self._processing_lock = set()  # Track entries currently being processed (race condition guard)
         
         # Statistics
         self.stats = {
@@ -122,207 +124,264 @@ class NewsAggregatorBot:
             logger.info(f"\nProcessing entry: {entry_id}")
             logger.debug(f"Source: {entry['source']} ({source_type})")
             
-            # Check if already processed
-            if self.db.is_processed(entry_id):
-                logger.debug(f"Already processed, skipping: {entry_id}")
+            # Check if already being processed by another path (race condition guard)
+            # Prevents double-posting when real-time handler and polling cycle
+            # pick up the same Telegram message simultaneously
+            if entry_id in self._processing_lock:
+                logger.debug(f"Already being processed by another path, skipping: {entry_id}")
                 return False
             
-            # Check if previously removed via voting
-            if self.removed_entries_db.is_removed(entry_id):
-                logger.debug(f"Entry was previously removed by voting, skipping: {entry_id}")
-                return False
+            # Claim this entry before doing any expensive work
+            self._processing_lock.add(entry_id)
             
-            # Get initial content for duplicate check (before downloading media)
-            content = entry.get('content', '')
-            
-            # Special handling for image-only Telegram entries
-            # Download media and extract OCR text BEFORE content validation
-            if source_type == 'telegram' and not content and entry.get('has_media'):
-                logger.info(f"Image-only Telegram entry detected, downloading media for OCR...")
-                entry = await self.media_handler.download_telegram_media(entry)
-                media_files = entry.get('media_files', [])
-                ocr_text = entry.get('ocr_text', '')
+            try:
+                # Check if already processed
+                if self.db.is_processed(entry_id):
+                    logger.debug(f"Already processed, skipping: {entry_id}")
+                    return False
                 
-                # BUGFIX: If this is an image-only entry but download failed, skip it entirely
-                if not media_files:
-                    logger.error(
-                        f"Image-only Telegram entry has no media files after download! "
-                        f"Entry ID: {entry_id}, has_media: {entry.get('has_media')}, "
-                        f"media_type: {entry.get('media_type')}. Skipping this entry."
-                    )
+                # Check if previously removed via voting
+                if self.removed_entries_db.is_removed(entry_id):
+                    logger.debug(f"Entry was previously removed by voting, skipping: {entry_id}")
+                    return False
+                
+                # Get initial content for duplicate check (before downloading media)
+                content = entry.get('content', '')
+                
+                # Special handling for image-only Telegram entries
+                # Download media and extract OCR text BEFORE content validation
+                if source_type == 'telegram' and not content and entry.get('has_media'):
+                    logger.info(f"Image-only Telegram entry detected, downloading media for OCR...")
+                    entry = await self.media_handler.download_telegram_media(entry)
+                    media_files = entry.get('media_files', [])
+                    ocr_text = entry.get('ocr_text', '')
+                    
+                    # BUGFIX: If this is an image-only entry but download failed, skip it entirely
+                    if not media_files:
+                        logger.error(
+                            f"Image-only Telegram entry has no media files after download! "
+                            f"Entry ID: {entry_id}, has_media: {entry.get('has_media')}, "
+                            f"media_type: {entry.get('media_type')}. Skipping this entry."
+                        )
+                        self.stats['errors'] += 1
+                        return False
+                    
+                    if ocr_text:
+                        # Additional check for TradingView chart garbage
+                        # (should be caught in OCR extraction, but double-check here)
+                        if is_tradingview_chart_ocr(ocr_text):
+                            logger.warning(
+                                f"Skipping image-only entry with TradingView chart OCR garbage: {entry_id}"
+                            )
+                            self.stats['duplicates'] += 1  # Count as filtered/skipped
+                            return False
+                        
+                        # Use OCR text as the content for image-only entries
+                        content = ocr_text
+                        entry['content'] = content
+                        logger.info(f"Using OCR text as content ({len(content)} chars)")
+                    else:
+                        # If OCR extraction failed or is disabled, use a placeholder
+                        # This allows image-only posts to still be processed
+                        content = "[Image content - no text extracted]"
+                        entry['content'] = content
+                        logger.info(f"No OCR text available, using placeholder content for image-only entry with {len(media_files)} media file(s)")
+                
+                if not content:
+                    logger.warning(f"No content to process for: {entry_id}")
                     self.stats['errors'] += 1
                     return False
                 
-                if ocr_text:
-                    # Use OCR text as the content for image-only entries
-                    content = ocr_text
-                    entry['content'] = content
-                    logger.info(f"Using OCR text as content ({len(content)} chars)")
-                else:
-                    # If OCR extraction failed or is disabled, use a placeholder
-                    # This allows image-only posts to still be processed
-                    content = "[Image content - no text extracted]"
-                    entry['content'] = content
-                    logger.info(f"No OCR text available, using placeholder content for image-only entry with {len(media_files)} media file(s)")
-            
-            if not content:
-                logger.warning(f"No content to process for: {entry_id}")
-                self.stats['errors'] += 1
-                return False
-            
-            # Generate embedding for duplicate detection BEFORE downloading media
-            # Note: OCR text will be added after media download for enhanced detection
-            logger.debug("Generating embedding for duplicate check...")
-            embedding = self.ollama.generate_embedding(content)
-            
-            # Check for exact duplicates BEFORE downloading media
-            is_duplicate, duplicate_similarity, match_preview = self.db.find_similar(
-                embedding, 
-                threshold=config.DUPLICATE_THRESHOLD
-            )
-            
-            if is_duplicate:
-                # True duplicate (>0.95 similarity) - skip entirely
-                logger.info(
-                    f"Exact duplicate detected (similarity: {duplicate_similarity:.3f}): {entry_id}\n"
-                    f"Matches: {match_preview}"
-                )
-                self.stats['duplicates'] += 1
-                return False
-            
-            # Check for similar content (not exact duplicate)
-            is_similar, similar_similarity, similar_preview = self.db.find_similar(
-                embedding,
-                threshold=config.SIMILARITY_THRESHOLD
-            )
-            
-            force_category = None
-            if is_similar and not is_duplicate:
-                # Similar but not duplicate - force to ignore category
-                logger.info(
-                    f"Similar content detected (similarity: {similar_similarity:.3f}): {entry_id}\n"
-                    f"Matches: {similar_preview}\n"
-                    f"Routing to ignore channel"
-                )
-                force_category = 'ignore'
-            
-            # Download media (for both new and similar entries)
-            # Skip if already downloaded (e.g., for image-only Telegram entries)
-            if not entry.get('media_files'):
-                logger.debug("Not a duplicate, downloading media...")
-                if source_type == 'twitter':
-                    entry = self.media_handler.download_twitter_media(entry)
-                    # Update content with gallery-dl extracted text if available
-                    content = entry.get('full_text') or content
-                elif source_type == 'telegram':
-                    entry = await self.media_handler.download_telegram_media(entry)
-                    # Content should already be set, but update if needed
-                    content = entry.get('content', content)
-            else:
-                logger.debug("Media already downloaded, skipping download step...")
-            
-            # Combine OCR text with content for better categorization
-            ocr_text = entry.get('ocr_text', '')
-            combined_content = content
-            if ocr_text:
-                combined_content = f"{content}\n\n[Text from images]:\n{ocr_text}"
-                logger.debug(f"Combined content with OCR text ({len(ocr_text)} chars from images)")
-            
-            # Categorize content (use forced category if similar content)
-            if force_category:
-                category = force_category
-                logger.info(f"Category: {category} (forced due to similarity)")
-            else:
-                logger.debug("Categorizing content...")
-                category = self.ollama.categorize(combined_content)
-                logger.info(f"Category: {category}")
-            
-            # Apply newsworthiness filter (only for non-forced, non-ignore categories)
-            if not force_category and category != 'ignore':
-                if getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
-                    logger.debug("Rating newsworthiness...")
-                    newsworthiness = self.ollama.rate_newsworthiness(combined_content, category)
-                    
-                    if not newsworthiness['passed']:
-                        original_category = category
-                        category = 'ignore'
-                        logger.info(
-                            f"Newsworthiness filter: {newsworthiness['score']:.1f}/10 below threshold "
-                            f"- routing from '{original_category}' to 'ignore' "
-                            f"(reason: {newsworthiness['reasoning']})"
-                        )
-            
-            # Post to Discord
-            media_files = entry.get('media_files', [])
-            video_urls = entry.get('video_urls', [])
-            
-            logger.debug(f"Posting to Discord: {len(media_files)} files, {len(video_urls)} videos")
-            
-            success, discord_message_id, discord_channel_id = await self.discord_poster.post_message(
-                category=category,
-                content=content,
-                media_files=media_files,
-                video_urls=video_urls,
-                source_type=source_type,
-                entry_id=entry_id
-            )
-            
-            if success:
-                # Mark as processed and store embedding
-                # Use combined content with OCR text for better duplicate detection in future
-                self.db.mark_processed(entry_id)
-                if ocr_text:
-                    # Store embedding with OCR text included for better future duplicate detection
-                    combined_embedding = self.ollama.generate_embedding(combined_content)
-                    self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
-                else:
-                    self.db.add_embedding(content, embedding, entry_id=entry_id)
+                # Generate embedding for duplicate detection BEFORE downloading media
+                # Note: OCR text will be added after media download for enhanced detection
+                # Wrapped in asyncio.to_thread() to prevent blocking Discord interactions
+                logger.debug("Generating embedding for duplicate check...")
+                embedding = await asyncio.to_thread(self.ollama.generate_embedding, content)
                 
-                # Store message mapping with source URL for all entries
-                if discord_message_id and discord_channel_id:
-                    # Get or construct source URL
-                    source_url = entry.get('link') or entry.get('url')
+                # Check for exact duplicates BEFORE downloading media
+                is_duplicate, duplicate_similarity, match_preview, _ = self.db.find_similar(
+                    embedding, 
+                    threshold=config.DUPLICATE_THRESHOLD
+                )
+                
+                if is_duplicate:
+                    # True duplicate (>0.95 similarity) - skip entirely
+                    logger.info(
+                        f"Exact duplicate detected (similarity: {duplicate_similarity:.3f}): {entry_id}\n"
+                        f"Matches: {match_preview}"
+                    )
+                    self.stats['duplicates'] += 1
+                    return False
+                
+                # Check for similar content (not exact duplicate)
+                is_similar, similar_similarity, similar_preview, similar_full_content = self.db.find_similar(
+                    embedding,
+                    threshold=config.SIMILARITY_THRESHOLD
+                )
+                
+                similarity_info = None
+                if is_similar and not is_duplicate:
+                    # LLM verification: ask the AI if these are truly the same story,
+                    # not just broadly similar topics (e.g. two different political headlines)
+                    logger.info(
+                        f"Embedding similarity detected ({similar_similarity:.3f}), verifying with LLM..."
+                    )
+                    is_truly_similar = await asyncio.to_thread(
+                        self.ollama.verify_similarity, content, similar_full_content
+                    )
                     
-                    # For Telegram entries, construct the t.me URL
-                    if source_type == 'telegram' and not source_url:
-                        message_id = entry.get('message_id')
-                        channel_name = entry.get('source')
-                        if message_id and channel_name:
-                            # Remove @ prefix if present (t.me URLs don't use it)
-                            channel_name_clean = channel_name.lstrip('@')
-                            source_url = f"https://t.me/{channel_name_clean}/{message_id}"
-                    
-                    self.db.store_message_mapping(
-                        telegram_entry_id=entry_id,
-                        telegram_message_id=entry.get('message_id', 0),
-                        discord_channel_id=discord_channel_id,
-                        discord_message_id=discord_message_id,
-                        content=content,
-                        source_url=source_url,
-                        video_urls=entry.get('video_urls', []),
-                        category=category,
-                        source_type=source_type
+                    if is_truly_similar:
+                        similarity_info = {
+                            'similarity': similar_similarity,
+                            'match_preview': similar_preview
+                        }
+                        logger.info(
+                            f"Similar content CONFIRMED by LLM (similarity: {similar_similarity:.3f}): {entry_id}\n"
+                            f"Matches: {similar_preview}"
+                        )
+                    else:
+                        logger.info(
+                            f"LLM says DIFFERENT story despite embedding similarity "
+                            f"({similar_similarity:.3f}): {entry_id}\n"
+                            f"Would have matched: {similar_preview}"
+                        )
+                
+                # Download media (for both new and similar entries)
+                # Skip if already downloaded (e.g., for image-only Telegram entries)
+                if not entry.get('media_files'):
+                    logger.debug("Not a duplicate, downloading media...")
+                    if source_type == 'twitter':
+                        entry = self.media_handler.download_twitter_media(entry)
+                        # Update content with gallery-dl extracted text if available
+                        content = entry.get('full_text') or content
+                    elif source_type == 'telegram':
+                        entry = await self.media_handler.download_telegram_media(entry)
+                        # Content should already be set, but update if needed
+                        content = entry.get('content', content)
+                else:
+                    logger.debug("Media already downloaded, skipping download step...")
+                
+                # Combine OCR text with content for better categorization
+                ocr_text = entry.get('ocr_text', '')
+                combined_content = content
+                if ocr_text:
+                    combined_content = f"{content}\n\n[Text from images]:\n{ocr_text}"
+                    logger.debug(f"Combined content with OCR text ({len(ocr_text)} chars from images)")
+                
+                # Always run AI categorization to get reasoning
+                # NOTE: Ollama calls are wrapped in asyncio.to_thread() to prevent blocking the event loop
+                # This allows Discord interactions to be processed while Ollama is thinking
+                logger.debug("Categorizing content...")
+                category, reasoning = await asyncio.to_thread(self.ollama.categorize, combined_content)
+                logger.info(f"Category: {category}")
+                
+                # If similar content was detected, override category to ignore
+                # but preserve the AI reasoning and append similarity info
+                if similarity_info:
+                    ai_category = category
+                    category = 'ignore'
+                    reasoning = (
+                        f"AI suggested '{ai_category}': {reasoning or 'no reasoning provided'} "
+                        f"| OVERRIDDEN by similarity detector "
+                        f"(score: {similarity_info['similarity']:.3f}, "
+                        f"matches: {similarity_info['match_preview'][:100]})"
+                    )
+                    logger.info(
+                        f"Category overridden to 'ignore' due to similarity "
+                        f"(AI suggested: {ai_category})"
                     )
                 
-                # Update last message ID for Telegram entries
-                if source_type == 'telegram':
-                    message_id = entry.get('message_id')
-                    if message_id:
-                        self.telegram_poller.update_last_message_id(entry_id, message_id)
+                # Apply newsworthiness filter (only for non-similar, non-ignore categories)
+                if not similarity_info and category != 'ignore':
+                    if getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
+                        logger.debug("Rating newsworthiness...")
+                        newsworthiness = await asyncio.to_thread(self.ollama.rate_newsworthiness, combined_content, category)
+                        
+                        if not newsworthiness['passed']:
+                            original_category = category
+                            category = 'ignore'
+                            logger.info(
+                                f"Newsworthiness filter: {newsworthiness['score']:.1f}/10 below threshold "
+                                f"- routing from '{original_category}' to 'ignore' "
+                                f"(reason: {newsworthiness['reasoning']})"
+                            )
                 
-                # Update statistics
-                self.stats['processed'] += 1
-                self.stats['by_category'][category] = self.stats['by_category'].get(category, 0) + 1
+                # Post to Discord
+                media_files = entry.get('media_files', [])
+                video_urls = entry.get('video_urls', [])
                 
-                logger.info(f"✓ Successfully processed and posted: {entry_id}")
-            else:
-                logger.error(f"Failed to post to Discord: {entry_id}")
-                self.stats['errors'] += 1
+                logger.debug(f"Posting to Discord: {len(media_files)} files, {len(video_urls)} videos")
+                
+                success, discord_message_id, discord_channel_id = await self.discord_poster.post_message(
+                    category=category,
+                    content=content,
+                    media_files=media_files,
+                    video_urls=video_urls,
+                    source_type=source_type,
+                    entry_id=entry_id
+                )
+                
+                if success:
+                    # Mark as processed and store embedding
+                    # Use combined content with OCR text for better duplicate detection in future
+                    self.db.mark_processed(entry_id)
+                    if ocr_text:
+                        # Store embedding with OCR text included for better future duplicate detection
+                        combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
+                        self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
+                    else:
+                        self.db.add_embedding(content, embedding, entry_id=entry_id)
+                    
+                    # Store message mapping with source URL for all entries
+                    if discord_message_id and discord_channel_id:
+                        # Get or construct source URL
+                        source_url = entry.get('link') or entry.get('url')
+                        
+                        # For Telegram entries, construct the t.me URL
+                        if source_type == 'telegram' and not source_url:
+                            message_id = entry.get('message_id')
+                            channel_name = entry.get('source')
+                            if message_id and channel_name:
+                                # Remove @ prefix if present (t.me URLs don't use it)
+                                channel_name_clean = channel_name.lstrip('@')
+                                source_url = f"https://t.me/{channel_name_clean}/{message_id}"
+                        
+                        self.db.store_message_mapping(
+                            telegram_entry_id=entry_id,
+                            telegram_message_id=entry.get('message_id', 0),
+                            discord_channel_id=discord_channel_id,
+                            discord_message_id=discord_message_id,
+                            content=content,
+                            source_url=source_url,
+                            video_urls=entry.get('video_urls', []),
+                            category=category,
+                            source_type=source_type,
+                            reasoning=reasoning
+                        )
+                    
+                    # Update last message ID for Telegram entries
+                    if source_type == 'telegram':
+                        message_id = entry.get('message_id')
+                        if message_id:
+                            self.telegram_poller.update_last_message_id(entry_id, message_id)
+                    
+                    # Update statistics
+                    self.stats['processed'] += 1
+                    self.stats['by_category'][category] = self.stats['by_category'].get(category, 0) + 1
+                    
+                    logger.info(f"✓ Successfully processed and posted: {entry_id}")
+                else:
+                    logger.error(f"Failed to post to Discord: {entry_id}")
+                    self.stats['errors'] += 1
+                
+                # Clean up temporary media files
+                self.media_handler.cleanup_entry_media(entry)
+                
+                return success
             
-            # Clean up temporary media files
-            self.media_handler.cleanup_entry_media(entry)
-            
-            return success
+            finally:
+                # Always release the processing lock when done
+                self._processing_lock.discard(entry_id)
             
         except GalleryDlFailure as e:
             # gallery-dl failed to extract content - add to retry queue
@@ -523,8 +582,14 @@ class NewsAggregatorBot:
             mapping_info = self.db.get_discord_message_info(entry_id)
             
             if not mapping_info:
-                logger.warning(f"No Discord mapping found for edited Telegram message: {entry_id}")
-                return False
+                # No mapping means the NewMessage event was never received (Telethon can
+                # swallow it during GetDifference catch-up). Treat this edit as a brand
+                # new entry so the message still gets processed and posted to Discord.
+                logger.info(
+                    f"No Discord mapping found for edited Telegram message: {entry_id} "
+                    f"- processing as new entry (NewMessage event was likely missed)"
+                )
+                return await self.process_entry(edited_entry)
             
             discord_channel_id = mapping_info['discord_channel_id']
             discord_message_id = mapping_info['discord_message_id']
@@ -567,7 +632,8 @@ class NewsAggregatorBot:
                     source_url=mapping_info.get('source_url'),
                     video_urls=mapping_info.get('video_urls', []),
                     category=mapping_info.get('category'),
-                    source_type=mapping_info.get('source_type', 'telegram')
+                    source_type=mapping_info.get('source_type', 'telegram'),
+                    reasoning=mapping_info.get('reasoning')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

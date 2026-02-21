@@ -8,10 +8,140 @@ import os
 import asyncio
 import re
 import hashlib
-from utils import logger, retry_with_backoff
+from utils import logger, retry_with_backoff, ensure_url_on_own_line
 import config
 from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
+
+
+class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
+    """Modal for re-categorizing an entry to a different category"""
+    
+    def __init__(self, current_cat, available_categories, entry_id, entry_data, message, poster):
+        super().__init__()
+        self.current_category = current_cat
+        self.available_categories = available_categories
+        self.entry_id = entry_id
+        self.entry_data = entry_data
+        self.message = message
+        self.poster = poster
+        
+        # Create a text input for category (since Select can't be in Modal directly)
+        self.category_input = discord.ui.TextInput(
+            label="New Category",
+            placeholder=f"Currently: {current_cat}",
+            required=True,
+            max_length=50,
+            style=discord.TextStyle.short
+        )
+        self.add_item(self.category_input)
+    
+    async def on_submit(self, modal_interaction: discord.Interaction):
+        """Handle modal submission"""
+        try:
+            # Log immediately to confirm callback is reached
+            logger.debug(f"RecategorizeModal on_submit called for entry {self.entry_id}")
+            
+            new_category = self.category_input.value.strip().lower()
+            logger.debug(f"New category input: '{new_category}', available: {self.available_categories}")
+            
+            # Validate the category
+            if new_category not in self.available_categories:
+                await modal_interaction.response.send_message(
+                    f"❌ Invalid category: `{new_category}`\n"
+                    f"Available categories: {', '.join(sorted(self.available_categories))}",
+                    ephemeral=True
+                )
+                return
+            
+            # Check if it's the same category
+            if new_category == self.current_category:
+                await modal_interaction.response.send_message(
+                    f"⚠️ This entry is already in the **{new_category}** category.",
+                    ephemeral=True
+                )
+                return
+            
+            # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
+            logger.debug("Deferring modal interaction response...")
+            await modal_interaction.response.defer(ephemeral=True)
+            logger.debug("Modal interaction deferred successfully")
+            
+            # Check if the message has a thread before re-categorizing
+            has_thread = self.message.thread is not None
+            
+            # Parse source type from entry_id (e.g., "twitter_123" -> "twitter")
+            source_type = self.entry_id.split('_')[0] if self.entry_id else None
+            
+            logger.info(
+                f"Re-categorizing entry {self.entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
+            )
+            
+            # Perform the re-categorization
+            success, new_message_id, new_channel_id, error_msg = await self.poster.recategorize_entry(
+                message_id=self.message.id,
+                channel_id=self.message.channel.id,
+                new_category=new_category,
+                entry_id=self.entry_id,
+                content=self.entry_data.get('content', self.message.content),
+                media_files=None,  # Will download from original message
+                video_urls=self.entry_data.get('video_urls', []),
+                source_type=source_type
+            )
+            
+            if success:
+                success_msg = f"✅ Successfully re-categorized from **{self.current_category}** to **{new_category}**!\n"
+                success_msg += f"New message ID: {new_message_id}"
+                
+                # Add note about thread preservation if applicable
+                if has_thread:
+                    success_msg += "\n🧵 Thread with Perplexity content preserved!"
+                
+                await modal_interaction.followup.send(
+                    success_msg,
+                    ephemeral=True
+                )
+                logger.info(f"Successfully re-categorized entry {self.entry_id} to {new_category}")
+            else:
+                await modal_interaction.followup.send(
+                    f"❌ Failed to re-categorize: {error_msg}",
+                    ephemeral=True
+                )
+                logger.error(f"Failed to re-categorize entry {self.entry_id}: {error_msg}")
+                
+        except Exception as e:
+            logger.error(f"Error in RecategorizeModal on_submit: {e}", exc_info=True)
+            # Try to send error response
+            try:
+                if modal_interaction.response.is_done():
+                    await modal_interaction.followup.send(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+                else:
+                    await modal_interaction.response.send_message(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+            except Exception as followup_error:
+                logger.error(f"Failed to send error followup: {followup_error}")
+    
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        """Handle errors in the modal"""
+        logger.error(f"RecategorizeModal error: {error}", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ An error occurred: {str(error)}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ An error occurred: {str(error)}",
+                    ephemeral=True
+                )
+        except Exception as e:
+            logger.error(f"Failed to send modal error message: {e}")
 
 
 class DiscordPoster:
@@ -588,6 +718,7 @@ Thread title:"""
             """Context menu command to re-categorize a bot message"""
             logger.debug(f"'Re-categorize' command triggered by user {interaction.user.id} on message {message.id}")
             try:
+                # FAST CHECKS FIRST - these don't require database lookups
                 # Check if re-categorize is enabled
                 enable_recategorize = getattr(config, 'RECATEGORIZE_COMMAND_ENABLED', True)
                 if not enable_recategorize:
@@ -615,18 +746,17 @@ Thread title:"""
                     )
                     return
                 
-                # Find the entry in the database
+                # Find the entry in the database using optimized reverse lookup
                 entry_id = None
                 entry_data = None
                 current_category = None
                 
                 if poster.database:
-                    for eid, mapping in poster.database.message_mapping.items():
-                        if mapping.get('discord_message_id') == message.id:
-                            entry_id = eid
-                            entry_data = mapping
-                            current_category = mapping.get('category', 'unknown')
-                            break
+                    # Use reverse index if available, otherwise fall back to iteration
+                    entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                    if entry_id:
+                        entry_data = poster.database.message_mapping.get(entry_id)
+                        current_category = entry_data.get('category', 'unknown') if entry_data else 'unknown'
                 
                 if not entry_id or not entry_data:
                     await interaction.response.send_message(
@@ -640,101 +770,11 @@ Thread title:"""
                     f"Entry {entry_id} currently in {current_category}"
                 )
                 
-                # Create a modal with a select dropdown for categories
-                class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
-                    def __init__(self, current_cat, available_categories):
-                        super().__init__()
-                        self.current_category = current_cat
-                        self.available_categories = available_categories
-                        
-                        # Create a text input for category (since Select can't be in Modal directly)
-                        self.category_input = discord.ui.TextInput(
-                            label="New Category",
-                            placeholder=f"Currently: {current_cat}",
-                            required=True,
-                            max_length=50,
-                            style=discord.TextStyle.short
-                        )
-                        self.add_item(self.category_input)
-                    
-                    async def on_submit(self, modal_interaction: discord.Interaction):
-                        """Handle modal submission"""
-                        new_category = self.category_input.value.strip().lower()
-                        
-                        # Validate the category
-                        if new_category not in self.available_categories:
-                            await modal_interaction.response.send_message(
-                                f"❌ Invalid category: `{new_category}`\n"
-                                f"Available categories: {', '.join(sorted(self.available_categories))}",
-                                ephemeral=True
-                            )
-                            return
-                        
-                        # Check if it's the same category
-                        if new_category == self.current_category:
-                            await modal_interaction.response.send_message(
-                                f"⚠️ This entry is already in the **{new_category}** category.",
-                                ephemeral=True
-                            )
-                            return
-                        
-                        # Defer response for the recategorization process
-                        await modal_interaction.response.defer(ephemeral=True)
-                        
-                        # Check if the message has a thread before re-categorizing
-                        has_thread = message.thread is not None
-                        
-                        # Parse source type from entry_id (e.g., "twitter_123" -> "twitter")
-                        source_type = entry_id.split('_')[0] if entry_id else None
-                        
-                        logger.info(
-                            f"Re-categorizing entry {entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
-                        )
-                        
-                        # Perform the re-categorization
-                        try:
-                            success, new_message_id, new_channel_id, error_msg = await poster.recategorize_entry(
-                                message_id=message.id,
-                                channel_id=message.channel.id,
-                                new_category=new_category,
-                                entry_id=entry_id,
-                                content=entry_data.get('content', message.content),
-                                media_files=None,  # Will download from original message
-                                video_urls=entry_data.get('video_urls', []),
-                                source_type=source_type
-                            )
-                            
-                            if success:
-                                success_msg = f"✅ Successfully re-categorized from **{self.current_category}** to **{new_category}**!\n"
-                                success_msg += f"New message ID: {new_message_id}"
-                                
-                                # Add note about thread preservation if applicable
-                                if has_thread:
-                                    success_msg += "\n🧵 Thread with Perplexity content preserved!"
-                                
-                                await modal_interaction.followup.send(
-                                    success_msg,
-                                    ephemeral=True
-                                )
-                                logger.info(f"Successfully re-categorized entry {entry_id} to {new_category}")
-                            else:
-                                await modal_interaction.followup.send(
-                                    f"❌ Failed to re-categorize: {error_msg}",
-                                    ephemeral=True
-                                )
-                                logger.error(f"Failed to re-categorize entry {entry_id}: {error_msg}")
-                        except Exception as e:
-                            logger.error(f"Error during re-categorization: {e}", exc_info=True)
-                            await modal_interaction.followup.send(
-                                f"❌ An error occurred: {str(e)}",
-                                ephemeral=True
-                            )
-                
                 # Get available categories
                 available_categories = list(config.DISCORD_CHANNELS.keys())
                 
-                # Show the modal
-                modal = RecategorizeModal(current_category, available_categories)
+                # Show the modal using the external RecategorizeModal class
+                modal = RecategorizeModal(current_category, available_categories, entry_id, entry_data, message, poster)
                 await interaction.response.send_modal(modal)
                 
             except Exception as e:
@@ -760,6 +800,86 @@ Thread title:"""
         )
         self.tree.add_command(recategorize_cmd)
         logger.debug("Registered 'Re-categorize' context menu command")
+        
+        # Define the Why This Category command function
+        async def why_this_category(interaction: discord.Interaction, message: discord.Message):
+            """Context menu command to see why a message was categorized the way it was"""
+            logger.debug(f"'Why This Category?' command triggered by user {interaction.user.id} on message {message.id}")
+            try:
+                # Check if user is authorized (same restriction as Re-categorize)
+                allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+                if interaction.user.id not in allowed_user_ids:
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Check if message is from the bot
+                if message.author != poster.client.user:
+                    await interaction.response.send_message(
+                        "❌ This command only works on messages posted by the bot.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Look up the entry in the database
+                entry_id = None
+                entry_data = None
+                
+                if poster.database:
+                    entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                    if entry_id:
+                        entry_data = poster.database.message_mapping.get(entry_id)
+                
+                if not entry_id or not entry_data:
+                    await interaction.response.send_message(
+                        "❌ Could not find entry data for this message in the database.",
+                        ephemeral=True
+                    )
+                    return
+                
+                category = entry_data.get('category', 'unknown')
+                reasoning = entry_data.get('reasoning')
+                source_type = entry_data.get('source_type', 'unknown')
+                
+                # Build the response
+                response_lines = [
+                    f"📂 **Category:** {category}",
+                    f"💬 **Reasoning:** {reasoning if reasoning else 'No reasoning stored (entry was processed before this feature was added)'}",
+                    f"🔗 **Source type:** {source_type}",
+                    f"🆔 **Entry ID:** `{entry_id}`",
+                ]
+                
+                await interaction.response.send_message(
+                    "\n".join(response_lines),
+                    ephemeral=True
+                )
+                logger.info(f"'Why This Category?' shown for entry {entry_id}: {category} - {reasoning}")
+                
+            except Exception as e:
+                logger.error(f"Error in 'Why This Category?' command: {e}", exc_info=True)
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            f"❌ An error occurred: {str(e)}",
+                            ephemeral=True
+                        )
+                except:
+                    pass
+        
+        # Manually add the Why This Category command to the tree
+        why_category_cmd = app_commands.ContextMenu(
+            name="Why This Category?",
+            callback=why_this_category
+        )
+        self.tree.add_command(why_category_cmd)
+        logger.debug("Registered 'Why This Category?' context menu command")
     
     async def start(self):
         """Start the Discord client"""
@@ -832,6 +952,10 @@ Thread title:"""
             
             # Prepare the message content
             message_text = content
+            
+            # Ensure URLs are on their own line (fixes formatting when emoji removal
+            # or text cleaning causes URLs to be glued to preceding text)
+            message_text = ensure_url_on_own_line(message_text)
             
             # Determine whether to suppress embeds using Discord's native API
             suppress_embeds = True  # Default: suppress all embeds
@@ -1098,6 +1222,10 @@ Thread title:"""
             
             # Prepare the message content (same logic as post_message)
             message_text = content
+            
+            # Ensure URLs are on their own line (fixes formatting when emoji removal
+            # or text cleaning causes URLs to be glued to preceding text)
+            message_text = ensure_url_on_own_line(message_text)
             
             # For edits, always suppress embeds by default
             # (edit_message doesn't receive video_urls parameter, so we keep it simple)

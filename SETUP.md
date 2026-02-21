@@ -63,7 +63,7 @@ Make sure the channel IDs in `config.py` match your Discord server:
 ```python
 DISCORD_CHANNELS = {
     "crypto": 1317592423962251275,
-    "news/politics": 1317592486927007784,
+    "politics": 1317592486927007784,
     # ... etc
 }
 ```

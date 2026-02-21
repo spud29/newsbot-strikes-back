@@ -10,7 +10,7 @@ Successfully implemented a feature to view entry details and re-categorize entri
 - Added `exclude_categories` parameter to the `categorize()` method
 - System prompt is enhanced with exclusion notes when categories are excluded
 - If AI returns an excluded category, it automatically falls back to a valid alternative
-- Fallback logic prioritizes `news/politics` or the first available non-excluded category
+- Fallback logic prioritizes `politics` or the first available non-excluded category
 
 **Key Features:**
 - Exclusion is handled both in the prompt and post-processing
@@ -30,7 +30,7 @@ Successfully implemented a feature to view entry details and re-categorize entri
 1. **Verification**: Confirms entry exists and is in "ignore" category
 2. **Content Retrieval**: Fetches content, media, and metadata from database
 3. **AI Re-categorization**: Runs Ollama categorization with "ignore" excluded
-4. **Safety Check**: Ensures "ignore" wasn't returned (forces to "news/politics" if needed)
+4. **Safety Check**: Ensures "ignore" wasn't returned (forces to "politics" if needed)
 5. **Media Discovery**: Finds existing media files in `temp_media` directory
 6. **Old Message Deletion**: Removes the Discord message from ignore channel
 7. **New Message Posting**: Posts content and media to new category channel
@@ -104,7 +104,7 @@ curl -X POST "http://localhost:8000/api/entry/{entry_id}/recategorize-from-ignor
 When "ignore" is excluded:
 1. System prompt explicitly instructs AI not to use "ignore"
 2. If AI still returns "ignore", post-processing forces alternative
-3. Preference order for fallback: DEFAULT_CATEGORY → news/politics → first available
+3. Preference order for fallback: DEFAULT_CATEGORY → politics → first available
 
 ### Media Handling
 - Searches `temp_media` directory for existing media files

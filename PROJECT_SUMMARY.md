@@ -94,7 +94,7 @@ newsbot strikes back/
 
 The bot categorizes content into 11 categories:
 1. crypto
-2. news/politics
+2. politics
 3. stocks
 4. artificial intelligence
 5. video games
