@@ -2,9 +2,9 @@
 Retry queue for failed Twitter media extractions
 """
 import json
-import os
-import time
 from utils import logger
+from db_connection import get_db_connection
+
 
 class RetryQueue:
     """Manages retry attempts for entries where gallery-dl failed"""
@@ -19,29 +19,8 @@ class RetryQueue:
         """
         self.max_retries = max_retries
         self.retry_delay_cycles = retry_delay_cycles
-        self.queue_file = os.path.join("data", "retry_queue.json")
-        self.queue = self._load_queue()
+        self.conn = get_db_connection()
         self.current_cycle = 0
-    
-    def _load_queue(self):
-        """Load retry queue from file"""
-        if os.path.exists(self.queue_file):
-            try:
-                with open(self.queue_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading retry queue: {e}")
-                return {}
-        return {}
-    
-    def _save_queue(self):
-        """Save retry queue to file"""
-        try:
-            os.makedirs("data", exist_ok=True)
-            with open(self.queue_file, 'w', encoding='utf-8') as f:
-                json.dump(self.queue, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving retry queue: {e}")
     
     def add_entry(self, entry):
         """
@@ -52,25 +31,32 @@ class RetryQueue:
         """
         entry_id = entry['id']
         
-        if entry_id in self.queue:
+        row = self.conn.execute(
+            "SELECT retry_count FROM retry_queue WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        
+        if row:
             # Increment retry count
-            self.queue[entry_id]['retry_count'] += 1
-            self.queue[entry_id]['last_attempt_cycle'] = self.current_cycle
+            new_count = row['retry_count'] + 1
+            self.conn.execute(
+                "UPDATE retry_queue SET retry_count = ?, last_attempt_cycle = ? WHERE entry_id = ?",
+                (new_count, self.current_cycle, entry_id)
+            )
+            self.conn.commit()
             logger.info(
-                f"Entry added to retry queue (attempt {self.queue[entry_id]['retry_count']}/{self.max_retries}): {entry_id}"
+                f"Entry added to retry queue (attempt {new_count}/{self.max_retries}): {entry_id}"
             )
         else:
             # First retry
-            self.queue[entry_id] = {
-                'entry': entry,
-                'retry_count': 1,
-                'first_attempt_cycle': self.current_cycle,
-                'last_attempt_cycle': self.current_cycle,
-                'reason': 'gallery-dl failed to extract content'
-            }
+            self.conn.execute(
+                """INSERT INTO retry_queue 
+                   (entry_id, entry_data, retry_count, first_attempt_cycle, last_attempt_cycle, reason)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (entry_id, json.dumps(entry), 1, self.current_cycle, self.current_cycle,
+                 'gallery-dl failed to extract content')
+            )
+            self.conn.commit()
             logger.info(f"Entry added to retry queue (first attempt): {entry_id}")
-        
-        self._save_queue()
     
     def get_entries_to_retry(self):
         """
@@ -81,9 +67,14 @@ class RetryQueue:
         """
         entries_to_retry = []
         
-        for entry_id, retry_info in list(self.queue.items()):
-            retry_count = retry_info['retry_count']
-            last_attempt_cycle = retry_info['last_attempt_cycle']
+        rows = self.conn.execute(
+            "SELECT entry_id, entry_data, retry_count, last_attempt_cycle FROM retry_queue"
+        ).fetchall()
+        
+        for row in rows:
+            entry_id = row['entry_id']
+            retry_count = row['retry_count']
+            last_attempt_cycle = row['last_attempt_cycle'] or 0
             
             # Check if we've exceeded max retries
             if retry_count > self.max_retries:
@@ -96,7 +87,8 @@ class RetryQueue:
             # Check if enough cycles have passed since last attempt
             cycles_since_last = self.current_cycle - last_attempt_cycle
             if cycles_since_last >= self.retry_delay_cycles:
-                entries_to_retry.append(retry_info['entry'])
+                entry_data = json.loads(row['entry_data'])
+                entries_to_retry.append(entry_data)
         
         return entries_to_retry
     
@@ -108,10 +100,14 @@ class RetryQueue:
             entry_id: ID of the entry to remove
             reason: Reason for removal (success, max_retries_exceeded, etc.)
         """
-        if entry_id in self.queue:
-            retry_count = self.queue[entry_id]['retry_count']
-            del self.queue[entry_id]
-            self._save_queue()
+        row = self.conn.execute(
+            "SELECT retry_count FROM retry_queue WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        
+        if row:
+            retry_count = row['retry_count']
+            self.conn.execute("DELETE FROM retry_queue WHERE entry_id = ?", (entry_id,))
+            self.conn.commit()
             
             if reason == "success":
                 logger.info(f"✓ Entry successfully processed after {retry_count} retry(ies): {entry_id}")
@@ -129,19 +125,21 @@ class RetryQueue:
         Returns:
             dict: Statistics including queue size and retry counts
         """
-        if not self.queue:
+        rows = self.conn.execute("SELECT retry_count FROM retry_queue").fetchall()
+        
+        if not rows:
             return {
                 'total_entries': 0,
                 'by_retry_count': {}
             }
         
         by_retry_count = {}
-        for retry_info in self.queue.values():
-            count = retry_info['retry_count']
+        for row in rows:
+            count = row['retry_count']
             by_retry_count[count] = by_retry_count.get(count, 0) + 1
         
         return {
-            'total_entries': len(self.queue),
+            'total_entries': len(rows),
             'by_retry_count': by_retry_count
         }
     
@@ -156,13 +154,13 @@ class RetryQueue:
         # Assuming 5 minute poll interval: 12 cycles per hour
         max_cycles = max_age_hours * 12
         
-        removed = 0
-        for entry_id, retry_info in list(self.queue.items()):
-            age_cycles = self.current_cycle - retry_info['first_attempt_cycle']
-            if age_cycles > max_cycles:
-                self.remove_entry(entry_id, reason="expired")
-                removed += 1
+        cutoff_cycle = self.current_cycle - max_cycles
         
+        cursor = self.conn.execute(
+            "DELETE FROM retry_queue WHERE first_attempt_cycle < ?", (cutoff_cycle,)
+        )
+        self.conn.commit()
+        
+        removed = cursor.rowcount
         if removed > 0:
             logger.info(f"Cleaned up {removed} expired entries from retry queue")
-

@@ -7,7 +7,6 @@ from discord import app_commands
 import os
 import asyncio
 import re
-import hashlib
 from utils import logger, retry_with_backoff, ensure_url_on_own_line
 import config
 from vote_tracker import VoteTracker
@@ -580,11 +579,10 @@ Thread title:"""
                 category = None
                 
                 if poster.database:
-                    for eid, mapping in poster.database.message_mapping.items():
-                        if mapping.get('discord_message_id') == message.id:
-                            entry_id = eid
-                            category = mapping.get('category', 'unknown')
-                            break
+                    entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                    if entry_id:
+                        mapping_info = poster.database.get_discord_message_info(entry_id)
+                        category = mapping_info.get('category', 'unknown') if mapping_info else 'unknown'
                 
                 if not entry_id:
                     entry_id = f"unknown_{discord_message_id}"
@@ -637,19 +635,9 @@ Thread title:"""
                     
                     # Remove from database
                     try:
-                        if entry_id in poster.database.processed_ids:
-                            del poster.database.processed_ids[entry_id]
-                            poster.database._save_json(poster.database.processed_ids_path, poster.database.processed_ids)
-                        
-                        if entry_id in poster.database.message_mapping:
-                            del poster.database.message_mapping[entry_id]
-                            poster.database._save_json(poster.database.message_mapping_path, poster.database.message_mapping)
-                        
-                        # Also remove embedding if it exists
-                        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-                        if content_hash in poster.database.embeddings:
-                            del poster.database.embeddings[content_hash]
-                            poster.database._save_json(poster.database.embeddings_path, poster.database.embeddings)
+                        poster.database.delete_processed(entry_id)
+                        poster.database.delete_message_mapping(entry_id)
+                        poster.database.delete_embedding_by_content(content)
                         
                         logger.info(f"Removed entry {entry_id} from database")
                     except Exception as e:
@@ -755,7 +743,7 @@ Thread title:"""
                     # Use reverse index if available, otherwise fall back to iteration
                     entry_id = poster.database.get_entry_id_by_discord_message(message.id)
                     if entry_id:
-                        entry_data = poster.database.message_mapping.get(entry_id)
+                        entry_data = poster.database.get_discord_message_info(entry_id)
                         current_category = entry_data.get('category', 'unknown') if entry_data else 'unknown'
                 
                 if not entry_id or not entry_data:
@@ -830,7 +818,7 @@ Thread title:"""
                 if poster.database:
                     entry_id = poster.database.get_entry_id_by_discord_message(message.id)
                     if entry_id:
-                        entry_data = poster.database.message_mapping.get(entry_id)
+                        entry_data = poster.database.get_discord_message_info(entry_id)
                 
                 if not entry_id or not entry_data:
                     await interaction.response.send_message(
@@ -1200,12 +1188,13 @@ Thread title:"""
             if self.database and entry_id:
                 try:
                     # Update the message mapping with new Discord message ID and channel
-                    if entry_id in self.database.message_mapping:
-                        self.database.message_mapping[entry_id]['discord_message_id'] = new_message_id
-                        self.database.message_mapping[entry_id]['discord_channel_id'] = new_channel_id
-                        self.database.message_mapping[entry_id]['category'] = new_category
-                        self.database._save_json(self.database.message_mapping_path, self.database.message_mapping)
-                        logger.info(f"Updated message mapping for entry {entry_id}")
+                    self.database.update_message_mapping_fields(
+                        entry_id,
+                        discord_message_id=new_message_id,
+                        discord_channel_id=new_channel_id,
+                        category=new_category
+                    )
+                    logger.info(f"Updated message mapping for entry {entry_id}")
                 except Exception as e:
                     logger.error(f"Error updating database: {e}")
                     # Don't fail the whole operation if database update fails

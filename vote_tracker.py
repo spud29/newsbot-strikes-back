@@ -3,44 +3,20 @@ Vote Tracking System for Discord "Not Valuable" Button
 Manages user votes on Discord messages to determine if content should be removed
 """
 import json
-import os
 import time
-from utils import logger, ensure_directory
+from utils import logger
+from db_connection import get_db_connection
 
 
 class VoteTracker:
     """Tracks votes on Discord messages for content removal"""
     
-    def __init__(self, votes_path="data/vote_tracking.json"):
-        """
-        Initialize vote tracker
+    def __init__(self):
+        """Initialize vote tracker with shared SQLite connection"""
+        self.conn = get_db_connection()
         
-        Args:
-            votes_path: Path to vote tracking JSON file
-        """
-        ensure_directory('data')
-        self.votes_path = votes_path
-        self.votes = self._load_votes()
-        logger.info(f"VoteTracker initialized with {len(self.votes)} active votes")
-    
-    def _load_votes(self):
-        """Load votes from JSON file"""
-        try:
-            if os.path.exists(self.votes_path):
-                with open(self.votes_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            return {}
-        except Exception as e:
-            logger.error(f"Error loading votes from {self.votes_path}: {e}")
-            return {}
-    
-    def _save_votes(self):
-        """Save votes to JSON file"""
-        try:
-            with open(self.votes_path, 'w', encoding='utf-8') as f:
-                json.dump(self.votes, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error saving votes to {self.votes_path}: {e}")
+        count = self.conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        logger.info(f"VoteTracker initialized with {count} active votes")
     
     def add_vote(self, discord_message_id, voter_user_id, entry_data=None):
         """
@@ -59,27 +35,43 @@ class VoteTracker:
         message_key = str(discord_message_id)
         voter_id = str(voter_user_id)
         
-        # Initialize vote tracking for this message if not exists
-        if message_key not in self.votes:
-            self.votes[message_key] = {
-                'voters': [],
-                'timestamp': time.time()
-            }
+        # Get existing vote data
+        row = self.conn.execute(
+            "SELECT voters, timestamp, entry_id, content, category, discord_channel_id FROM votes WHERE discord_message_id = ?",
+            (message_key,)
+        ).fetchone()
+        
+        if row:
+            voters = json.loads(row['voters'])
             
-            # Add entry metadata if provided
-            if entry_data:
-                self.votes[message_key].update(entry_data)
+            # Check if user already voted
+            if voter_id in voters:
+                logger.info(f"User {voter_id} already voted on message {message_key}")
+                return len(voters), True
+            
+            # Add vote
+            voters.append(voter_id)
+            self.conn.execute(
+                "UPDATE votes SET voters = ? WHERE discord_message_id = ?",
+                (json.dumps(voters), message_key)
+            )
+        else:
+            # New vote tracking entry
+            voters = [voter_id]
+            entry_id = entry_data.get('entry_id') if entry_data else None
+            content = entry_data.get('content') if entry_data else None
+            category = entry_data.get('category') if entry_data else None
+            discord_channel_id = entry_data.get('discord_channel_id') if entry_data else None
+            
+            self.conn.execute(
+                """INSERT INTO votes (discord_message_id, voters, timestamp, entry_id, content, category, discord_channel_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (message_key, json.dumps(voters), time.time(), entry_id, content, category, discord_channel_id)
+            )
         
-        # Check if user already voted
-        if voter_id in self.votes[message_key]['voters']:
-            logger.info(f"User {voter_id} already voted on message {message_key}")
-            return len(self.votes[message_key]['voters']), True
+        self.conn.commit()
         
-        # Add the vote
-        self.votes[message_key]['voters'].append(voter_id)
-        self._save_votes()
-        
-        vote_count = len(self.votes[message_key]['voters'])
+        vote_count = len(voters)
         logger.info(f"Vote added for message {message_key} by user {voter_id}. Total votes: {vote_count}")
         
         return vote_count, False
@@ -95,7 +87,21 @@ class VoteTracker:
             dict: Vote data or None if no votes exist
         """
         message_key = str(discord_message_id)
-        return self.votes.get(message_key)
+        row = self.conn.execute(
+            "SELECT * FROM votes WHERE discord_message_id = ?", (message_key,)
+        ).fetchone()
+        
+        if row is None:
+            return None
+        
+        return {
+            'voters': json.loads(row['voters']),
+            'timestamp': row['timestamp'],
+            'entry_id': row['entry_id'],
+            'content': row['content'],
+            'category': row['category'],
+            'discord_channel_id': row['discord_channel_id']
+        }
     
     def get_vote_count(self, discord_message_id):
         """
@@ -124,9 +130,12 @@ class VoteTracker:
         """
         message_key = str(discord_message_id)
         
-        if message_key in self.votes:
-            del self.votes[message_key]
-            self._save_votes()
+        cursor = self.conn.execute(
+            "DELETE FROM votes WHERE discord_message_id = ?", (message_key,)
+        )
+        self.conn.commit()
+        
+        if cursor.rowcount > 0:
             logger.info(f"Vote tracking removed for message {message_key}")
             return True
         
@@ -142,22 +151,18 @@ class VoteTracker:
         Returns:
             int: Number of entries cleaned up
         """
-        current_time = time.time()
-        cutoff_time = current_time - (max_age_hours * 3600)
+        cutoff_time = time.time() - (max_age_hours * 3600)
         
-        old_entries = [
-            msg_id for msg_id, data in self.votes.items()
-            if data.get('timestamp', 0) < cutoff_time
-        ]
+        cursor = self.conn.execute(
+            "DELETE FROM votes WHERE timestamp < ?", (cutoff_time,)
+        )
+        self.conn.commit()
         
-        for msg_id in old_entries:
-            del self.votes[msg_id]
+        deleted = cursor.rowcount
+        if deleted:
+            logger.info(f"Cleaned up {deleted} old vote tracking entries")
         
-        if old_entries:
-            self._save_votes()
-            logger.info(f"Cleaned up {len(old_entries)} old vote tracking entries")
-        
-        return len(old_entries)
+        return deleted
     
     def get_stats(self):
         """
@@ -166,22 +171,13 @@ class VoteTracker:
         Returns:
             dict: Statistics
         """
-        total_messages = len(self.votes)
-        total_votes = sum(len(data.get('voters', [])) for data in self.votes.values())
+        total_messages = self.conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        
+        # Sum up total votes across all entries
+        rows = self.conn.execute("SELECT voters FROM votes").fetchall()
+        total_votes = sum(len(json.loads(row['voters'])) for row in rows)
         
         return {
             'total_messages_with_votes': total_messages,
             'total_votes': total_votes
         }
-
-
-
-
-
-
-
-
-
-
-
-

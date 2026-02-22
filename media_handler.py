@@ -149,6 +149,33 @@ class MediaHandler:
                         video_urls.append(url)
                         logger.debug(f"Found video URL: {url}")
             
+            # Extract video duration if there are videos
+            video_duration = None
+            if video_urls:
+                duration_cmd = [
+                    'gallery-dl',
+                    '--print', '{duration}',
+                    '--range', '1',
+                    '--no-download',
+                    link
+                ]
+                
+                duration_result = subprocess.run(
+                    duration_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30
+                )
+                
+                if duration_result.returncode == 0 and duration_result.stdout.strip():
+                    try:
+                        video_duration = float(duration_result.stdout.strip().split('\n')[0])
+                        logger.info(f"Video duration: {video_duration:.1f} seconds")
+                    except (ValueError, IndexError):
+                        logger.debug(f"Could not parse video duration: {duration_result.stdout.strip()}")
+            
             # Now download media files (images only, skip videos)
             # Videos are handled via video_urls to avoid Discord file size limits
             media_cmd = [
@@ -201,6 +228,7 @@ class MediaHandler:
             logger.debug("Assigning entry values...")
             entry['media_files'] = media_files
             entry['video_urls'] = video_urls
+            entry['video_duration'] = video_duration
             entry['full_text'] = full_text
             entry['ocr_text'] = ocr_text
             entry['download_dir'] = download_dir

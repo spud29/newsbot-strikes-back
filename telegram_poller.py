@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 from utils import logger, retry_with_backoff, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, remove_telegram_formatting
+from db_connection import get_db_connection
 import config
 
 class TelegramPoller:
@@ -18,7 +19,7 @@ class TelegramPoller:
         self.api_hash = config.TELEGRAM_API_HASH
         self.channels = config.TELEGRAM_CHANNELS
         self.client = None
-        self.last_message_ids_file = config.DB_LAST_MESSAGE_IDS
+        self.conn = get_db_connection()
         self.last_message_ids = self._load_last_message_ids()  # Track last seen message per channel
         self.message_queue = asyncio.Queue()  # Queue for real-time messages
         self.edit_queue = asyncio.Queue()  # Queue for edited messages
@@ -266,34 +267,32 @@ class TelegramPoller:
     
     def _load_last_message_ids(self):
         """
-        Load last message IDs from file
+        Load last message IDs from SQLite
         
         Returns:
             dict: Channel name to last message ID mapping
         """
         try:
-            if os.path.exists(self.last_message_ids_file):
-                with open(self.last_message_ids_file, 'r') as f:
-                    data = json.load(f)
-                    logger.debug(f"Loaded last message IDs: {data}")
-                    return data
+            rows = self.conn.execute("SELECT channel_name, message_id FROM last_message_ids").fetchall()
+            data = {row['channel_name']: row['message_id'] for row in rows}
+            logger.debug(f"Loaded last message IDs: {data}")
+            return data
         except Exception as e:
             logger.error(f"Error loading last message IDs: {e}")
         
         return {}
     
-    def _save_last_message_ids(self):
-        """Save last message IDs to file"""
+    def _save_last_message_id(self, channel_name, message_id):
+        """Save a single last message ID to SQLite"""
         try:
-            # Ensure data directory exists
-            os.makedirs(os.path.dirname(self.last_message_ids_file), exist_ok=True)
-            
-            with open(self.last_message_ids_file, 'w') as f:
-                json.dump(self.last_message_ids, f, indent=2)
-            
-            logger.debug(f"Saved last message IDs: {self.last_message_ids}")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO last_message_ids (channel_name, message_id) VALUES (?, ?)",
+                (channel_name, message_id)
+            )
+            self.conn.commit()
+            logger.debug(f"Saved last message ID for {channel_name}: {message_id}")
         except Exception as e:
-            logger.error(f"Error saving last message IDs: {e}")
+            logger.error(f"Error saving last message ID: {e}")
     
     def update_last_message_id(self, entry_id, message_id):
         """
@@ -314,7 +313,7 @@ class TelegramPoller:
                 current_last_id = self.last_message_ids.get(channel_name, 0)
                 if message_id > current_last_id:
                     self.last_message_ids[channel_name] = message_id
-                    self._save_last_message_ids()
+                    self._save_last_message_id(channel_name, message_id)
                     logger.debug(f"Updated last message ID for {channel_name}: {message_id}")
         except Exception as e:
             logger.error(f"Error updating last message ID for {entry_id}: {e}")

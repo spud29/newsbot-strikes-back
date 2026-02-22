@@ -194,6 +194,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Memes without substantive news value
 - When uncertain about relevance or quality
 - Content from or mentioning @BTC_Tick (always ignore regardless of topic)
+- Routine crypto/financial market data: daily price tickers, gainers/losers lists, fear & greed index readings, TVL rankings, wallet statistics, dominance charts, and other recurring metrics
 
 ## CATEGORIZATION GUIDELINES
 
@@ -204,6 +205,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 5. **Context Clues**: Consider source, tone, and depth of information
 6. **When Unclear**: Default to 'ignore' rather than miscategorizing
 7. **Entertainment Context**: Theme parks, entertainment venues, and entertainment-focused technology (Disney animatronics, movie theater tech, concert staging) should be categorized as **pop culture**, NOT technology. Consider the PRIMARY CONTEXT: Is this entertainment news or tech industry news?
+8. **Data vs. News**: Recurring market data and statistics (daily price lists, index readings, TVL rankings, wallet breakdowns, gainers/losers) are NOT news — categorize as 'ignore' regardless of topic. Only truly unexpected events or breaking developments are newsworthy.
 
 ## DECISION TREE
 
@@ -235,6 +237,12 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Universal Studios adds holographic effects to attraction" → pop culture
 "Robotics lab develops new AI-powered humanoid robot" → technology
 "Engineers create breakthrough in autonomous navigation" → artificial intelligence
+"Top 100 24h Gainers: INJ $3.84 +13.12%, MORPHO $1.62 +7.00%... Top 100 24h Losers: NIGHT $0.0582 -4.26%..." → ignore
+"95.6% of Pump.fun wallets broke even or lost money. Only 0.4% ever made over $10K. The platform collected $950M in fees." → ignore
+"Crypto Fear and Greed Index Value: 9, Sentiment: Extreme Fear, BTC Price: $68005" → ignore
+"Top DeFi Projects By TVL:" → ignore
+"Daily BTC dominance: 54.2%, ETH dominance: 17.8%" → ignore
+"Top 10 cryptos by market cap this week" → ignore
 "Random meme with no context" → ignore
 "Incomplete sentence..." → ignore
 "JUST IN : Bitcoin hits $67,000 @BTC_Tick" → ignore
@@ -249,10 +257,8 @@ Valid responses: crypto, politics, stocks, artificial intelligence, video games,
 DUPLICATE_THRESHOLD = 0.95  # Exact duplicates only (>0.95 similarity)
 SIMILARITY_THRESHOLD = 0.60  # Similar content - route to ignore channel
 
-# Database paths
-DB_PROCESSED_IDS = "data/processed_ids.json"
-DB_EMBEDDINGS = "data/embeddings_cache.json"
-DB_LAST_MESSAGE_IDS = "data/last_message_ids.json"
+# Database path (single SQLite file)
+DB_PATH = "data/newsbot.db"
 
 # Polling interval (seconds)
 POLL_INTERVAL = 300  # 5 minutes
@@ -291,6 +297,9 @@ RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed
 # Filters out mundane/routine news by rating surprise, impact, and actionability
 # Only posts that score ABOVE the threshold will be posted to their category
 # Posts below threshold go to the 'ignore' channel for review
+SHORT_VIDEO_FILTER_ENABLED = True  # Enable/disable the short video filter
+SHORT_VIDEO_THRESHOLD = 60  # Videos under this duration (seconds) are sent to ignore
+
 NEWSWORTHINESS_FILTER_ENABLED = False  # Enable/disable the newsworthiness filter
 NEWSWORTHINESS_THRESHOLD = 7.0  # STRICT: 1-10 scale, only high-quality news gets through
 NEWSWORTHINESS_WEIGHTS = {

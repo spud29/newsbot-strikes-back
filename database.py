@@ -1,50 +1,48 @@
 """
-JSON Database management for the Discord News Aggregator Bot
+SQLite Database management for the Discord News Aggregator Bot
 """
 import json
-import os
 import time
 import hashlib
 import numpy as np
-from datetime import datetime, timedelta
-from utils import logger, ensure_directory
-import config
+from utils import logger
+from db_connection import get_db_connection
+
 
 class Database:
-    """Manages JSON databases for processed IDs and embeddings cache"""
+    """Manages SQLite tables for processed IDs, embeddings cache, and message mappings"""
     
     def __init__(self):
-        """Initialize database with empty dicts if files don't exist"""
-        ensure_directory('data')
+        """Initialize database connection and load embeddings cache into memory"""
+        self.conn = get_db_connection()
         
-        self.processed_ids_path = config.DB_PROCESSED_IDS
-        self.embeddings_path = config.DB_EMBEDDINGS
-        self.message_mapping_path = "data/message_mapping.json"
+        # Load embeddings into memory for fast cosine similarity lookups
+        # (SQLite can't do vector math natively)
+        self._embeddings_cache = {}
+        self._load_embeddings_cache()
         
-        self.processed_ids = self._load_json(self.processed_ids_path, {})
-        self.embeddings = self._load_json(self.embeddings_path, {})
-        self.message_mapping = self._load_json(self.message_mapping_path, {})
+        # Stats for logging
+        processed_count = self.conn.execute("SELECT COUNT(*) FROM processed_ids").fetchone()[0]
+        embeddings_count = len(self._embeddings_cache)
+        mapping_count = self.conn.execute("SELECT COUNT(*) FROM message_mapping").fetchone()[0]
         
-        logger.info(f"Database initialized: {len(self.processed_ids)} processed IDs, {len(self.embeddings)} embeddings, {len(self.message_mapping)} message mappings")
+        logger.info(f"Database initialized: {processed_count} processed IDs, {embeddings_count} embeddings, {mapping_count} message mappings")
     
-    def _load_json(self, filepath, default=None):
-        """Load JSON file, return default if it doesn't exist"""
-        try:
-            if os.path.exists(filepath):
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            return default if default is not None else {}
-        except Exception as e:
-            logger.error(f"Error loading {filepath}: {e}")
-            return default if default is not None else {}
-    
-    def _save_json(self, filepath, data):
-        """Save data to JSON file"""
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error saving {filepath}: {e}")
+    def _load_embeddings_cache(self):
+        """Load all embeddings from SQLite into memory for fast similarity search"""
+        rows = self.conn.execute(
+            "SELECT content_hash, embedding, timestamp, preview, content, entry_id FROM embeddings"
+        ).fetchall()
+        
+        self._embeddings_cache = {}
+        for row in rows:
+            self._embeddings_cache[row['content_hash']] = {
+                'embedding': json.loads(row['embedding']),
+                'timestamp': row['timestamp'],
+                'preview': row['preview'],
+                'content': row['content'],
+                'entry_id': row['entry_id']
+            }
     
     def is_processed(self, entry_id):
         """
@@ -56,7 +54,10 @@ class Database:
         Returns:
             bool: True if already processed
         """
-        return entry_id in self.processed_ids
+        row = self.conn.execute(
+            "SELECT 1 FROM processed_ids WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        return row is not None
     
     def mark_processed(self, entry_id):
         """
@@ -65,8 +66,11 @@ class Database:
         Args:
             entry_id: Unique identifier to mark as processed
         """
-        self.processed_ids[entry_id] = time.time()
-        self._save_json(self.processed_ids_path, self.processed_ids)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO processed_ids (entry_id, timestamp) VALUES (?, ?)",
+            (entry_id, time.time())
+        )
+        self.conn.commit()
         logger.debug(f"Marked as processed: {entry_id}")
     
     def add_embedding(self, content, embedding, entry_id=None):
@@ -81,23 +85,32 @@ class Database:
         Returns:
             str: Hash key for the stored embedding
         """
-        # Create hash of content for unique ID
         content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        embedding_list = embedding if isinstance(embedding, list) else embedding.tolist()
+        now = time.time()
+        preview = content[:100]
         
-        self.embeddings[content_hash] = {
-            'embedding': embedding if isinstance(embedding, list) else embedding.tolist(),
-            'timestamp': time.time(),
-            'preview': content[:100],  # Store preview for logging
-            'content': content,  # Store full content for LLM similarity verification
-            'entry_id': entry_id  # Store entry_id to link back to message_mapping
+        self.conn.execute(
+            """INSERT OR REPLACE INTO embeddings 
+               (content_hash, embedding, timestamp, preview, content, entry_id) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (content_hash, json.dumps(embedding_list), now, preview, content, entry_id)
+        )
+        self.conn.commit()
+        
+        # Keep in-memory cache in sync
+        self._embeddings_cache[content_hash] = {
+            'embedding': embedding_list,
+            'timestamp': now,
+            'preview': preview,
+            'content': content,
+            'entry_id': entry_id
         }
         
-        self._save_json(self.embeddings_path, self.embeddings)
         logger.debug(f"Stored embedding for: {content[:50]}...")
-        
         return content_hash
     
-    def find_similar(self, embedding, threshold=config.DUPLICATE_THRESHOLD):
+    def find_similar(self, embedding, threshold=None):
         """
         Find similar embeddings above threshold using cosine similarity
         
@@ -108,18 +121,21 @@ class Database:
         Returns:
             tuple: (is_match, similarity_score, matching_preview, full_content) or (False, 0.0, None, None)
         """
-        if not self.embeddings:
+        import config
+        if threshold is None:
+            threshold = config.DUPLICATE_THRESHOLD
+            
+        if not self._embeddings_cache:
             return False, 0.0, None, None
         
         embedding_array = np.array(embedding)
         
-        for hash_key, data in self.embeddings.items():
+        for hash_key, data in self._embeddings_cache.items():
             stored_embedding = np.array(data['embedding'])
             similarity = self._cosine_similarity(embedding_array, stored_embedding)
             
             if similarity >= threshold:
                 logger.info(f"Duplicate detected! Similarity: {similarity:.3f} - {data['preview']}")
-                # Return full content if available, fall back to preview for older entries
                 full_content = data.get('content', data['preview'])
                 return True, similarity, data['preview'], full_content
         
@@ -147,34 +163,33 @@ class Database:
     
     def cleanup_old_entries(self):
         """Remove entries older than DB_RETENTION_HOURS"""
+        import config
         current_time = time.time()
         cutoff_time = current_time - (config.DB_RETENTION_HOURS * 3600)
         
         # Clean processed IDs
-        old_ids = [
-            entry_id for entry_id, timestamp in self.processed_ids.items()
-            if timestamp < cutoff_time
-        ]
+        cursor = self.conn.execute(
+            "DELETE FROM processed_ids WHERE timestamp < ?", (cutoff_time,)
+        )
+        deleted_ids = cursor.rowcount
         
-        for entry_id in old_ids:
-            del self.processed_ids[entry_id]
-        
-        if old_ids:
-            self._save_json(self.processed_ids_path, self.processed_ids)
-            logger.info(f"Cleaned up {len(old_ids)} old processed IDs")
+        if deleted_ids:
+            logger.info(f"Cleaned up {deleted_ids} old processed IDs")
         
         # Clean embeddings
-        old_embeddings = [
-            hash_key for hash_key, data in self.embeddings.items()
-            if data['timestamp'] < cutoff_time
-        ]
+        cursor = self.conn.execute(
+            "DELETE FROM embeddings WHERE timestamp < ?", (cutoff_time,)
+        )
+        deleted_embeddings = cursor.rowcount
         
-        for hash_key in old_embeddings:
-            del self.embeddings[hash_key]
+        if deleted_embeddings:
+            logger.info(f"Cleaned up {deleted_embeddings} old embeddings")
         
-        if old_embeddings:
-            self._save_json(self.embeddings_path, self.embeddings)
-            logger.info(f"Cleaned up {len(old_embeddings)} old embeddings")
+        self.conn.commit()
+        
+        # Refresh in-memory cache if embeddings were removed
+        if deleted_embeddings:
+            self._load_embeddings_cache()
     
     def get_stats(self):
         """
@@ -183,10 +198,14 @@ class Database:
         Returns:
             dict: Statistics about the database
         """
+        processed_count = self.conn.execute("SELECT COUNT(*) FROM processed_ids").fetchone()[0]
+        embeddings_count = len(self._embeddings_cache)
+        mapping_count = self.conn.execute("SELECT COUNT(*) FROM message_mapping").fetchone()[0]
+        
         return {
-            'processed_ids': len(self.processed_ids),
-            'embeddings': len(self.embeddings),
-            'message_mappings': len(self.message_mapping)
+            'processed_ids': processed_count,
+            'embeddings': embeddings_count,
+            'message_mappings': mapping_count
         }
     
     def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None):
@@ -205,24 +224,26 @@ class Database:
             source_type: Source type ('twitter', 'telegram', etc.) for re-categorization
             reasoning: Brief explanation of why this category was chosen
         """
-        mapping_key = telegram_entry_id
-        self.message_mapping[mapping_key] = {
-            'telegram_message_id': telegram_message_id,
-            'discord_channel_id': discord_channel_id,
-            'discord_message_id': discord_message_id,
-            'content': content,
-            'source_url': source_url,
-            'video_urls': video_urls if video_urls else [],
-            'category': category,
-            'source_type': source_type,
-            'reasoning': reasoning,
-            'timestamp': time.time()
-        }
-        self._save_json(self.message_mapping_path, self.message_mapping)
-        
-        # Update reverse index if it exists
-        if hasattr(self, '_discord_msg_to_entry') and discord_message_id:
-            self._discord_msg_to_entry[discord_message_id] = mapping_key
+        self.conn.execute(
+            """INSERT OR REPLACE INTO message_mapping 
+               (entry_id, telegram_message_id, discord_channel_id, discord_message_id,
+                content, source_url, video_urls, category, source_type, reasoning, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                telegram_entry_id,
+                telegram_message_id,
+                discord_channel_id,
+                discord_message_id,
+                content,
+                source_url,
+                json.dumps(video_urls) if video_urls else '[]',
+                category,
+                source_type,
+                reasoning,
+                time.time()
+            )
+        )
+        self.conn.commit()
         
         logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id} (category: {category}, source_type: {source_type})")
     
@@ -236,13 +257,31 @@ class Database:
         Returns:
             dict: Discord message info or None if not found
         """
-        return self.message_mapping.get(telegram_entry_id)
+        row = self.conn.execute(
+            "SELECT * FROM message_mapping WHERE entry_id = ?", (telegram_entry_id,)
+        ).fetchone()
+        
+        if row is None:
+            return None
+        
+        return {
+            'telegram_message_id': row['telegram_message_id'],
+            'discord_channel_id': row['discord_channel_id'],
+            'discord_message_id': row['discord_message_id'],
+            'content': row['content'],
+            'source_url': row['source_url'],
+            'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+            'category': row['category'],
+            'source_type': row['source_type'],
+            'reasoning': row['reasoning'],
+            'timestamp': row['timestamp']
+        }
     
     def get_entry_id_by_discord_message(self, discord_message_id):
         """
         Fast reverse lookup: get entry ID from Discord message ID
         
-        This is optimized for speed to avoid interaction timeouts in Discord commands.
+        Uses SQL index on discord_message_id for fast lookups.
         
         Args:
             discord_message_id: Discord message ID (int)
@@ -250,24 +289,127 @@ class Database:
         Returns:
             str: Entry ID or None if not found
         """
-        # Build reverse index on first call or if it doesn't exist
-        if not hasattr(self, '_discord_msg_to_entry'):
-            self._rebuild_reverse_index()
+        row = self.conn.execute(
+            "SELECT entry_id FROM message_mapping WHERE discord_message_id = ?",
+            (discord_message_id,)
+        ).fetchone()
         
-        # Try the index first
-        entry_id = self._discord_msg_to_entry.get(discord_message_id)
-        if entry_id:
-            return entry_id
-        
-        # If not found in index, rebuild and try again (in case of new entries)
-        self._rebuild_reverse_index()
-        return self._discord_msg_to_entry.get(discord_message_id)
+        return row['entry_id'] if row else None
     
-    def _rebuild_reverse_index(self):
-        """Rebuild the reverse lookup index for discord_message_id -> entry_id"""
-        self._discord_msg_to_entry = {}
-        for entry_id, mapping in self.message_mapping.items():
-            msg_id = mapping.get('discord_message_id')
-            if msg_id:
-                self._discord_msg_to_entry[msg_id] = entry_id
-
+    def delete_message_mapping(self, entry_id):
+        """
+        Delete a message mapping by entry ID
+        
+        Args:
+            entry_id: Entry ID to delete
+        """
+        self.conn.execute("DELETE FROM message_mapping WHERE entry_id = ?", (entry_id,))
+        self.conn.commit()
+        logger.debug(f"Deleted message mapping: {entry_id}")
+    
+    def update_message_mapping_fields(self, entry_id, **kwargs):
+        """
+        Update specific fields on a message mapping
+        
+        Args:
+            entry_id: Entry ID to update
+            **kwargs: Fields to update (e.g., discord_message_id=123, category='crypto')
+        """
+        if not kwargs:
+            return
+        
+        # Handle video_urls specially (needs JSON encoding)
+        if 'video_urls' in kwargs:
+            kwargs['video_urls'] = json.dumps(kwargs['video_urls']) if kwargs['video_urls'] else '[]'
+        
+        set_clause = ", ".join(f"{key} = ?" for key in kwargs)
+        values = list(kwargs.values()) + [entry_id]
+        
+        self.conn.execute(
+            f"UPDATE message_mapping SET {set_clause} WHERE entry_id = ?",
+            values
+        )
+        self.conn.commit()
+        logger.debug(f"Updated message mapping for {entry_id}: {list(kwargs.keys())}")
+    
+    def delete_processed(self, entry_id):
+        """
+        Remove an entry from the processed IDs table
+        
+        Args:
+            entry_id: Entry ID to remove
+        """
+        self.conn.execute("DELETE FROM processed_ids WHERE entry_id = ?", (entry_id,))
+        self.conn.commit()
+        logger.debug(f"Removed from processed IDs: {entry_id}")
+    
+    def delete_embedding_by_content(self, content):
+        """
+        Remove an embedding by its content (used when removing entries)
+        
+        Args:
+            content: The content text whose embedding should be removed
+        """
+        import hashlib
+        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        
+        self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (content_hash,))
+        self.conn.commit()
+        
+        # Keep in-memory cache in sync
+        self._embeddings_cache.pop(content_hash, None)
+        logger.debug(f"Deleted embedding for content hash: {content_hash}")
+    
+    def get_all_message_mappings(self):
+        """
+        Get all message mappings as a dict (for iteration/search)
+        
+        Returns:
+            dict: All mappings keyed by entry_id
+        """
+        rows = self.conn.execute("SELECT * FROM message_mapping").fetchall()
+        result = {}
+        for row in rows:
+            result[row['entry_id']] = {
+                'telegram_message_id': row['telegram_message_id'],
+                'discord_channel_id': row['discord_channel_id'],
+                'discord_message_id': row['discord_message_id'],
+                'content': row['content'],
+                'source_url': row['source_url'],
+                'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+                'category': row['category'],
+                'source_type': row['source_type'],
+                'reasoning': row['reasoning'],
+                'timestamp': row['timestamp']
+            }
+        return result
+    
+    def search_message_mappings(self, query):
+        """
+        Search message mappings by content or entry_id
+        
+        Args:
+            query: Search string
+        
+        Returns:
+            dict: Matching mappings keyed by entry_id
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM message_mapping WHERE entry_id LIKE ? OR content LIKE ?",
+            (f"%{query}%", f"%{query}%")
+        ).fetchall()
+        result = {}
+        for row in rows:
+            result[row['entry_id']] = {
+                'telegram_message_id': row['telegram_message_id'],
+                'discord_channel_id': row['discord_channel_id'],
+                'discord_message_id': row['discord_message_id'],
+                'content': row['content'],
+                'source_url': row['source_url'],
+                'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+                'category': row['category'],
+                'source_type': row['source_type'],
+                'reasoning': row['reasoning'],
+                'timestamp': row['timestamp']
+            }
+        return result

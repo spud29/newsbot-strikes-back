@@ -9,6 +9,7 @@ import subprocess
 import os
 from utils import logger, setup_logging
 import config
+from db_connection import close_db_connection
 from database import Database
 from ollama_client import OllamaClient
 from rss_poller import RSSPoller
@@ -304,6 +305,22 @@ class NewsAggregatorBot:
                                 f"Newsworthiness filter: {newsworthiness['score']:.1f}/10 below threshold "
                                 f"- routing from '{original_category}' to 'ignore' "
                                 f"(reason: {newsworthiness['reasoning']})"
+                            )
+                
+                # Filter short videos (under threshold) to ignore channel
+                if not similarity_info and category != 'ignore':
+                    if getattr(config, 'SHORT_VIDEO_FILTER_ENABLED', False):
+                        video_duration = entry.get('video_duration')
+                        if video_duration is not None and video_duration < config.SHORT_VIDEO_THRESHOLD:
+                            original_category = category
+                            category = 'ignore'
+                            reasoning = (
+                                f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                                f"| OVERRIDDEN: short video ({video_duration:.0f}s < {config.SHORT_VIDEO_THRESHOLD}s threshold)"
+                            )
+                            logger.info(
+                                f"Short video filter: {video_duration:.0f}s duration "
+                                f"- routing from '{original_category}' to 'ignore'"
                             )
                 
                 # Post to Discord
@@ -709,4 +726,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        close_db_connection()
 

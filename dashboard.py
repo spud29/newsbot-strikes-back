@@ -498,22 +498,22 @@ async def restart_bot(username: str = Depends(verify_credentials)):
 @app.get("/api/stats")
 async def get_stats(username: str = Depends(verify_credentials)):
     """Get current dashboard statistics"""
-    # Reload database from files to get fresh data
-    db.processed_ids = db._load_json(db.processed_ids_path, {})
-    db.embeddings = db._load_json(db.embeddings_path, {})
-    db.message_mapping = db._load_json(db.message_mapping_path, {})
-    
     db_stats = db.get_stats()
     
     # Calculate 24h statistics
     cutoff_24h = time.time() - (24 * 3600)
-    processed_24h = sum(1 for ts in db.processed_ids.values() if ts >= cutoff_24h)
+    row = db.conn.execute("SELECT COUNT(*) FROM processed_ids WHERE timestamp >= ?", (cutoff_24h,)).fetchone()
+    processed_24h = row[0]
     
     # Get recent entries
     recent_entries = []
-    sorted_entries = sorted(db.processed_ids.items(), key=lambda x: x[1], reverse=True)[:20]
+    rows = db.conn.execute(
+        "SELECT entry_id, timestamp FROM processed_ids ORDER BY timestamp DESC LIMIT 20"
+    ).fetchall()
     
-    for entry_id, timestamp in sorted_entries:
+    for row in rows:
+        entry_id = row['entry_id']
+        timestamp = row['timestamp']
         # Parse entry_id to extract source and category info
         parts = entry_id.split('_')
         source_type = parts[0] if parts else 'unknown'
@@ -597,23 +597,16 @@ async def clear_old_entries(username: str = Depends(verify_credentials)):
 async def reset_entry(entry_id: str, username: str = Depends(verify_credentials)):
     """Remove specific entry from processed IDs, embeddings, and message mapping"""
     try:
-        # Reload database to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.embeddings = db._load_json(db.embeddings_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
-        
         removed_items = []
         
         # Check if it's in processed_ids
-        if entry_id in db.processed_ids:
-            del db.processed_ids[entry_id]
-            db._save_json(db.processed_ids_path, db.processed_ids)
+        if db.is_processed(entry_id):
+            db.delete_processed(entry_id)
             removed_items.append("processed_ids")
         
         # Check if it's in message_mapping
-        if entry_id in db.message_mapping:
-            del db.message_mapping[entry_id]
-            db._save_json(db.message_mapping_path, db.message_mapping)
+        if db.get_discord_message_info(entry_id):
+            db.delete_message_mapping(entry_id)
             removed_items.append("message_mapping")
         
         # Check if it's an embedding entry (starts with "embedding_")
@@ -621,32 +614,30 @@ async def reset_entry(entry_id: str, username: str = Depends(verify_credentials)
             # Extract the hash prefix (first 12 chars after "embedding_")
             hash_prefix = entry_id.replace("embedding_", "")
             
-            # Find matching embedding hash
-            matching_hashes = [h for h in db.embeddings.keys() if h.startswith(hash_prefix)]
+            # Find matching embedding hashes in the in-memory cache
+            matching_hashes = [h for h in db._embeddings_cache.keys() if h.startswith(hash_prefix)]
             
             if matching_hashes:
                 for hash_key in matching_hashes:
                     # Also check if the embedding has an entry_id and remove that too
-                    embedding_data = db.embeddings[hash_key]
+                    embedding_data = db._embeddings_cache[hash_key]
                     stored_entry_id = embedding_data.get('entry_id')
                     
                     # Remove the embedding
-                    del db.embeddings[hash_key]
+                    db.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (hash_key,))
+                    db._embeddings_cache.pop(hash_key, None)
                     removed_items.append(f"embedding ({hash_key[:12]}...)")
                     
                     # If embedding has a linked entry_id, remove that from processed_ids and message_mapping
                     if stored_entry_id:
-                        if stored_entry_id in db.processed_ids:
-                            del db.processed_ids[stored_entry_id]
+                        if db.is_processed(stored_entry_id):
+                            db.delete_processed(stored_entry_id)
                             removed_items.append(f"processed_id ({stored_entry_id})")
-                        if stored_entry_id in db.message_mapping:
-                            del db.message_mapping[stored_entry_id]
+                        if db.get_discord_message_info(stored_entry_id):
+                            db.delete_message_mapping(stored_entry_id)
                             removed_items.append(f"message_mapping ({stored_entry_id})")
                 
-                # Save all changes
-                db._save_json(db.embeddings_path, db.embeddings)
-                db._save_json(db.processed_ids_path, db.processed_ids)
-                db._save_json(db.message_mapping_path, db.message_mapping)
+                db.conn.commit()
         
         if removed_items:
             return {
@@ -670,18 +661,13 @@ async def reset_entry(entry_id: str, username: str = Depends(verify_credentials)
 async def reprocess_entry(entry_id: str, username: str = Depends(verify_credentials)):
     """Manually reprocess an entry through the full bot pipeline"""
     try:
-        # Reload database to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.embeddings = db._load_json(db.embeddings_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
-        
         content = None
         source_url = None
         original_entry_id = entry_id
         
         # Try to find content from message_mapping first
-        if entry_id in db.message_mapping:
-            mapping_data = db.message_mapping[entry_id]
+        mapping_data = db.get_discord_message_info(entry_id)
+        if mapping_data:
             content = mapping_data.get('content')
             source_url = mapping_data.get('source_url')
             logger.info(f"Found content in message_mapping for {entry_id}")
@@ -689,20 +675,21 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
         # If it's an embedding ID, find the embedding and extract content
         if not content and entry_id.startswith("embedding_"):
             hash_prefix = entry_id.replace("embedding_", "")
-            matching_hashes = [h for h in db.embeddings.keys() if h.startswith(hash_prefix)]
+            matching_hashes = [h for h in db._embeddings_cache.keys() if h.startswith(hash_prefix)]
             
             if matching_hashes:
                 hash_key = matching_hashes[0]
-                embedding_data = db.embeddings[hash_key]
+                embedding_data = db._embeddings_cache[hash_key]
                 content = embedding_data.get('preview')
                 
                 # Try to get full content from linked entry_id
                 stored_entry_id = embedding_data.get('entry_id')
-                if stored_entry_id and stored_entry_id in db.message_mapping:
-                    mapping_data = db.message_mapping[stored_entry_id]
-                    content = mapping_data.get('content', content)
-                    source_url = mapping_data.get('source_url')
-                    original_entry_id = stored_entry_id
+                if stored_entry_id:
+                    stored_mapping = db.get_discord_message_info(stored_entry_id)
+                    if stored_mapping:
+                        content = stored_mapping.get('content', content)
+                        source_url = stored_mapping.get('source_url')
+                        original_entry_id = stored_entry_id
                 
                 logger.info(f"Found content in embeddings for {entry_id}")
         
@@ -765,8 +752,8 @@ async def reprocess_entry(entry_id: str, username: str = Depends(verify_credenti
             # Try to preserve video_urls and source_type from original entry if available
             original_video_urls = []
             original_source_type = None
-            if original_entry_id in db.message_mapping:
-                original_mapping = db.message_mapping[original_entry_id]
+            original_mapping = db.get_discord_message_info(original_entry_id)
+            if original_mapping:
                 original_video_urls = original_mapping.get('video_urls', [])
                 original_source_type = original_mapping.get('source_type')
             
@@ -878,15 +865,14 @@ async def remove_from_retry_queue(entry_id: str, username: str = Depends(verify_
 async def export_database(username: str = Depends(verify_credentials)):
     """Export database as JSON"""
     try:
-        # Reload database to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.embeddings = db._load_json(db.embeddings_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
+        # Build export data from SQLite
+        processed_rows = db.conn.execute("SELECT entry_id, timestamp FROM processed_ids").fetchall()
+        processed_ids = {row['entry_id']: row['timestamp'] for row in processed_rows}
         
         export_data = {
-            "processed_ids": db.processed_ids,
-            "embeddings_count": len(db.embeddings),
-            "message_mappings": db.message_mapping,
+            "processed_ids": processed_ids,
+            "embeddings_count": len(db._embeddings_cache),
+            "message_mappings": db.get_all_message_mappings(),
             "exported_at": time.time()
         }
         return JSONResponse(content=export_data)
@@ -983,21 +969,16 @@ async def get_config(username: str = Depends(verify_credentials)):
 async def search_database(q: str, username: str = Depends(verify_credentials)):
     """Search for entry by ID or text content"""
     try:
-        # Reload database to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.embeddings = db._load_json(db.embeddings_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
-        
         results = []
         query_lower = q.lower()
         
         # Check for exact entry ID match
-        if q in db.processed_ids:
-            # Try to get source_url from message mapping if available
-            mapping_data = db.message_mapping.get(q, {})
+        if db.is_processed(q):
+            row = db.conn.execute("SELECT timestamp FROM processed_ids WHERE entry_id = ?", (q,)).fetchone()
+            mapping_data = db.get_discord_message_info(q) or {}
             results.append({
                 "entry_id": q,
-                "timestamp": db.processed_ids[q],
+                "timestamp": row['timestamp'] if row else 0,
                 "match_type": "exact_id",
                 "preview": None,
                 "source_url": mapping_data.get('source_url')
@@ -1005,34 +986,36 @@ async def search_database(q: str, username: str = Depends(verify_credentials)):
         
         # Search in processed IDs (partial match)
         if not results:
-            for entry_id in db.processed_ids.keys():
-                if query_lower in entry_id.lower():
-                    # Try to get source_url from message mapping if available
-                    mapping_data = db.message_mapping.get(entry_id, {})
+            rows = db.conn.execute(
+                "SELECT entry_id, timestamp FROM processed_ids WHERE entry_id LIKE ?",
+                (f"%{q}%",)
+            ).fetchall()
+            for row in rows:
+                mapping_data = db.get_discord_message_info(row['entry_id']) or {}
+                results.append({
+                    "entry_id": row['entry_id'],
+                    "timestamp": row['timestamp'],
+                    "match_type": "partial_id",
+                    "preview": None,
+                    "source_url": mapping_data.get('source_url')
+                })
+        
+        # Search in message mapping content
+        content_matches = db.search_message_mappings(q)
+        for entry_id, mapping_data in content_matches.items():
+            if mapping_data.get('content'):
+                if not any(r['entry_id'] == entry_id for r in results):
+                    content_text = mapping_data['content']
                     results.append({
                         "entry_id": entry_id,
-                        "timestamp": db.processed_ids[entry_id],
-                        "match_type": "partial_id",
-                        "preview": None,
+                        "timestamp": mapping_data.get('timestamp', 0),
+                        "match_type": "content",
+                        "preview": content_text[:200] + "..." if len(content_text) > 200 else content_text,
                         "source_url": mapping_data.get('source_url')
                     })
         
-        # Search in message mapping content
-        for entry_id, mapping_data in db.message_mapping.items():
-            if 'content' in mapping_data and mapping_data['content']:
-                if query_lower in mapping_data['content'].lower():
-                    # Only add if not already in results
-                    if not any(r['entry_id'] == entry_id for r in results):
-                        results.append({
-                            "entry_id": entry_id,
-                            "timestamp": mapping_data.get('timestamp', 0),
-                            "match_type": "content",
-                            "preview": mapping_data['content'][:200] + "..." if len(mapping_data['content']) > 200 else mapping_data['content'],
-                            "source_url": mapping_data.get('source_url')
-                        })
-        
         # Search in embeddings preview text
-        for hash_key, embedding_data in db.embeddings.items():
+        for hash_key, embedding_data in db._embeddings_cache.items():
             if 'preview' in embedding_data and embedding_data['preview']:
                 if query_lower in embedding_data['preview'].lower():
                     preview = embedding_data['preview']
@@ -1048,8 +1031,8 @@ async def search_database(q: str, username: str = Depends(verify_credentials)):
                     # Try to get source_url from message_mapping if we have the entry_id
                     source_url = None
                     if stored_entry_id:
-                        mapping_data = db.message_mapping.get(stored_entry_id, {})
-                        source_url = mapping_data.get('source_url')
+                        stored_mapping = db.get_discord_message_info(stored_entry_id)
+                        source_url = stored_mapping.get('source_url') if stored_mapping else None
                     
                     results.append({
                         "entry_id": display_entry_id,
@@ -1159,11 +1142,6 @@ def find_media_files_for_entry(entry_id: str, source_type: str, telegram_message
 async def get_entry_details(entry_id: str, username: str = Depends(verify_credentials)):
     """Get full details for a specific entry ID"""
     try:
-        # Reload database to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.embeddings = db._load_json(db.embeddings_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
-        
         # Initialize result structure
         result = {
             "entry_id": entry_id,
@@ -1184,9 +1162,13 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
         }
         
         # Check if entry exists in processed_ids
-        if entry_id in db.processed_ids:
+        processed_row = db.conn.execute(
+            "SELECT timestamp FROM processed_ids WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        
+        if processed_row:
             result["found"] = True
-            result["timestamp"] = db.processed_ids[entry_id]
+            result["timestamp"] = processed_row['timestamp']
             
             # Parse source type from entry_id
             parts = entry_id.split('_')
@@ -1194,8 +1176,8 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
             
             # Get message mapping data if available
             telegram_message_id = None
-            if entry_id in db.message_mapping:
-                mapping_data = db.message_mapping[entry_id]
+            mapping_data = db.get_discord_message_info(entry_id)
+            if mapping_data:
                 result["content"] = mapping_data.get('content')
                 result["source_url"] = mapping_data.get('source_url')
                 result["discord_channel_id"] = mapping_data.get('discord_channel_id')
@@ -1210,7 +1192,7 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
             
             # Check for embedding info
             # Look for embedding with matching entry_id
-            for hash_key, embedding_data in db.embeddings.items():
+            for hash_key, embedding_data in db._embeddings_cache.items():
                 if embedding_data.get('entry_id') == entry_id:
                     result["embedding_info"] = {
                         "hash": hash_key,
@@ -1222,10 +1204,10 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
             # If no embedding found by entry_id, check if entry_id is an embedding hash
             if not result["embedding_info"] and entry_id.startswith("embedding_"):
                 hash_prefix = entry_id.replace("embedding_", "")
-                matching_hashes = [h for h in db.embeddings.keys() if h.startswith(hash_prefix)]
+                matching_hashes = [h for h in db._embeddings_cache.keys() if h.startswith(hash_prefix)]
                 if matching_hashes:
                     hash_key = matching_hashes[0]
-                    embedding_data = db.embeddings[hash_key]
+                    embedding_data = db._embeddings_cache[hash_key]
                     result["embedding_info"] = {
                         "hash": hash_key,
                         "preview": embedding_data.get('preview'),
@@ -1233,19 +1215,20 @@ async def get_entry_details(entry_id: str, username: str = Depends(verify_creden
                     }
                     # Try to get linked entry_id
                     linked_entry_id = embedding_data.get('entry_id')
-                    if linked_entry_id and linked_entry_id in db.message_mapping:
-                        mapping_data = db.message_mapping[linked_entry_id]
-                        result["content"] = mapping_data.get('content')
-                        result["source_url"] = mapping_data.get('source_url')
-                        result["discord_channel_id"] = mapping_data.get('discord_channel_id')
-                        result["discord_message_id"] = mapping_data.get('discord_message_id')
-                        result["telegram_message_id"] = mapping_data.get('telegram_message_id')
-                        result["category"] = mapping_data.get('category')
-                        telegram_message_id = mapping_data.get('telegram_message_id')
-                        # Get video URLs from message mapping (for Twitter entries)
-                        video_urls = mapping_data.get('video_urls', [])
-                        if video_urls:
-                            result["media"]["videos"] = video_urls
+                    if linked_entry_id:
+                        linked_mapping = db.get_discord_message_info(linked_entry_id)
+                        if linked_mapping:
+                            result["content"] = linked_mapping.get('content')
+                            result["source_url"] = linked_mapping.get('source_url')
+                            result["discord_channel_id"] = linked_mapping.get('discord_channel_id')
+                            result["discord_message_id"] = linked_mapping.get('discord_message_id')
+                            result["telegram_message_id"] = linked_mapping.get('telegram_message_id')
+                            result["category"] = linked_mapping.get('category')
+                            telegram_message_id = linked_mapping.get('telegram_message_id')
+                            # Get video URLs from message mapping (for Twitter entries)
+                            video_urls = linked_mapping.get('video_urls', [])
+                            if video_urls:
+                                result["media"]["videos"] = video_urls
             
             # Find media files (images and videos from temp_media)
             media_info = find_media_files_for_entry(
@@ -1925,9 +1908,6 @@ async def serve_temp_media(
 async def get_removed_entries(username: str = Depends(verify_credentials)):
     """Get all removed entries"""
     try:
-        # Reload removed entries from file
-        removed_entries_db.entries = removed_entries_db._load_entries()
-        
         entries = removed_entries_db.get_all_removed_entries()
         stats = removed_entries_db.get_stats()
         
@@ -1951,9 +1931,6 @@ async def get_removed_entries(username: str = Depends(verify_credentials)):
 async def restore_removed_entry(entry_id: str, username: str = Depends(verify_credentials)):
     """Restore a wrongly removed entry"""
     try:
-        # Reload removed entries
-        removed_entries_db.entries = removed_entries_db._load_entries()
-        
         success = removed_entries_db.restore_entry(entry_id)
         
         if success:
@@ -1997,19 +1974,13 @@ async def recategorize_from_ignore(entry_id: str, username: str = Depends(verify
     try:
         logger.info(f"Re-categorize from ignore requested for entry: {entry_id}")
         
-        # Reload databases to get fresh data
-        db.processed_ids = db._load_json(db.processed_ids_path, {})
-        db.message_mapping = db._load_json(db.message_mapping_path, {})
-        removed_entries_db.entries = removed_entries_db._load_entries()
-        
         # Check if entry exists
-        if entry_id not in db.message_mapping:
+        mapping_data = db.get_discord_message_info(entry_id)
+        if not mapping_data:
             return {
                 'success': False,
                 'error': 'Entry not found in message mapping'
             }
-        
-        mapping_data = db.message_mapping[entry_id]
         current_category = mapping_data.get('category')
         
         # Verify entry is in ignore category

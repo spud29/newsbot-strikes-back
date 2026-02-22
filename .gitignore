@@ -43,6 +43,10 @@ data/vote_tracking.json
 data/statistics.json
 data/bot_stats.json
 data/removed_entries.json
+data/*.bak
+data/newsbot.db
+data/newsbot.db-shm
+data/newsbot.db-wal
 
 # Temporary media files
 temp_media/

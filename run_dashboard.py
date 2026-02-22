@@ -10,6 +10,7 @@ import os
 import signal
 import time
 from utils import logger, setup_logging
+from db_connection import close_db_connection
 
 # Process references
 uvicorn_process = None
@@ -88,6 +89,7 @@ def signal_handler(sig, frame):
     logger.info("\nShutdown signal received")
     stop_uvicorn()
     stop_ngrok()
+    close_db_connection()
     sys.exit(0)
 
 if __name__ == "__main__":
