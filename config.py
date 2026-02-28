@@ -298,6 +298,10 @@ NOT_VALUABLE_VOTES_REQUIRED = 2  # Number of unique votes needed to remove entry
 RECATEGORIZE_COMMAND_ENABLED = True  # Enable/disable "Re-categorize" context menu command
 RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed to re-categorize entries
 
+# Source Context Menu Command (Right-click on bot messages → Apps → "Source")
+# Shows the original Telegram/Twitter source URL to the user who triggered it
+SOURCE_COMMAND_ENABLED = True
+
 # Newsworthiness Filter Configuration
 # Filters out mundane/routine news by rating surprise, impact, and actionability
 # Only posts that score ABOVE the threshold will be posted to their category

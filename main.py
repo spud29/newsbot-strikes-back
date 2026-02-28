@@ -205,14 +205,18 @@ class NewsAggregatorBot:
                     threshold=config.DUPLICATE_THRESHOLD
                 )
                 
+                # Store duplicate info to override category later (same pattern as similarity_info)
+                duplicate_info = None
                 if is_duplicate:
-                    # True duplicate (>0.95 similarity) - skip entirely
                     logger.info(
                         f"Exact duplicate detected (similarity: {duplicate_similarity:.3f}): {entry_id}\n"
                         f"Matches: {match_preview}"
                     )
                     self.stats['duplicates'] += 1
-                    return False
+                    duplicate_info = {
+                        'similarity': duplicate_similarity,
+                        'match_preview': match_preview
+                    }
                 
                 # Check for similar content (not exact duplicate)
                 is_similar, similar_similarity, similar_preview, similar_full_content = self.db.find_similar(
@@ -285,6 +289,22 @@ class NewsAggregatorBot:
                         f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
                     )
                     logger.info(f"Pause mode: routing '{original_category}' to 'ignore'")
+
+                # If exact duplicate was detected, override category to ignore
+                # but preserve the AI reasoning and append duplicate info
+                if duplicate_info:
+                    ai_category = category
+                    category = 'ignore'
+                    reasoning = (
+                        f"AI suggested '{ai_category}': {reasoning or 'no reasoning provided'} "
+                        f"| OVERRIDDEN by duplicate detector "
+                        f"(score: {duplicate_info['similarity']:.3f}, "
+                        f"matches: {duplicate_info['match_preview'][:100]})"
+                    )
+                    logger.info(
+                        f"Category overridden to 'ignore' due to duplicate "
+                        f"(AI suggested: {ai_category})"
+                    )
 
                 # If similar content was detected, override category to ignore
                 # but preserve the AI reasoning and append similarity info

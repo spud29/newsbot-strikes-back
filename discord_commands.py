@@ -586,3 +586,80 @@ def register_commands(poster):
     )
     poster.tree.add_command(why_category_cmd)
     logger.debug("Registered 'Why This Category?' context menu command")
+
+    # Define the Source command function
+    async def source(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to show the original Telegram/Twitter source URL"""
+        logger.debug(f"'Source' command triggered by user {interaction.user.id} on message {message.id}")
+        try:
+            # Check if Source command is enabled
+            if not getattr(config, 'SOURCE_COMMAND_ENABLED', True):
+                await interaction.response.send_message(
+                    "❌ This feature is not enabled.",
+                    ephemeral=True
+                )
+                return
+
+            # Check if message is from the bot
+            if message.author != poster.client.user:
+                await interaction.response.send_message(
+                    "❌ This command only works on messages posted by the bot.",
+                    ephemeral=True
+                )
+                return
+
+            # Look up the entry in the database
+            entry_id = None
+            entry_data = None
+
+            if poster.database:
+                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                if entry_id:
+                    entry_data = poster.database.get_discord_message_info(entry_id)
+
+            if not entry_id or not entry_data:
+                await interaction.response.send_message(
+                    "❌ Could not find entry data for this message in the database.",
+                    ephemeral=True
+                )
+                return
+
+            source_url = entry_data.get('source_url')
+
+            if not source_url:
+                await interaction.response.send_message(
+                    "❌ No source URL found for this entry.",
+                    ephemeral=True
+                )
+                return
+
+            # Send the source URL wrapped in angle brackets to suppress Discord embeds
+            await interaction.response.send_message(
+                f"<{source_url}>",
+                ephemeral=True
+            )
+            logger.info(f"'Source' shown for entry {entry_id}: {source_url}")
+
+        except Exception as e:
+            logger.error(f"Error in 'Source' command: {e}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+            except:
+                pass
+
+    # Manually add the Source command to the tree
+    source_cmd = app_commands.ContextMenu(
+        name="Source",
+        callback=source
+    )
+    poster.tree.add_command(source_cmd)
+    logger.debug("Registered 'Source' context menu command")
