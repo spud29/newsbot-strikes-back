@@ -276,6 +276,16 @@ class NewsAggregatorBot:
                 category, reasoning = await asyncio.to_thread(self.ollama.categorize, combined_content)
                 logger.info(f"Category: {category}")
                 
+                # Pause mode: route everything to ignore while preserving AI category
+                if getattr(config, 'PAUSE_MODE', False):
+                    original_category = category
+                    category = 'ignore'
+                    reasoning = (
+                        f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                        f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
+                    )
+                    logger.info(f"Pause mode: routing '{original_category}' to 'ignore'")
+
                 # If similar content was detected, override category to ignore
                 # but preserve the AI reasoning and append similarity info
                 if similarity_info:

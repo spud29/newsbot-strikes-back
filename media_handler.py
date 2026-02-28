@@ -6,7 +6,7 @@ import json
 import subprocess
 import asyncio
 from pathlib import Path
-from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, remove_twitter_attribution, remove_xcom_urls
+from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls
 import config
 from ocr_handler import OCRHandler
 
@@ -215,6 +215,7 @@ class MediaHandler:
             full_text = remove_emojis(full_text)
             full_text = remove_corrupted_emoji_marks(full_text)
             full_text = remove_xcom_urls(full_text)
+            full_text = format_quote_tweets(full_text)
             full_text = remove_twitter_attribution(full_text)
             
             # Extract text from images using OCR

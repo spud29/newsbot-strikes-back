@@ -73,6 +73,11 @@ VALID_CATEGORIES = [
 # Default category for uncertain/unmatched content
 DEFAULT_CATEGORY = "ignore"
 
+# Pause Mode - When enabled, ALL entries are routed to the 'ignore' channel
+# regardless of their AI categorization. The original category is preserved in reasoning.
+# Useful for temporarily silencing all channels without changing any other config.
+PAUSE_MODE = True
+
 # Telegram channels to monitor
 TELEGRAM_CHANNELS = [
     "Fin_Watch",

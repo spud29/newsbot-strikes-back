@@ -394,6 +394,72 @@ def remove_corrupted_emoji_marks(text):
     
     return text
 
+def format_quote_tweets(text):
+    """
+    Detect and reformat quote-tweet content from gallery-dl output.
+
+    gallery-dl concatenates quote tweet text with the quoted tweet's
+    author and content without any separator, e.g.:
+        "TRUMP: CUBA IS IN BIG TROUBLENewsWire (@NewsWire_US) TRUMP ON CUBA: ..."
+    becomes:
+        "TRUMP: CUBA IS IN BIG TROUBLE
+         TRUMP ON CUBA: ..."
+
+    The author attribution is removed and trailing em dashes are stripped.
+
+    Args:
+        text: Tweet text potentially containing concatenated quote-tweet content
+
+    Returns:
+        str: Text with quote-tweet parts properly separated and cleaned
+    """
+    if not text:
+        return text
+
+    import re
+
+    # Find all (@handle) patterns
+    handle_matches = list(re.finditer(r'\(@(\w+)\)', text))
+    if not handle_matches:
+        return text
+
+    # Process from right to left to preserve string positions
+    for handle_match in reversed(handle_matches):
+        handle_start = handle_match.start()
+        handle_end = handle_match.end()
+
+        # Check if there's substantial text after the handle (not just a date)
+        after = text[handle_end:].strip()
+        if len(after) < 15:
+            continue  # Likely attribution at end, skip
+        if re.match(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)', after):
+            continue  # Date follows handle, this is attribution not a quote tweet
+
+        # Get text before the handle
+        before = text[:handle_start]
+
+        # Find the last word before the handle (the author name)
+        name_match = re.search(r'(\S+)\s*$', before)
+        if not name_match:
+            continue
+
+        name_start = name_match.start()
+
+        # Check if there's NO space between the preceding text and the author name
+        # This is the key signal: "TROUBLENewsWire" vs "TROUBLE NewsWire"
+        if name_start > 0 and before[name_start - 1].isalnum():
+            # Remove the author attribution "AuthorName (@handle) " and insert newline
+            before_text = text[:name_start].rstrip()
+            after_text = text[handle_end:].lstrip()
+
+            # Strip trailing em dashes and hyphens from the quoted content
+            after_text = re.sub(r'[—\-]+\s*$', '', after_text).rstrip()
+
+            text = before_text + '\n' + after_text
+
+    return text
+
+
 def remove_twitter_attribution(text):
     """
     Remove Twitter attribution (author/handle/date) from the end of tweets
