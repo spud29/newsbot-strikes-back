@@ -302,6 +302,11 @@ RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed
 # Shows the original Telegram/Twitter source URL to the user who triggered it
 SOURCE_COMMAND_ENABLED = True
 
+# Edit Text Context Menu Command (Right-click on bot messages → Apps → "Edit Text")
+# Allows authorized users to edit the text of a posted entry
+# Uses the same RECATEGORIZE_ALLOWED_USER_IDS for permission checks
+EDIT_TEXT_COMMAND_ENABLED = True
+
 # Newsworthiness Filter Configuration
 # Filters out mundane/routine news by rating surprise, impact, and actionability
 # Only posts that score ABOVE the threshold will be posted to their category

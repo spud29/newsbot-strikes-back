@@ -125,15 +125,15 @@ class OllamaClient:
                     "stream": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 300
+                        "num_predict": 500
                     }
                 },
                 timeout=60
             )
-            
+
             response.raise_for_status()
             result = response.json()
-            
+
             # Extract category and reasoning from response
             response_text = result.get('response', '').strip()
             category_raw = ''
@@ -283,7 +283,7 @@ class OllamaClient:
                     "stream": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 10
+                        "num_predict": 100
                     }
                 },
                 timeout=15

@@ -53,19 +53,18 @@ class MediaHandler:
             download_dir = os.path.join(self.temp_dir, f"twitter_{entry['status_id']}")
             os.makedirs(download_dir, exist_ok=True)
             
-            # First, extract the full tweet text using gallery-dl --print
-            # This works for both text-only and media tweets
-            # PRIMARY METHOD: Use gallery-dl to get full text directly from x.com URL
-            # Use --range 1 to only extract content once (not once per image)
+            # First, extract the full tweet text using gallery-dl --dump-json
+            # Using --dump-json instead of --print ensures we get content even for
+            # text-only tweets (--print only outputs when media items are found)
             logger.debug(f"Extracting tweet text using gallery-dl from: {link}")
             text_cmd = [
                 'gallery-dl',
-                '--print', '{content}',
+                '--dump-json',
                 '--range', '1',
                 '--no-download',
                 link
             ]
-            
+
             text_result = subprocess.run(
                 text_cmd,
                 capture_output=True,
@@ -74,36 +73,33 @@ class MediaHandler:
                 errors='replace',
                 timeout=30
             )
-            
-            # Extract text from gallery-dl output
-            # With --no-download, gallery-dl outputs the content once, preserving newlines in the tweet
+
+            # Extract text from gallery-dl JSON output
             full_text = ''
             if text_result.returncode == 0 and text_result.stdout.strip():
-                # Take the entire output as-is (tweets can contain multiple lines)
-                raw_output = text_result.stdout.strip()
-                logger.debug(f"Raw gallery-dl output ({len(raw_output)} chars): {raw_output[:500]}")
-                
-                # BUGFIX: gallery-dl sometimes outputs content twice
-                # Check if the text is duplicated by splitting lines in half and comparing
-                output_lines = raw_output.split('\n')
-                if len(output_lines) >= 2 and len(output_lines) % 2 == 0:
-                    # Check if the first half of lines equals the second half
-                    mid = len(output_lines) // 2
-                    first_half = output_lines[:mid]
-                    second_half = output_lines[mid:]
-                    
-                    if first_half == second_half:
-                        logger.warning(f"Detected duplicate content in gallery-dl output, using first half only")
-                        full_text = '\n'.join(first_half)
-                    else:
-                        full_text = raw_output
-                else:
+                try:
+                    json_data = json.loads(text_result.stdout.strip())
+                    # --dump-json returns a list of [directory_info, file_info, ...]
+                    # The metadata dict contains the 'content' field
+                    for item in json_data:
+                        if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+                            raw_output = item[1].get('content', '')
+                            if raw_output:
+                                full_text = raw_output.strip()
+                                logger.debug(f"Raw gallery-dl output ({len(full_text)} chars): {full_text[:500]}")
+                                logger.info(f"✓ Successfully extracted full text from x.com using gallery-dl ({len(full_text)} chars)")
+                                break
+                    if not full_text:
+                        logger.warning(f"gallery-dl JSON had no content for: {link}")
+                except json.JSONDecodeError:
+                    # Fallback: try treating output as plain text (legacy --print behavior)
+                    raw_output = text_result.stdout.strip()
+                    logger.debug(f"gallery-dl output not JSON, using as plain text ({len(raw_output)} chars): {raw_output[:500]}")
                     full_text = raw_output
-                
-                if full_text:
-                    logger.info(f"✓ Successfully extracted full text from x.com using gallery-dl ({len(full_text)} chars)")
-                else:
-                    logger.warning(f"gallery-dl returned empty content for: {link}")
+                    if full_text:
+                        logger.info(f"✓ Successfully extracted full text from x.com using gallery-dl ({len(full_text)} chars)")
+                    else:
+                        logger.warning(f"gallery-dl returned empty content for: {link}")
             else:
                 logger.warning(f"gallery-dl failed to extract text (return code: {text_result.returncode})")
                 if text_result.stderr:

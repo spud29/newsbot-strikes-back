@@ -8,7 +8,7 @@ import re
 import requests
 import config
 from utils import logger
-from discord_ui import RecategorizeModal
+from discord_ui import RecategorizeModal, EditTextModal
 
 
 def generate_thread_title(content):
@@ -258,166 +258,8 @@ def register_commands(poster):
     poster.tree.add_command(get_more_info_cmd)
     logger.debug("Registered 'Get More Info' context menu command")
 
-    # Define the Not Valuable command function
-    async def not_valuable(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to vote that a message is not valuable"""
-        logger.debug(f"'Not Valuable' command triggered by user {interaction.user.id} on message {message.id}")
-        try:
-            # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
-            logger.debug("Deferring interaction response...")
-            await interaction.response.defer(ephemeral=True)
-            logger.debug("Interaction deferred successfully")
-
-            # Check if Not Valuable is enabled
-            enable_not_valuable = getattr(config, 'NOT_VALUABLE_BUTTON_ENABLED', True)
-            if not enable_not_valuable:
-                await interaction.followup.send(
-                    "❌ This feature is not enabled.",
-                    ephemeral=True
-                )
-                return
-
-            # Check if message is from the bot
-            if message.author != poster.client.user:
-                await interaction.followup.send(
-                    "❌ This command only works on messages posted by the bot.",
-                    ephemeral=True
-                )
-                return
-
-            voter_user_id = str(interaction.user.id)
-            discord_message_id = str(message.id)
-            discord_channel_id = message.channel.id
-            content = message.content
-
-            logger.info(f"'Not Valuable' command invoked by user {voter_user_id} on message {discord_message_id}")
-
-            # Find entry data from database
-            entry_id = None
-            category = None
-
-            if poster.database:
-                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
-                if entry_id:
-                    mapping_info = poster.database.get_discord_message_info(entry_id)
-                    category = mapping_info.get('category', 'unknown') if mapping_info else 'unknown'
-
-            if not entry_id:
-                entry_id = f"unknown_{discord_message_id}"
-                category = "unknown"
-
-            # Add vote and get current count
-            entry_data = {
-                'entry_id': entry_id,
-                'content': content,
-                'category': category,
-                'discord_channel_id': discord_channel_id,
-                'discord_message_id': int(discord_message_id)
-            }
-
-            vote_count, is_duplicate = poster.vote_tracker.add_vote(
-                discord_message_id,
-                voter_user_id,
-                entry_data
-            )
-
-            # Check if user already voted
-            if is_duplicate:
-                await interaction.followup.send(
-                    "⚠️ You have already voted on this entry.",
-                    ephemeral=True
-                )
-                return
-
-            votes_required = getattr(config, 'NOT_VALUABLE_VOTES_REQUIRED', 2)
-
-            # Check if threshold reached
-            if vote_count >= votes_required:
-                logger.info(f"Vote threshold reached ({vote_count}/{votes_required}) for message {discord_message_id}")
-
-                # Get voter IDs
-                vote_data = poster.vote_tracker.get_votes(discord_message_id)
-                voter_ids = vote_data.get('voters', []) if vote_data else []
-
-                # Delete the Discord message
-                try:
-                    await message.delete()
-                    logger.info(f"Deleted Discord message {discord_message_id}")
-                except Exception as e:
-                    logger.error(f"Failed to delete Discord message: {e}")
-                    await interaction.followup.send(
-                        f"❌ Failed to delete message: {str(e)}",
-                        ephemeral=True
-                    )
-                    return
-
-                # Remove from database
-                try:
-                    poster.database.delete_processed(entry_id)
-                    poster.database.delete_message_mapping(entry_id)
-                    poster.database.delete_embedding_by_content(content)
-
-                    logger.info(f"Removed entry {entry_id} from database")
-                except Exception as e:
-                    logger.error(f"Error removing entry from database: {e}", exc_info=True)
-
-                # Store in removed entries database
-                try:
-                    poster.removed_entries_db.add_removed_entry(
-                        entry_id=entry_id,
-                        content=content,
-                        category=category,
-                        voter_ids=voter_ids,
-                        discord_message_id=int(discord_message_id),
-                        discord_channel_id=discord_channel_id
-                    )
-                    logger.info(f"Added entry {entry_id} to removed entries database")
-                except Exception as e:
-                    logger.error(f"Error adding to removed entries: {e}", exc_info=True)
-
-                # Clean up vote tracking
-                poster.vote_tracker.remove_tracking(discord_message_id)
-
-                # Send confirmation
-                try:
-                    await interaction.followup.send(
-                        f"✅ Entry removed successfully after {vote_count} votes. This content will be used to improve future categorization.",
-                        ephemeral=True
-                    )
-                except:
-                    pass  # Message might already be deleted
-
-                logger.info(f"Successfully processed removal of entry {entry_id}")
-            else:
-                # Not enough votes yet
-                await interaction.followup.send(
-                    f"✅ Vote recorded ({vote_count}/{votes_required}). Need {votes_required - vote_count} more vote(s) to remove.",
-                    ephemeral=True
-                )
-
-        except Exception as e:
-            logger.error(f"Error in 'Not Valuable' command: {e}", exc_info=True)
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.response.send_message(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
-            except:
-                pass
-
-    # Manually add the Not Valuable command to the tree
-    not_valuable_cmd = app_commands.ContextMenu(
-        name="Not Valuable",
-        callback=not_valuable
-    )
-    poster.tree.add_command(not_valuable_cmd)
-    logger.debug("Registered 'Not Valuable' context menu command")
+    # NOTE: "Not Valuable" context menu command was removed to stay within
+    # Discord's 5 message context menu command limit. Edit Text took its slot.
 
     # Define the Re-categorize command function
     async def recategorize(interaction: discord.Interaction, message: discord.Message):
@@ -663,3 +505,80 @@ def register_commands(poster):
     )
     poster.tree.add_command(source_cmd)
     logger.debug("Registered 'Source' context menu command")
+
+    # Define the Edit Text command function
+    async def edit_text(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to edit the text of a bot message (admin only)"""
+        logger.debug(f"'Edit Text' command triggered by user {interaction.user.id} on message {message.id}")
+        try:
+            # Check if edit text is enabled
+            if not getattr(config, 'EDIT_TEXT_COMMAND_ENABLED', True):
+                await interaction.response.send_message(
+                    "❌ This feature is not enabled.",
+                    ephemeral=True
+                )
+                return
+
+            # Check if user is authorized (same list as Re-categorize)
+            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+            if interaction.user.id not in allowed_user_ids:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.",
+                    ephemeral=True
+                )
+                logger.warning(f"Unauthorized edit text attempt by user {interaction.user.id}")
+                return
+
+            # Check if message is from the bot
+            if message.author != poster.client.user:
+                await interaction.response.send_message(
+                    "❌ This command only works on messages posted by the bot.",
+                    ephemeral=True
+                )
+                return
+
+            # Find the entry in the database
+            entry_id = None
+            entry_data = None
+
+            if poster.database:
+                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                if entry_id:
+                    entry_data = poster.database.get_discord_message_info(entry_id)
+
+            if not entry_id or not entry_data:
+                await interaction.response.send_message(
+                    "❌ Could not find entry data for this message in the database.",
+                    ephemeral=True
+                )
+                return
+
+            logger.info(f"Edit Text command from user {interaction.user.id}: Entry {entry_id}")
+
+            # Show the modal
+            modal = EditTextModal(entry_id, entry_data, message, poster)
+            await interaction.response.send_modal(modal)
+
+        except Exception as e:
+            logger.error(f"Error in 'Edit Text' command: {e}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+            except:
+                pass
+
+    # Manually add the Edit Text command to the tree
+    edit_text_cmd = app_commands.ContextMenu(
+        name="Edit Text",
+        callback=edit_text
+    )
+    poster.tree.add_command(edit_text_cmd)
+    logger.debug("Registered 'Edit Text' context menu command")
