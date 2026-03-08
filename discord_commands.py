@@ -8,7 +8,7 @@ import re
 import requests
 import config
 from utils import logger
-from discord_ui import RecategorizeModal, EditTextModal
+from discord_ui import RecategorizeModal, EditTextModal, NewsSearchModal
 
 
 def generate_thread_title(content):
@@ -349,86 +349,6 @@ def register_commands(poster):
     poster.tree.add_command(recategorize_cmd)
     logger.debug("Registered 'Re-categorize' context menu command")
 
-    # Define the Why This Category command function
-    async def why_this_category(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to see why a message was categorized the way it was"""
-        logger.debug(f"'Why This Category?' command triggered by user {interaction.user.id} on message {message.id}")
-        try:
-            # Check if user is authorized (same restriction as Re-categorize)
-            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
-            if interaction.user.id not in allowed_user_ids:
-                await interaction.response.send_message(
-                    "❌ You don't have permission to use this command.",
-                    ephemeral=True
-                )
-                return
-
-            # Check if message is from the bot
-            if message.author != poster.client.user:
-                await interaction.response.send_message(
-                    "❌ This command only works on messages posted by the bot.",
-                    ephemeral=True
-                )
-                return
-
-            # Look up the entry in the database
-            entry_id = None
-            entry_data = None
-
-            if poster.database:
-                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
-                if entry_id:
-                    entry_data = poster.database.get_discord_message_info(entry_id)
-
-            if not entry_id or not entry_data:
-                await interaction.response.send_message(
-                    "❌ Could not find entry data for this message in the database.",
-                    ephemeral=True
-                )
-                return
-
-            category = entry_data.get('category', 'unknown')
-            reasoning = entry_data.get('reasoning')
-            source_type = entry_data.get('source_type', 'unknown')
-
-            # Build the response
-            response_lines = [
-                f"📂 **Category:** {category}",
-                f"💬 **Reasoning:** {reasoning if reasoning else 'No reasoning stored (entry was processed before this feature was added)'}",
-                f"🔗 **Source type:** {source_type}",
-                f"🆔 **Entry ID:** `{entry_id}`",
-            ]
-
-            await interaction.response.send_message(
-                "\n".join(response_lines),
-                ephemeral=True
-            )
-            logger.info(f"'Why This Category?' shown for entry {entry_id}: {category} - {reasoning}")
-
-        except Exception as e:
-            logger.error(f"Error in 'Why This Category?' command: {e}", exc_info=True)
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.response.send_message(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
-            except:
-                pass
-
-    # Manually add the Why This Category command to the tree
-    why_category_cmd = app_commands.ContextMenu(
-        name="Why This Category?",
-        callback=why_this_category
-    )
-    poster.tree.add_command(why_category_cmd)
-    logger.debug("Registered 'Why This Category?' context menu command")
-
     # Define the Source command function
     async def source(interaction: discord.Interaction, message: discord.Message):
         """Context menu command to show the original Telegram/Twitter source URL"""
@@ -582,3 +502,43 @@ def register_commands(poster):
     )
     poster.tree.add_command(edit_text_cmd)
     logger.debug("Registered 'Edit Text' context menu command")
+
+    # --- News Search context menu command ---
+    async def news_search(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to search for news on any topic"""
+        logger.debug(f"'News Search' command triggered by user {interaction.user.id}")
+        try:
+            # Check if command is enabled
+            if not getattr(config, 'NEWS_SEARCH_COMMAND_ENABLED', True):
+                await interaction.response.send_message(
+                    "❌ This command is not currently enabled.",
+                    ephemeral=True
+                )
+                return
+
+            # Show the modal
+            modal = NewsSearchModal(poster, channel=interaction.channel)
+            await interaction.response.send_modal(modal)
+
+        except Exception as e:
+            logger.error(f"Error in 'News Search' command: {e}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"❌ An error occurred: {str(e)}",
+                        ephemeral=True
+                    )
+            except:
+                pass
+
+    news_search_cmd = app_commands.ContextMenu(
+        name="News Search",
+        callback=news_search
+    )
+    poster.tree.add_command(news_search_cmd)
+    logger.debug("Registered 'News Search' context menu command")

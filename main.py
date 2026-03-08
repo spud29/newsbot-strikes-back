@@ -7,7 +7,7 @@ import signal
 import sys
 import subprocess
 import os
-from utils import logger, setup_logging
+from utils import logger, setup_logging, is_all_caps
 import config
 from db_connection import close_db_connection
 from database import Database
@@ -192,7 +192,20 @@ class NewsAggregatorBot:
                     logger.warning(f"No content to process for: {entry_id}")
                     self.stats['errors'] += 1
                     return False
-                
+
+                # Fix ALL CAPS content (wire-service style headlines from any source)
+                # Rewrites to proper sentence case before embedding/categorization/posting
+                if getattr(config, 'CAPS_FIX_ENABLED', False):
+                    if is_all_caps(content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
+                        logger.info(f"ALL CAPS detected in {source_type} entry, fixing capitalization...")
+                        original_content = content
+                        content = await asyncio.to_thread(self.ollama.fix_capitalization, content)
+                        entry['content'] = content
+                        if content != original_content:
+                            logger.info(f"Capitalization fixed for {entry_id}")
+                        else:
+                            logger.debug(f"Capitalization unchanged (fix returned original)")
+
                 # Generate embedding for duplicate detection BEFORE downloading media
                 # Note: OCR text will be added after media download for enhanced detection
                 # Wrapped in asyncio.to_thread() to prevent blocking Discord interactions
@@ -256,7 +269,7 @@ class NewsAggregatorBot:
                 if not entry.get('media_files'):
                     logger.debug("Not a duplicate, downloading media...")
                     if source_type == 'twitter':
-                        entry = self.media_handler.download_twitter_media(entry)
+                        entry = await asyncio.to_thread(self.media_handler.download_twitter_media, entry)
                         # Update content with gallery-dl extracted text if available
                         content = entry.get('full_text') or content
                     elif source_type == 'telegram':
@@ -641,12 +654,23 @@ class NewsAggregatorBot:
             discord_channel_id = mapping_info['discord_channel_id']
             discord_message_id = mapping_info['discord_message_id']
             old_content = mapping_info.get('content', '')
+
+            # Skip overwriting if the user manually edited this entry via Edit Text
+            if mapping_info.get('user_edited'):
+                logger.info(f"Skipping Telegram edit for {entry_id} - entry was manually edited by user")
+                return True
             
             logger.info(f"Found Discord message mapping: Channel {discord_channel_id}, Message {discord_message_id}")
             
             # Get the edited content
             new_content = edited_entry.get('content', '')
-            
+
+            # Fix ALL CAPS in edited Telegram messages too
+            if new_content and getattr(config, 'CAPS_FIX_ENABLED', False):
+                if is_all_caps(new_content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
+                    logger.info(f"ALL CAPS detected in edited Telegram message, fixing capitalization...")
+                    new_content = await asyncio.to_thread(self.ollama.fix_capitalization, new_content)
+
             if not new_content:
                 logger.warning(f"No content in edited message: {entry_id}")
                 return False

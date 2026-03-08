@@ -34,6 +34,11 @@ PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"  # Not used by context menu
 PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"  # Not used by context menu
 PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # Not used by context menu
 
+# /news Slash Command Configuration
+NEWS_SEARCH_COMMAND_ENABLED = True
+NEWS_SEARCH_MODEL = "sonar-reasoning-pro"  # Model for news topic searches
+NEWS_SEARCH_COOLDOWN_SECONDS = 30  # Per-user cooldown to prevent API abuse
+
 # RSS Feed URLs
 RSS_FEEDS = {
     "unusual_whales": "https://rss.app/feeds/MRsE23OX1FDxCdJ6.xml",
@@ -313,6 +318,12 @@ EDIT_TEXT_COMMAND_ENABLED = True
 # Posts below threshold go to the 'ignore' channel for review
 SHORT_VIDEO_FILTER_ENABLED = True  # Enable/disable the short video filter
 SHORT_VIDEO_THRESHOLD = 60  # Videos under this duration (seconds) are sent to ignore
+
+# ALL CAPS Capitalization Fix
+# When enabled, entries detected as ALL CAPS are rewritten to proper
+# sentence capitalization using Ollama before posting to Discord.
+CAPS_FIX_ENABLED = True
+CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
 
 NEWSWORTHINESS_FILTER_ENABLED = False  # Enable/disable the newsworthiness filter
 NEWSWORTHINESS_THRESHOLD = 7.0  # STRICT: 1-10 scale, only high-quality news gets through

@@ -242,6 +242,78 @@ class OllamaClient:
         return config.DEFAULT_CATEGORY
     
     @retry_with_backoff(max_retries=2, initial_delay=1)
+    def fix_capitalization(self, content):
+        """
+        Rewrite ALL CAPS text to proper sentence capitalization using Ollama.
+
+        Handles proper nouns, acronyms, and abbreviations intelligently.
+        Only changes casing — never alters wording, meaning, or structure.
+
+        Args:
+            content: ALL CAPS text to rewrite
+
+        Returns:
+            str: Text with proper capitalization, or original text on failure
+        """
+        logger.debug(f"Fixing capitalization for: {content[:100]}...")
+
+        try:
+            prompt = (
+                "Rewrite the following ALL CAPS text using proper sentence capitalization. "
+                "Rules:\n"
+                "- Capitalize proper nouns (names, countries, companies, etc.)\n"
+                "- Keep acronyms uppercase (U.S., NATO, SEC, ETF, AI, CEO, GDP, FBI, etc.)\n"
+                "- Capitalize the first letter of each sentence\n"
+                "- Do NOT change any words, punctuation, or meaning\n"
+                "- Do NOT add or remove any text\n"
+                "- Preserve all URLs, numbers, and special characters exactly\n"
+                "- If text contains multiple lines, preserve the line structure\n\n"
+                f"ALL CAPS TEXT:\n{content}\n\n"
+                "PROPERLY CAPITALIZED TEXT:"
+            )
+
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.categorization_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 500
+                    }
+                },
+                timeout=30
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+            rewritten = result.get('response', '').strip()
+
+            if not rewritten:
+                logger.warning("Ollama returned empty capitalization fix, using original")
+                return content
+
+            # Sanity check: rewritten text should be roughly the same length
+            # Guards against hallucination or the model adding commentary
+            len_ratio = len(rewritten) / len(content) if content else 1.0
+            if len_ratio < 0.7 or len_ratio > 1.3:
+                logger.warning(
+                    f"Capitalization fix length mismatch "
+                    f"(original: {len(content)}, rewritten: {len(rewritten)}, "
+                    f"ratio: {len_ratio:.2f}), using original"
+                )
+                return content
+
+            logger.info(f"Capitalization fixed: '{content[:60]}...' -> '{rewritten[:60]}...'")
+            return rewritten
+
+        except Exception as e:
+            logger.error(f"Error fixing capitalization: {e}")
+            return content
+
+    @retry_with_backoff(max_retries=2, initial_delay=1)
     def verify_similarity(self, new_content, existing_content):
         """
         Use the LLM to verify whether two pieces of content are about the same specific

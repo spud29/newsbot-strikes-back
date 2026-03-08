@@ -94,7 +94,8 @@ class DiscordPoster:
         @self.client.event
         async def on_interaction(interaction: discord.Interaction):
             """Handle all interactions (for logging/debugging)"""
-            logger.debug(f"Interaction received: type={interaction.type}, data={interaction.data}")
+            cmd_name = interaction.data.get('name', 'unknown') if interaction.data else 'unknown'
+            logger.debug(f"Interaction received: type={interaction.type}, command={cmd_name}")
             # App commands (context menus) are handled automatically by the command tree
             # This is just for logging
 

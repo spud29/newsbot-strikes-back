@@ -198,6 +198,112 @@ class PerplexityClient:
                     'error': f'Search failed: {error_msg}'
                 }
     
+    @retry_with_backoff(max_retries=2, initial_delay=1)
+    def news_search(self, topic):
+        """
+        Search for recent news on a topic using Perplexity AI
+
+        Args:
+            topic: The news topic to search for
+
+        Returns:
+            dict: {success, answer, citations, error}
+        """
+        if not self.client:
+            return {
+                'success': False,
+                'answer': None,
+                'citations': [],
+                'error': 'Perplexity API key not configured'
+            }
+
+        try:
+            max_topic_length = 200
+            if len(topic) > max_topic_length:
+                topic = topic[:max_topic_length]
+
+            model = getattr(config, 'NEWS_SEARCH_MODEL', 'sonar-reasoning-pro')
+
+            logger.info(f"News search for topic: {topic} (model: {model})")
+
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a concise news briefing assistant. "
+                            "Find the most recent and important news about the given topic. "
+                            "Focus on the last 24-48 hours when possible. "
+                            "Present findings as a clear, organized summary with key facts. "
+                            "Keep the response under 1500 characters. "
+                            "Do not show your thinking process."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"What is the latest news about: {topic}"
+                    }
+                ],
+                stream=False
+            )
+
+            if response and response.choices:
+                answer = response.choices[0].message.content
+                cleaned_answer = self.clean_response(answer)
+                logger.info(f"News search successful ({len(cleaned_answer)} chars)")
+
+                # Extract citations (same logic as search())
+                citations = []
+                if hasattr(response, 'citations'):
+                    citations = response.citations
+                elif hasattr(response.choices[0].message, 'citations'):
+                    citations = response.choices[0].message.citations
+                elif hasattr(response, 'model_extra') and response.model_extra:
+                    if 'citations' in response.model_extra:
+                        citations = response.model_extra['citations']
+                try:
+                    if hasattr(response, '__dict__') and 'citations' in response.__dict__:
+                        citations = response.__dict__['citations']
+                except:
+                    pass
+
+                if citations:
+                    logger.info(f"Found {len(citations)} citations")
+
+                return {
+                    'success': True,
+                    'answer': cleaned_answer,
+                    'citations': citations,
+                    'error': None
+                }
+            else:
+                return {
+                    'success': False,
+                    'answer': None,
+                    'citations': [],
+                    'error': 'Empty response from Perplexity API'
+                }
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"News search failed: {error_msg}")
+
+            if "rate_limit" in error_msg.lower():
+                return {
+                    'success': False,
+                    'answer': None,
+                    'citations': [],
+                    'error': 'Rate limit exceeded. Please try again later.'
+                }
+
+            return {
+                'success': False,
+                'answer': None,
+                'citations': [],
+                'error': f'Search failed: {error_msg}'
+            }
+
     def format_search_url(self, query):
         """
         Construct a Perplexity search URL with the query pre-filled

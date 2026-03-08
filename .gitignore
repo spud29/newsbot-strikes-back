@@ -59,6 +59,9 @@ temp_media_serve/
 # Twitter authentication
 twitter_cookies.txt
 
+# Claude Code
+.claude/
+
 # IDE
 .vscode/
 .idea/

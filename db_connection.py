@@ -33,7 +33,8 @@ def get_db_connection(db_path=None):
     _connection.execute("PRAGMA foreign_keys=ON")
     
     _create_tables(_connection)
-    
+    _run_migrations(_connection)
+
     return _connection
 
 
@@ -110,6 +111,16 @@ def _create_tables(conn):
         );
     """)
     conn.commit()
+
+
+def _run_migrations(conn):
+    """Run schema migrations for columns added after initial release."""
+    # Get existing columns in message_mapping
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(message_mapping)").fetchall()}
+
+    if 'user_edited' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN user_edited INTEGER DEFAULT 0")
+        conn.commit()
 
 
 def close_db_connection():

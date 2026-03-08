@@ -274,7 +274,8 @@ class Database:
             'category': row['category'],
             'source_type': row['source_type'],
             'reasoning': row['reasoning'],
-            'timestamp': row['timestamp']
+            'timestamp': row['timestamp'],
+            'user_edited': row['user_edited'] if 'user_edited' in row.keys() else 0
         }
     
     def get_entry_id_by_discord_message(self, discord_message_id):

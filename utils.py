@@ -599,6 +599,41 @@ def ensure_url_on_own_line(text):
     return text
 
 
+def is_all_caps(text, threshold=0.65):
+    """
+    Detect if text is predominantly ALL CAPS (wire-service style).
+
+    Only counts alphabetic characters. Ignores numbers, URLs, punctuation,
+    and whitespace. Returns True if the ratio of uppercase letters to
+    total letters exceeds the threshold.
+
+    Args:
+        text: Text to check
+        threshold: Ratio of uppercase chars needed (default: 0.65 = 65%)
+
+    Returns:
+        bool: True if text is predominantly ALL CAPS
+    """
+    if not text:
+        return False
+
+    import re
+
+    # Remove URLs before checking (URLs contain mixed case that would skew the ratio)
+    text_without_urls = re.sub(r'https?://\S+', '', text)
+
+    # Count only alphabetic characters
+    alpha_chars = [c for c in text_without_urls if c.isalpha()]
+
+    if len(alpha_chars) < 10:
+        return False
+
+    upper_count = sum(1 for c in alpha_chars if c.isupper())
+    ratio = upper_count / len(alpha_chars)
+
+    return ratio >= threshold
+
+
 def remove_telegram_formatting(text, channel_name=None):
     """
     Remove Telegram formatting markup and channel usernames
