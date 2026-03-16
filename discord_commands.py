@@ -101,6 +101,30 @@ def register_commands(poster):
                 .perplexity_client, .database, .vote_tracker, .removed_entries_db)
     """
 
+    def extract_message_text(message: discord.Message) -> str:
+        """Extract all readable text from a message, including rich embed fields."""
+        parts = []
+
+        if message.content:
+            parts.append(message.content)
+
+        for embed in message.embeds:
+            if embed.author and embed.author.name:
+                parts.append(embed.author.name)
+            if embed.title:
+                parts.append(embed.title)
+            if embed.description:
+                parts.append(embed.description)
+            for field in embed.fields:
+                if field.name:
+                    parts.append(field.name)
+                if field.value:
+                    parts.append(field.value)
+            if embed.footer and embed.footer.text:
+                parts.append(embed.footer.text)
+
+        return "\n".join(parts).strip()
+
     # Define the command function
     async def get_more_info(interaction: discord.Interaction, message: discord.Message):
         """Context menu command to get additional information via Perplexity AI"""
@@ -120,18 +144,10 @@ def register_commands(poster):
                 )
                 return
 
-            # Check if message is from the bot
-            if message.author != poster.client.user:
-                await interaction.followup.send(
-                    "❌ This command only works on messages posted by the bot.",
-                    ephemeral=True
-                )
-                return
-
-            content = message.content
+            content = extract_message_text(message)
             if not content:
                 await interaction.followup.send(
-                    "❌ No content found in message.",
+                    "❌ No readable text found in this message.",
                     ephemeral=True
                 )
                 return
