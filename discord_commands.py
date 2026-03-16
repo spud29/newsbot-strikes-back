@@ -5,10 +5,11 @@ import discord
 from discord import app_commands
 import asyncio
 import re
+import time
 import requests
 import config
 from utils import logger
-from discord_ui import RecategorizeModal, EditTextModal, NewsSearchModal
+from discord_ui import RecategorizeModal, EditTextModal
 
 
 def generate_thread_title(content):
@@ -519,12 +520,16 @@ def register_commands(poster):
     poster.tree.add_command(edit_text_cmd)
     logger.debug("Registered 'Edit Text' context menu command")
 
-    # --- News Search context menu command ---
-    async def news_search(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to search for news on any topic"""
-        logger.debug(f"'News Search' command triggered by user {interaction.user.id}")
+    # --- /news slash command ---
+    # Per-user cooldown tracking
+    _news_cooldowns: dict = {}
+
+    @poster.tree.command(name="news", description="Search for the latest news on any topic")
+    @app_commands.describe(topic="The topic to search for (e.g. Bitcoin ETF, AI regulation, Nintendo Switch 2)")
+    async def news_slash(interaction: discord.Interaction, topic: str):
+        """Slash command to search for news on any topic via Perplexity AI"""
+        logger.debug(f"'/news' command triggered by user {interaction.user.id} with topic: {topic}")
         try:
-            # Check if command is enabled
             if not getattr(config, 'NEWS_SEARCH_COMMAND_ENABLED', True):
                 await interaction.response.send_message(
                     "❌ This command is not currently enabled.",
@@ -532,29 +537,101 @@ def register_commands(poster):
                 )
                 return
 
-            # Show the modal
-            modal = NewsSearchModal(poster, channel=interaction.channel)
-            await interaction.response.send_modal(modal)
+            # Defer immediately to avoid 3s timeout
+            await interaction.response.defer(ephemeral=True)
+
+            # Cooldown check
+            cooldown_seconds = getattr(config, 'NEWS_SEARCH_COOLDOWN_SECONDS', 30)
+            now = time.time()
+            remaining = cooldown_seconds - (now - _news_cooldowns.get(interaction.user.id, 0))
+            if remaining > 0:
+                await interaction.followup.send(
+                    f"Please wait {remaining:.0f} seconds before searching again.",
+                    ephemeral=True
+                )
+                return
+
+            topic = topic.strip()
+            if len(topic) < 2:
+                await interaction.followup.send(
+                    "Please provide a longer topic (at least 2 characters).",
+                    ephemeral=True
+                )
+                return
+
+            if not poster.perplexity_client or not poster.perplexity_client.is_available():
+                await interaction.followup.send(
+                    "Perplexity search is not available. API key may not be configured.",
+                    ephemeral=True
+                )
+                return
+
+            # Record cooldown before the slow API call
+            _news_cooldowns[interaction.user.id] = now
+
+            result = await asyncio.to_thread(poster.perplexity_client.news_search, topic)
+
+            if result['success'] and result.get('answer'):
+                answer = result['answer']
+                citations = result.get('citations', [])
+
+                # Truncate if needed (embed description limit is 4096)
+                max_length = 3900
+                truncated = False
+                if len(answer) > max_length:
+                    answer = answer[:max_length] + "..."
+                    truncated = True
+
+                embed = discord.Embed(
+                    title=f"News: {topic[:200]}",
+                    description=answer,
+                    color=discord.Color.blue(),
+                    timestamp=discord.utils.utcnow()
+                )
+
+                # Add citations as a field (up to 10 sources)
+                if citations:
+                    sources_text = ""
+                    for i, citation in enumerate(citations[:10], 1):
+                        if isinstance(citation, dict):
+                            url = citation.get('url', citation.get('link', ''))
+                            cite_title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
+                            if url:
+                                sources_text += f"{i}. [{cite_title}]({url})\n"
+                            else:
+                                sources_text += f"{i}. {cite_title}\n"
+                        elif isinstance(citation, str):
+                            sources_text += f"{i}. {citation}\n"
+
+                    if sources_text:
+                        if len(sources_text) > 1024:
+                            sources_text = sources_text[:1021] + "..."
+                        embed.add_field(name="Sources", value=sources_text, inline=False)
+
+                footer_text = f"Requested by {interaction.user.display_name}"
+                if truncated:
+                    footer_text += " | Response truncated"
+                embed.set_footer(text=footer_text)
+
+                # Post to channel as a persistent (non-ephemeral) message
+                posted_msg = await interaction.channel.send(embed=embed)
+
+                await interaction.followup.send("✅ Results posted!", ephemeral=True)
+                logger.info(f"News search for '{topic}' completed ({len(answer)} chars, {len(citations)} citations)")
+
+            else:
+                error_msg = result.get('error', 'Unknown error')
+                await interaction.followup.send(f"Search failed: {error_msg}", ephemeral=True)
+                logger.error(f"News search failed for '{topic}': {error_msg}")
 
         except Exception as e:
-            logger.error(f"Error in 'News Search' command: {e}", exc_info=True)
+            logger.error(f"Error in '/news' command: {e}", exc_info=True)
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                    await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
                 else:
-                    await interaction.response.send_message(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                    await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
             except:
                 pass
 
-    news_search_cmd = app_commands.ContextMenu(
-        name="News Search",
-        callback=news_search
-    )
-    poster.tree.add_command(news_search_cmd)
-    logger.debug("Registered 'News Search' context menu command")
+    logger.debug("Registered '/news' slash command")

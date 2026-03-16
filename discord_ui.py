@@ -3,9 +3,8 @@ Discord UI components (modals, views) for the news aggregator bot
 """
 import discord
 import asyncio
-import time
 import config
-from utils import logger
+from utils import logger, ensure_url_on_own_line
 
 
 class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
@@ -176,9 +175,23 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
             # Defer response to avoid timeout
             await modal_interaction.response.defer(ephemeral=True)
 
+            # Reconstruct the full message text (same logic as post_message),
+            # re-appending hidden video URL links so they aren't lost on edit.
+            video_urls = self.entry_data.get('video_urls', [])
+            source_type = self.entry_data.get('source_type') or (self.entry_id.split('_')[0] if self.entry_id else None)
+
+            message_text = ensure_url_on_own_line(new_text)
+            suppress_embeds = True
+
+            if source_type == 'twitter' and video_urls:
+                suppress_embeds = False
+                for video_url in video_urls:
+                    if video_url.startswith('http'):
+                        message_text += f" [.]({video_url})"
+
             # Edit the Discord message
             try:
-                await self.message.edit(content=new_text, suppress=True)
+                await self.message.edit(content=message_text, suppress=suppress_embeds)
                 logger.info(f"Edited Discord message {self.message.id} for entry {self.entry_id}")
             except discord.Forbidden:
                 await modal_interaction.followup.send(
@@ -248,180 +261,3 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
             logger.error(f"Failed to send modal error message: {e}")
 
 
-# Per-user cooldown tracking for news search
-_news_cooldowns = {}
-
-
-class NewsSearchModal(discord.ui.Modal, title="News Search"):
-    """Modal for searching news on any topic via Perplexity AI"""
-
-    def __init__(self, poster, channel=None):
-        super().__init__()
-        self.poster = poster
-        self.channel = channel
-
-        self.topic_input = discord.ui.TextInput(
-            label="Topic",
-            placeholder="e.g. Bitcoin ETF, AI regulation, Nintendo Switch 2",
-            required=True,
-            max_length=200,
-            style=discord.TextStyle.short
-        )
-        self.add_item(self.topic_input)
-
-    async def on_submit(self, modal_interaction: discord.Interaction):
-        """Handle modal submission"""
-        try:
-            topic = self.topic_input.value.strip()
-            logger.debug(f"NewsSearchModal on_submit called for topic: {topic}")
-
-            if len(topic) < 2:
-                await modal_interaction.response.send_message(
-                    "Please provide a longer search topic (at least 2 characters).",
-                    ephemeral=True
-                )
-                return
-
-            # Cooldown check
-            cooldown_seconds = getattr(config, 'NEWS_SEARCH_COOLDOWN_SECONDS', 30)
-            user_id = modal_interaction.user.id
-            now = time.time()
-            last_use = _news_cooldowns.get(user_id, 0)
-            remaining = cooldown_seconds - (now - last_use)
-
-            if remaining > 0:
-                await modal_interaction.response.send_message(
-                    f"Please wait {remaining:.0f} seconds before searching again.",
-                    ephemeral=True
-                )
-                return
-
-            # Check if Perplexity is available
-            if not self.poster.perplexity_client or not self.poster.perplexity_client.is_available():
-                await modal_interaction.response.send_message(
-                    "Perplexity search is not available. API key may not be configured.",
-                    ephemeral=True
-                )
-                return
-
-            # Send immediate loading indicator
-            await modal_interaction.response.send_message(
-                f"🔍 Searching for news on **{topic}**...",
-                ephemeral=True
-            )
-
-            # Record cooldown after responding
-            _news_cooldowns[user_id] = now
-
-            # Perform the search
-            result = await asyncio.to_thread(self.poster.perplexity_client.news_search, topic)
-
-            if result['success'] and result.get('answer'):
-                answer = result['answer']
-                citations = result.get('citations', [])
-
-                # Truncate if needed (embed description limit is 4096)
-                max_length = 3900
-                truncated = False
-                if len(answer) > max_length:
-                    answer = answer[:max_length] + "..."
-                    truncated = True
-
-                # Build the embed
-                embed = discord.Embed(
-                    title=f"News: {topic[:200]}",
-                    description=answer,
-                    color=discord.Color.blue(),
-                    timestamp=discord.utils.utcnow()
-                )
-
-                # Add citations as a field (up to 10 sources)
-                if citations:
-                    sources_text = ""
-                    display_citations = citations[:10]
-
-                    for i, citation in enumerate(display_citations, 1):
-                        if isinstance(citation, dict):
-                            url = citation.get('url', citation.get('link', ''))
-                            cite_title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
-                            if url:
-                                sources_text += f"{i}. [{cite_title}]({url})\n"
-                            else:
-                                sources_text += f"{i}. {cite_title}\n"
-                        elif isinstance(citation, str):
-                            sources_text += f"{i}. {citation}\n"
-
-                    if sources_text:
-                        if len(sources_text) > 1024:
-                            sources_text = sources_text[:1021] + "..."
-                        embed.add_field(
-                            name="Sources",
-                            value=sources_text,
-                            inline=False
-                        )
-
-                footer_text = f"Requested by {modal_interaction.user.display_name}"
-                if truncated:
-                    footer_text += " | Response truncated"
-                embed.set_footer(text=footer_text)
-
-                # Post to channel as a persistent (non-ephemeral) message
-                channel = self.channel or modal_interaction.channel
-                posted_msg = await channel.send(embed=embed)
-
-                # Create a thread on it for discussion
-                thread_name = f"News: {topic}"[:100]
-                try:
-                    await posted_msg.create_thread(
-                        name=thread_name,
-                        auto_archive_duration=1440
-                    )
-                except discord.Forbidden:
-                    logger.warning("No permission to create thread on news search result")
-                except discord.HTTPException as thread_err:
-                    logger.warning(f"Failed to create thread: {thread_err}")
-
-                # Update the ephemeral loading message to confirm
-                await modal_interaction.edit_original_response(
-                    content="✅ Results posted!"
-                )
-                logger.info(f"News search for '{topic}' completed ({len(answer)} chars, {len(citations)} citations)")
-
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                await modal_interaction.edit_original_response(
-                    content=f"Search failed: {error_msg}"
-                )
-                logger.error(f"News search failed for '{topic}': {error_msg}")
-
-        except Exception as e:
-            logger.error(f"Error in NewsSearchModal on_submit: {e}", exc_info=True)
-            try:
-                if modal_interaction.response.is_done():
-                    await modal_interaction.edit_original_response(
-                        content=f"An error occurred: {str(e)}"
-                    )
-                else:
-                    await modal_interaction.response.send_message(
-                        f"An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
-            except Exception as followup_error:
-                logger.error(f"Failed to send error response: {followup_error}")
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        """Handle errors in the modal"""
-        logger.error(f"NewsSearchModal error: {error}", exc_info=True)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"An error occurred: {str(error)}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"An error occurred: {str(error)}",
-                    ephemeral=True
-                )
-        except Exception as e:
-            logger.error(f"Failed to send modal error message: {e}")
