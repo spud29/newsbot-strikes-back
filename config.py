@@ -312,6 +312,11 @@ SOURCE_COMMAND_ENABLED = True
 # Uses the same RECATEGORIZE_ALLOWED_USER_IDS for permission checks
 EDIT_TEXT_COMMAND_ENABLED = True
 
+# Reprocess Entry Context Menu Command (Right-click on bot messages → Apps → "Reprocess Entry")
+# Re-runs the full AI pipeline on an already-posted message (re-download, re-categorize, re-post)
+# Uses the same RECATEGORIZE_ALLOWED_USER_IDS for permission checks
+REPROCESS_COMMAND_ENABLED = True
+
 # Newsworthiness Filter Configuration
 # Filters out mundane/routine news by rating surprise, impact, and actionability
 # Only posts that score ABOVE the threshold will be posted to their category

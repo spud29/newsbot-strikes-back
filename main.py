@@ -81,7 +81,10 @@ class NewsAggregatorBot:
         
         # Start Discord client
         await self.discord_poster.start()
-        
+
+        # Wire up the reprocess callback so discord_commands.py can trigger it
+        self.discord_poster.reprocess_callback = self._handle_reprocess
+
         # Start Telegram client
         await self.telegram_poller.start()
         
@@ -469,6 +472,85 @@ class NewsAggregatorBot:
             
             return False
     
+    async def _handle_reprocess(self, entry_id, entry_data, original_discord_channel_id, original_discord_message_id):
+        """
+        Re-run the full pipeline for an already-posted entry.
+
+        Called by the "Reprocess Entry" Discord context menu command. Clears processed/embedding
+        state so process_entry won't skip the entry, reconstructs an entry dict from stored
+        message_mapping data, then runs the pipeline. On success, deletes the original message.
+        On failure, preserves the original message.
+
+        Args:
+            entry_id: Entry ID string (e.g. 'telegram_Fin_Watch_12345')
+            entry_data: Dict from database.get_discord_message_info()
+            original_discord_channel_id: Channel ID of the original Discord message
+            original_discord_message_id: Message ID of the original Discord message
+
+        Returns:
+            bool: True if reprocessing succeeded and original was deleted
+        """
+        try:
+            logger.info(f"Reprocess requested for entry: {entry_id}")
+
+            # Clear processed state so process_entry won't skip it
+            self.db.delete_processed(entry_id)
+            logger.info(f"Cleared processed_ids for: {entry_id}")
+
+            # Clear embedding so it won't self-detect as a duplicate
+            self.db.delete_embedding_by_entry_id(entry_id)
+            logger.info(f"Cleared embedding for: {entry_id}")
+
+            # Reconstruct entry dict from stored mapping data
+            source_type = entry_data.get('source_type', 'telegram')
+            content = entry_data.get('content', '')
+            source_url = entry_data.get('source_url', '')
+            video_urls = entry_data.get('video_urls', []) or []
+            telegram_message_id = entry_data.get('telegram_message_id', 0)
+
+            # Derive channel/source name from entry_id robustly (handles underscores in names)
+            source = ''
+            if source_type == 'telegram' and telegram_message_id:
+                prefix = 'telegram_'
+                suffix = f'_{telegram_message_id}'
+                if entry_id.startswith(prefix) and entry_id.endswith(suffix):
+                    source = entry_id[len(prefix):-len(suffix)]
+            elif source_type == 'twitter':
+                source = 'twitter'
+
+            reconstructed_entry = {
+                'id': entry_id,
+                'source_type': source_type,
+                'source': source,
+                'content': content,
+                'link': source_url,
+                'url': source_url,
+                'message_id': telegram_message_id,
+                'video_urls': video_urls,
+                # media_files omitted intentionally — pipeline re-downloads fresh
+            }
+
+            # Twitter entries need status_id for media_handler download directory
+            if source_type == 'twitter' and entry_id.startswith('twitter_'):
+                reconstructed_entry['status_id'] = entry_id[len('twitter_'):]
+
+            logger.info(f"Running full pipeline for reprocess: {entry_id}")
+            success = await self.process_entry(reconstructed_entry)
+
+            if success:
+                await self.discord_poster.delete_message(
+                    original_discord_channel_id, original_discord_message_id
+                )
+                logger.info(f"Reprocess complete for: {entry_id}")
+            else:
+                logger.error(f"Reprocess pipeline failed for {entry_id} — original message preserved")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Error in _handle_reprocess for {entry_id}: {e}", exc_info=True)
+            return False
+
     async def poll_cycle(self):
         """Run one polling cycle"""
         logger.info("\n" + "=" * 80)
@@ -762,12 +844,52 @@ def signal_handler(sig, frame):
     logger.info("\nShutdown signal received")
     sys.exit(0)
 
+def kill_existing_instance():
+    """Kill any existing bot instance recorded in the PID file."""
+    import psutil
+
+    pid_file = os.path.join("data", "bot.pid")
+    if not os.path.exists(pid_file):
+        return
+
+    try:
+        with open(pid_file) as f:
+            old_pid = int(f.read().strip())
+    except (ValueError, OSError):
+        return
+
+    if old_pid == os.getpid():
+        return
+
+    try:
+        proc = psutil.Process(old_pid)
+        # Confirm it's actually a Python process (not a recycled PID)
+        if "python" in proc.name().lower():
+            logger.info(f"Found existing bot instance (PID {old_pid}), terminating it...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+                logger.info(f"PID {old_pid} terminated cleanly")
+            except psutil.TimeoutExpired:
+                proc.kill()
+                logger.warning(f"PID {old_pid} force-killed after timeout")
+        else:
+            logger.debug(f"PID {old_pid} from PID file is not a Python process, ignoring")
+    except psutil.NoSuchProcess:
+        logger.debug(f"PID {old_pid} from PID file is no longer running")
+    except Exception as e:
+        logger.warning(f"Could not terminate old instance (PID {old_pid}): {e}")
+
+
 async def main():
     """Main entry point"""
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
+    # Kill any leftover instance before starting
+    kill_existing_instance()
+
     # Create and run bot
     bot = NewsAggregatorBot()
     await bot.run()

@@ -344,6 +344,27 @@ class Database:
         self.conn.commit()
         logger.debug(f"Removed from processed IDs: {entry_id}")
     
+    def delete_embedding_by_entry_id(self, entry_id):
+        """
+        Remove all embeddings associated with a given entry_id.
+
+        Used by the reprocess pipeline to clear stale embeddings before re-running,
+        so the entry won't self-detect as a duplicate during reprocessing.
+        Must look up by entry_id (not content hash) because OCR entries store embeddings
+        generated from combined_content (content + OCR text), not plain content.
+
+        Args:
+            entry_id: The entry ID whose embeddings should be removed
+        """
+        rows = self.conn.execute(
+            "SELECT content_hash FROM embeddings WHERE entry_id = ?", (entry_id,)
+        ).fetchall()
+        for row in rows:
+            self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (row['content_hash'],))
+            self._embeddings_cache.pop(row['content_hash'], None)
+        self.conn.commit()
+        logger.debug(f"Deleted {len(rows)} embedding(s) for entry_id: {entry_id}")
+
     def delete_embedding_by_content(self, content):
         """
         Remove an embedding by its content (used when removing entries)

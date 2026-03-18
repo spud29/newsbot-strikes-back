@@ -520,6 +520,79 @@ def register_commands(poster):
     poster.tree.add_command(edit_text_cmd)
     logger.debug("Registered 'Edit Text' context menu command")
 
+    # Define the Reprocess Entry command function
+    async def reprocess_entry(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to re-run the full pipeline on an already-posted bot message (admin only)"""
+        logger.debug(f"'Reprocess Entry' triggered by user {interaction.user.id} on message {message.id}")
+        try:
+            if not getattr(config, 'REPROCESS_COMMAND_ENABLED', True):
+                await interaction.response.send_message("❌ This feature is not enabled.", ephemeral=True)
+                return
+
+            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+            if interaction.user.id not in allowed_user_ids:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.", ephemeral=True
+                )
+                logger.warning(f"Unauthorized reprocess attempt by user {interaction.user.id}")
+                return
+
+            if message.author != poster.client.user:
+                await interaction.response.send_message(
+                    "❌ This command only works on messages posted by the bot.", ephemeral=True
+                )
+                return
+
+            if not poster.reprocess_callback:
+                await interaction.response.send_message(
+                    "❌ Reprocess is not available (callback not registered).", ephemeral=True
+                )
+                return
+
+            entry_id = poster.database.get_entry_id_by_discord_message(message.id) if poster.database else None
+            if not entry_id:
+                await interaction.response.send_message(
+                    "❌ Could not find entry data for this message.", ephemeral=True
+                )
+                return
+
+            entry_data = poster.database.get_discord_message_info(entry_id)
+            if not entry_data:
+                await interaction.response.send_message(
+                    "❌ Could not retrieve entry details.", ephemeral=True
+                )
+                return
+
+            await interaction.response.send_message(
+                f"⚙️ Reprocessing `{entry_id}`... A new post will appear shortly.",
+                ephemeral=True
+            )
+
+            original_channel_id = message.channel.id
+            original_message_id = message.id
+
+            async def run_reprocess():
+                try:
+                    await poster.reprocess_callback(entry_id, entry_data, original_channel_id, original_message_id)
+                except Exception as e:
+                    logger.error(f"Background reprocess task failed for {entry_id}: {e}", exc_info=True)
+
+            asyncio.create_task(run_reprocess())
+
+        except Exception as e:
+            logger.error(f"Error in 'Reprocess Entry' command: {e}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
+            except:
+                pass
+
+    reprocess_entry_cmd = app_commands.ContextMenu(name="Reprocess Entry", callback=reprocess_entry)
+    poster.tree.add_command(reprocess_entry_cmd)
+    logger.debug("Registered 'Reprocess Entry' context menu command")
+
     # --- /news slash command ---
     # Per-user cooldown tracking
     _news_cooldowns: dict = {}

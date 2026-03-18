@@ -553,13 +553,14 @@ def remove_xcom_urls(text):
     
     import re
     
-    # Remove x.com and twitter.com URLs (with or without https://)
+    # Remove x.com, twitter.com, and pic.twitter.com URLs (with or without https://)
     # Matches patterns like:
     # - x.com/username/status/1234567890
     # - twitter.com/username/status/1234567890
     # - https://x.com/username/status/1234567890
     # - https://twitter.com/username/status/1234567890
-    url_pattern = r'https?://(?:www\.)?(?:x\.com|twitter\.com)/\S+|(?:^|\s)(?:x\.com|twitter\.com)/\S+'
+    # - pic.twitter.com/Abc123XYZ
+    url_pattern = r'https?://(?:www\.)?(?:pic\.twitter\.com|x\.com|twitter\.com)/\S+|(?:^|\s)(?:pic\.twitter\.com|x\.com|twitter\.com)/\S+'
     text = re.sub(url_pattern, '', text)
     
     # Clean up any multiple consecutive spaces left behind

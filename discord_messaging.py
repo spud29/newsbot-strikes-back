@@ -48,6 +48,8 @@ class DiscordPoster:
         self.vote_tracker = vote_tracker if vote_tracker else VoteTracker()
         self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
 
+        self.reprocess_callback = None  # Set by NewsAggregatorBot.start()
+
         # Register context menu commands
         register_commands(self)
 
@@ -236,11 +238,6 @@ class DiscordPoster:
                     if video_url.startswith('http'):
                         message_text += f" [.]({video_url})"
 
-            # Discord has a 2000 character limit
-            if len(message_text) > 2000:
-                logger.warning(f"Message too long ({len(message_text)} chars), truncating to 2000")
-                message_text = message_text[:1997] + "..."
-
             # Prepare file attachments
             files = []
             if media_files:
@@ -274,11 +271,22 @@ class DiscordPoster:
                             logger.error(f"Error preparing file {file_path}: {e}")
 
             # Send the message (no view/buttons needed - using context menu commands)
-            sent_message = await channel.send(
-                content=message_text,
-                files=files,
-                suppress_embeds=suppress_embeds
-            )
+            if source_type == 'telegram' and len(message_text) > 2000:
+                # Post as embed to avoid Discord's 2000-char plain text limit
+                # (Embeds support up to 4096 chars in description)
+                if len(message_text) > 4093:
+                    message_text = message_text[:4093] + "..."
+                embed = discord.Embed(description=message_text, color=discord.Color.dark_grey())
+                sent_message = await channel.send(embed=embed, files=files)
+            else:
+                if len(message_text) > 2000:
+                    logger.warning(f"Message too long ({len(message_text)} chars), truncating to 2000")
+                    message_text = message_text[:1997] + "..."
+                sent_message = await channel.send(
+                    content=message_text,
+                    files=files,
+                    suppress_embeds=suppress_embeds
+                )
 
             logger.info(
                 f"Successfully posted to {category}: "
@@ -528,13 +536,19 @@ class DiscordPoster:
             # (edit_message doesn't receive video_urls parameter, so we keep it simple)
             suppress_embeds = True
 
-            # Discord has a 2000 character limit
-            if len(message_text) > 2000:
-                logger.warning(f"Message too long ({len(message_text)} chars), truncating to 2000")
-                message_text = message_text[:1997] + "..."
-
-            # Edit the message with embed suppression (note: cannot edit attachments, only text)
-            await message.edit(content=message_text, suppress=suppress_embeds)
+            # Edit the message — match the format it was originally posted in
+            if message.embeds and not message.content:
+                # Originally posted as a Discord embed (long Telegram) — update the embed description
+                if len(message_text) > 4093:
+                    message_text = message_text[:4093] + "..."
+                updated_embed = discord.Embed(description=message_text, color=discord.Color.dark_grey())
+                await message.edit(embed=updated_embed)
+            else:
+                # Plain text — existing path
+                if len(message_text) > 2000:
+                    logger.warning(f"Message too long ({len(message_text)} chars), truncating to 2000")
+                    message_text = message_text[:1997] + "..."
+                await message.edit(content=message_text, suppress=suppress_embeds)
 
             logger.info(f"Successfully edited Discord message {message_id}: {len(content)} chars")
 
@@ -549,6 +563,37 @@ class DiscordPoster:
                 return False
         except Exception as e:
             logger.error(f"Error editing Discord message: {e}", exc_info=True)
+            return False
+
+    async def delete_message(self, channel_id, message_id):
+        """
+        Delete a Discord message by channel and message ID.
+
+        Args:
+            channel_id: Discord channel ID
+            message_id: Discord message ID to delete
+
+        Returns:
+            bool: True if deleted (or already gone), False on error
+        """
+        try:
+            channel = self.client.get_channel(channel_id)
+            if not channel:
+                logger.error(f"delete_message: could not find channel {channel_id}")
+                return False
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                logger.warning(f"delete_message: message {message_id} already gone")
+                return True
+            except discord.Forbidden:
+                logger.error(f"delete_message: no permission to fetch message {message_id}")
+                return False
+            await message.delete()
+            logger.info(f"Deleted Discord message {message_id} from channel {channel_id}")
+            return True
+        except Exception as e:
+            logger.error(f"delete_message error: {e}", exc_info=True)
             return False
 
     async def _verify_channel_access(self):

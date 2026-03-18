@@ -189,9 +189,16 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
                     if video_url.startswith('http'):
                         message_text += f" [.]({video_url})"
 
-            # Edit the Discord message
+            # Edit the Discord message — match the format it was originally posted in
             try:
-                await self.message.edit(content=message_text, suppress=suppress_embeds)
+                if self.message.embeds and not self.message.content:
+                    # Originally posted as a Discord embed (long Telegram) — update the embed description
+                    if len(message_text) > 4093:
+                        message_text = message_text[:4093] + "..."
+                    updated_embed = discord.Embed(description=message_text, color=discord.Color.dark_grey())
+                    await self.message.edit(embed=updated_embed)
+                else:
+                    await self.message.edit(content=message_text, suppress=suppress_embeds)
                 logger.info(f"Edited Discord message {self.message.id} for entry {self.entry_id}")
             except discord.Forbidden:
                 await modal_interaction.followup.send(
