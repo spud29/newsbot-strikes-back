@@ -9,7 +9,7 @@ import time
 import requests
 import config
 from utils import logger
-from discord_ui import RecategorizeModal, EditTextModal
+from discord_ui import RecategorizeView, EditTextModal
 
 
 def generate_thread_title(content):
@@ -338,9 +338,13 @@ def register_commands(poster):
             # Get available categories
             available_categories = list(config.DISCORD_CHANNELS.keys())
 
-            # Show the modal using the external RecategorizeModal class
-            modal = RecategorizeModal(current_category, available_categories, entry_id, entry_data, message, poster)
-            await interaction.response.send_modal(modal)
+            # Show an ephemeral dropdown so the user can pick a category
+            view = RecategorizeView(current_category, available_categories, entry_id, entry_data, message, poster)
+            await interaction.response.send_message(
+                f"Select a new category for this entry (currently **{current_category}**):",
+                view=view,
+                ephemeral=True
+            )
 
         except Exception as e:
             logger.error(f"Error in 'Re-categorize' command: {e}", exc_info=True)

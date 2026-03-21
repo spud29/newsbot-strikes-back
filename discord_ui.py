@@ -7,77 +7,56 @@ import config
 from utils import logger, ensure_url_on_own_line
 
 
-class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
-    """Modal for re-categorizing an entry to a different category"""
+class RecategorizeView(discord.ui.View):
+    """Ephemeral view with a Select dropdown for re-categorizing an entry"""
 
     def __init__(self, current_cat, available_categories, entry_id, entry_data, message, poster):
-        super().__init__()
+        super().__init__(timeout=60)
         self.current_category = current_cat
-        self.available_categories = available_categories
         self.entry_id = entry_id
         self.entry_data = entry_data
         self.message = message
         self.poster = poster
 
-        # Create a text input for category (since Select can't be in Modal directly)
-        self.category_input = discord.ui.TextInput(
-            label="New Category",
-            placeholder=f"Currently: {current_cat}",
-            required=True,
-            max_length=50,
-            style=discord.TextStyle.short
+        # Build select options — all categories except the current one
+        options = [
+            discord.SelectOption(label=cat.title(), value=cat)
+            for cat in sorted(available_categories)
+            if cat != current_cat
+        ]
+
+        select = discord.ui.Select(
+            placeholder=f"Currently: {current_cat} — pick a new category",
+            options=options,
+            min_values=1,
+            max_values=1,
         )
-        self.add_item(self.category_input)
+        select.callback = self._on_select
+        self.add_item(select)
 
-    async def on_submit(self, modal_interaction: discord.Interaction):
-        """Handle modal submission"""
+    async def _on_select(self, select_interaction: discord.Interaction):
+        """Handle category selection"""
         try:
-            # Log immediately to confirm callback is reached
-            logger.debug(f"RecategorizeModal on_submit called for entry {self.entry_id}")
+            new_category = select_interaction.data["values"][0]
+            logger.debug(f"RecategorizeView selection: '{new_category}' for entry {self.entry_id}")
 
-            new_category = self.category_input.value.strip().lower()
-            logger.debug(f"New category input: '{new_category}', available: {self.available_categories}")
+            # Defer immediately — recategorization can take a moment
+            await select_interaction.response.defer(ephemeral=True)
 
-            # Validate the category
-            if new_category not in self.available_categories:
-                await modal_interaction.response.send_message(
-                    f"❌ Invalid category: `{new_category}`\n"
-                    f"Available categories: {', '.join(sorted(self.available_categories))}",
-                    ephemeral=True
-                )
-                return
-
-            # Check if it's the same category
-            if new_category == self.current_category:
-                await modal_interaction.response.send_message(
-                    f"⚠️ This entry is already in the **{new_category}** category.",
-                    ephemeral=True
-                )
-                return
-
-            # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
-            logger.debug("Deferring modal interaction response...")
-            await modal_interaction.response.defer(ephemeral=True)
-            logger.debug("Modal interaction deferred successfully")
-
-            # Check if the message has a thread before re-categorizing
             has_thread = self.message.thread is not None
-
-            # Parse source type from entry_id (e.g., "twitter_123" -> "twitter")
             source_type = self.entry_id.split('_')[0] if self.entry_id else None
 
             logger.info(
                 f"Re-categorizing entry {self.entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
             )
 
-            # Perform the re-categorization
             success, new_message_id, new_channel_id, error_msg = await self.poster.recategorize_entry(
                 message_id=self.message.id,
                 channel_id=self.message.channel.id,
                 new_category=new_category,
                 entry_id=self.entry_id,
                 content=self.entry_data.get('content', self.message.content),
-                media_files=None,  # Will download from original message
+                media_files=None,
                 video_urls=self.entry_data.get('video_urls', []),
                 source_type=source_type
             )
@@ -85,56 +64,34 @@ class RecategorizeModal(discord.ui.Modal, title="Re-categorize Entry"):
             if success:
                 success_msg = f"✅ Successfully re-categorized from **{self.current_category}** to **{new_category}**!\n"
                 success_msg += f"New message ID: {new_message_id}"
-
-                # Add note about thread preservation if applicable
                 if has_thread:
                     success_msg += "\n🧵 Thread with Perplexity content preserved!"
-
-                await modal_interaction.followup.send(
-                    success_msg,
-                    ephemeral=True
-                )
+                await select_interaction.followup.send(success_msg, ephemeral=True)
                 logger.info(f"Successfully re-categorized entry {self.entry_id} to {new_category}")
             else:
-                await modal_interaction.followup.send(
+                await select_interaction.followup.send(
                     f"❌ Failed to re-categorize: {error_msg}",
                     ephemeral=True
                 )
                 logger.error(f"Failed to re-categorize entry {self.entry_id}: {error_msg}")
 
+            # Disable the select after use so it can't be clicked again
+            self.children[0].disabled = True
+            await select_interaction.edit_original_response(view=self)
+
         except Exception as e:
-            logger.error(f"Error in RecategorizeModal on_submit: {e}", exc_info=True)
-            # Try to send error response
+            logger.error(f"Error in RecategorizeView _on_select: {e}", exc_info=True)
             try:
-                if modal_interaction.response.is_done():
-                    await modal_interaction.followup.send(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                if select_interaction.response.is_done():
+                    await select_interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
                 else:
-                    await modal_interaction.response.send_message(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                    await select_interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
             except Exception as followup_error:
                 logger.error(f"Failed to send error followup: {followup_error}")
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        """Handle errors in the modal"""
-        logger.error(f"RecategorizeModal error: {error}", exc_info=True)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"❌ An error occurred: {str(error)}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ An error occurred: {str(error)}",
-                    ephemeral=True
-                )
-        except Exception as e:
-            logger.error(f"Failed to send modal error message: {e}")
+    async def on_timeout(self):
+        """Disable the select when the view times out"""
+        self.children[0].disabled = True
 
 
 class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
