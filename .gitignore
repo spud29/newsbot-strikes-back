@@ -59,8 +59,12 @@ temp_media_serve/
 # Twitter authentication
 twitter_cookies.txt
 
-# Claude Code
-.claude/
+# Claude Code - commit settings.json and commands/, ignore local/private files
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+.claude/settings.local.json
+.claude/worktrees/
 
 # IDE
 .vscode/
