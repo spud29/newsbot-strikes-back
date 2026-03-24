@@ -337,7 +337,7 @@ class MediaHandler:
                 image_files = [f for f in media_files if os.path.splitext(f)[1].lower() in ['.jpg', '.jpeg', '.png', '.gif', '.webp']]
                 if image_files:
                     logger.debug(f"Running OCR on {len(image_files)} Telegram images...")
-                    ocr_text = self.ocr_handler.extract_text_from_images(image_files)
+                    ocr_text = await asyncio.to_thread(self.ocr_handler.extract_text_from_images, image_files)
                     if ocr_text:
                         logger.info(f"✓ OCR extracted {len(ocr_text)} characters from Telegram images")
             
