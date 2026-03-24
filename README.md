@@ -1,269 +1,191 @@
-# Discord News Aggregator Bot
+# newsbot-strikes-back
 
-A sophisticated Discord bot that aggregates content from Twitter (via RSS feeds) and Telegram channels, categorizes them using local AI (Ollama), detects duplicates, and posts to appropriate Discord channels with full media support.
+A Discord news aggregator bot that polls Twitter (via RSS) and Telegram channels, deduplicates stories using AI embeddings, categorizes content with a local Ollama LLM, and posts to the appropriate Discord channel with full media support.
 
 ## Features
 
-- 📰 **Multi-Source Aggregation**: Collects from Twitter RSS feeds and Telegram channels
-- 🤖 **AI Categorization**: Uses Ollama with gpt-oss:20b for intelligent content categorization
-- 🔍 **Duplicate Detection**: Employs embeddings and cosine similarity to prevent duplicate posts
-- 🖼️ **Full Media Support**: Downloads and repost images/videos from both Twitter and Telegram
-- 📊 **48-Hour Database**: Maintains a rolling window of processed content
-- 🐛 **Comprehensive Logging**: Debug-level logging for easy troubleshooting
+- **Multi-source aggregation** — Twitter RSS feeds and Telegram channels polled every 5 minutes
+- **AI categorization** — local Ollama LLM (`gpt-oss:20b`) assigns each entry to one of 12 categories
+- **Two-tier duplicate detection** — embedding cosine similarity with an LLM cross-check for borderline matches
+- **Full media support** — images and videos downloaded from both Twitter (gallery-dl) and Telegram (Telethon)
+- **OCR for image-only posts** — Tesseract extracts text from image-only Telegram entries
+- **Community moderation** — right-click context menu commands for voting, re-categorizing, and sourcing
+- **Feedback learning** — removed entries are fed back into the LLM prompt as negative examples
+- **Content cleaning** — emoji removal, wire-prefix stripping (JUST IN, BREAKING, etc.), URL resolution, ALL CAPS fix
+- **Retry queue** — gallery-dl failures are retried automatically across poll cycles
+- **Perplexity integration** — "Get More Info" command spawns a thread with web search context
 
 ## Requirements
 
 - Python 3.9+
-- [Ollama](https://ollama.ai/) running locally with models:
-  - `gpt-oss:20b` (for categorization)
-  - `nomic-embed-text` (for embeddings)
-- [gallery-dl](https://github.com/mikf/gallery-dl) (for Twitter media downloads)
+- [Ollama](https://ollama.ai/) running locally with:
+  - `gpt-oss:20b` (categorization)
+  - `nomic-embed-text` (embeddings)
+- [gallery-dl](https://github.com/mikf/gallery-dl) (Twitter media downloads)
+- [Tesseract](https://github.com/tesseract-ocr/tesseract) (OCR, optional but recommended)
 - Discord bot token
 - Telegram API credentials
+- Perplexity API key (optional — enables "Get More Info")
 
 ## Installation
 
-1. **Clone the repository** (or create the directory):
-```bash
-cd "C:\Users\spud9\OneDrive\Documents\newsbot strikes back"
-```
-
-2. **Install Python dependencies**:
+1. **Install Python dependencies:**
 ```bash
 pip install -r requirements.txt
 ```
 
-3. **Install gallery-dl**:
+2. **Install gallery-dl:**
 ```bash
 pip install gallery-dl
 ```
 
-4. **Install Ollama and pull required models**:
+3. **Pull Ollama models:**
 ```bash
-# Download from https://ollama.ai/
-# Then pull models:
 ollama pull gpt-oss:20b
 ollama pull nomic-embed-text
 ```
 
-5. **Create `.env` file** with your credentials:
+4. **Create a `.env` file** in the project root:
 ```env
-DISCORD_TOKEN=your_discord_bot_token_here
-TELEGRAM_API_ID=your_telegram_api_id_here
-TELEGRAM_API_HASH=your_telegram_api_hash_here
+DISCORD_TOKEN=your_discord_bot_token
+TELEGRAM_API_ID=your_telegram_api_id
+TELEGRAM_API_HASH=your_telegram_api_hash
+
+# Optional
+PERPLEXITY_API_KEY=your_perplexity_api_key
 ```
-
-## Configuration
-
-Edit `config.py` to customize:
-
-- RSS feed URLs
-- Discord channel IDs for each category
-- Telegram channels to monitor
-- Ollama models
-- System prompt for categorization
-- Duplicate detection threshold
-- Polling interval
 
 ## Usage
 
-1. **Ensure Ollama is running**:
 ```bash
-# Ollama should be running on http://localhost:11434
-```
-
-2. **Start the bot**:
-```bash
-python main.py
+python run_bot.py
 ```
 
 The bot will:
-- Poll RSS feeds and Telegram channels every 5 minutes
-- Download full content and media
-- Check for duplicates using embeddings
-- Categorize using AI
-- Post to appropriate Discord channels
-- Log all activities to `bot.log` and console
+1. Poll all RSS feeds and Telegram channels every 5 minutes
+2. Clean content (HTML, emojis, wire prefixes, shortened URLs)
+3. Generate an embedding and check for duplicates/similar stories
+4. Download media (images, videos) via gallery-dl or Telethon
+5. Run OCR on image-only posts
+6. Categorize with the Ollama LLM
+7. Post to the matching Discord channel with media attached
+8. Store the embedding and message mapping in SQLite
 
-## Web Dashboard (Optional)
+## Configuration
 
-A web-based monitoring and management dashboard is available:
+All settings live in `config.py`. Key options:
 
-**Features:**
-- Real-time bot and Ollama status monitoring
-- View recent activity and processing statistics
-- Browse and filter error logs
-- Test content categorization manually
-- View configuration and manage database
-- Search, export, and reset database entries
-
-**Quick Start:**
-```bash
-# Install dashboard dependencies
-pip install fastapi uvicorn jinja2 python-multipart
-
-# Add to .env file:
-# DASHBOARD_USERNAME=admin
-# DASHBOARD_PASSWORD=your_secure_password
-
-# Run dashboard (in separate terminal while bot is running)
-uvicorn dashboard:app --reload --port 8000
-
-# Access at: http://localhost:8000
-```
-
-**Documentation:**
-- See `DASHBOARD.md` for full documentation
-- See `DASHBOARD_QUICKSTART.md` for quick setup guide
+| Setting | Default | Description |
+|---|---|---|
+| `PAUSE_MODE` | `True` | Routes everything to the `ignore` channel |
+| `POLL_INTERVAL` | `300` | Seconds between poll cycles |
+| `DUPLICATE_THRESHOLD` | `0.95` | Cosine similarity for exact duplicate rejection |
+| `SIMILARITY_THRESHOLD` | `0.60` | Cosine similarity that triggers LLM cross-check |
+| `DB_RETENTION_HOURS` | `48` | How long processed entries are retained |
+| `DISCORD_FILE_SIZE_LIMIT_MB` | `25` | Max attachment size |
+| `OCR_ENABLED` | `True` | Tesseract OCR for image-only posts |
+| `FEEDBACK_LEARNING_ENABLED` | `True` | Inject removed entries into LLM prompt |
+| `NOT_VALUABLE_VOTES_REQUIRED` | `2` | Votes needed to auto-remove a post |
 
 ## Categories
 
-The bot can categorize content into:
-- crypto
-- politics
-- stocks
-- artificial intelligence
-- video games
-- sports
-- food
-- technology
-- music
-- fashion
-- ignore (default for unclear content)
+Content is categorized into one of:
 
-## Discord Channels
+`crypto` · `politics` · `stocks` · `artificial intelligence` · `video games` · `sports` · `food` · `technology` · `music` · `fashion` · `pop culture` · `ignore`
 
-Configure your Discord channel IDs in `config.py`:
-```python
-DISCORD_CHANNELS = {
-    "crypto": 1317592423962251275,
-    "politics": 1317592486927007784,
-    # ... etc
-}
-```
+Each category maps to a Discord channel ID in `config.DISCORD_CHANNELS`.
 
-## RSS Feeds
+## Discord Context Menu Commands
 
-Currently configured Twitter RSS feeds:
-- unusual_whales
-- dexerto_twitter
-- solana_floor
-- quiver_quant
-- degenerate_news
-- watcher_guru
-- newswire
+Users right-click a bot message and go to **Apps** to access:
 
-## Telegram Channels
+| Command | Access | Description |
+|---|---|---|
+| **Get More Info** | Everyone | Spawns a thread with Perplexity web search results |
+| **Not Valuable** | Everyone | Casts a removal vote; auto-deletes at threshold |
+| **Re-categorize** | Allowlisted users | Moves a post to a different category channel |
+| **Source** | Everyone | Shows the original Telegram/Twitter URL |
 
-Currently monitored Telegram channels:
-- Fin_Watch
-- news_crypto
-- drops_analytics
-- joescrypt
-- unfolded
-- unfolded_defi
-- infinityhedge
+## Sources
 
-## File Structure
+**Twitter RSS feeds:** unusual_whales, dexerto_twitter, solana_floor, quiver_quant, degenerate_news, watcher_guru, newswire
+
+**Telegram channels:** Fin_Watch, news_crypto, drops_analytics, joescrypt, unfolded, unfolded_defi, infinityhedge
+
+Add new sources in `config.py` under `RSS_FEEDS` or `TELEGRAM_CHANNELS`.
+
+## Project Structure
 
 ```
-newsbot strikes back/
-├── main.py                     # Main bot orchestrator
-├── config.py                   # Configuration and credentials
-├── database.py                 # JSON database management
-├── ollama_client.py           # AI categorization and embeddings
-├── rss_poller.py              # RSS feed polling
-├── telegram_poller.py         # Telegram channel monitoring
-├── media_handler.py           # Media downloads
-├── discord_poster.py          # Discord posting
-├── utils.py                   # Utilities and logging
-├── requirements.txt           # Python dependencies
-├── README.md                  # This file
-├── .env                       # Credentials (create this)
-├── bot.log                    # Log file (auto-generated)
+newsbot-strikes-back/
+├── main.py                 # Bot orchestrator and entry processing pipeline
+├── config.py               # All configuration and feature flags
+├── run_bot.py              # Bot launcher
+├── utils.py                # Logging, retry decorator, text cleaning helpers
+├── db_connection.py        # Singleton SQLite connection (WAL mode)
+├── database.py             # Processed IDs, embeddings cache, message mapping
+├── removed_entries.py      # Voted-out entries store; feedback learning
+├── retry_queue.py          # gallery-dl failure retry across poll cycles
+├── rss_poller.py           # Twitter RSS feed parser (feedparser)
+├── telegram_poller.py      # Telethon client: real-time events + polling
+├── ollama_client.py        # Categorization, embeddings, similarity verification
+├── perplexity_client.py    # "Get More Info" web search via Perplexity API
+├── ocr_handler.py          # Tesseract OCR for image-only posts
+├── media_handler.py        # gallery-dl (Twitter) + Telethon (Telegram) downloads
+├── discord_poster.py       # Re-export shim for discord_messaging
+├── discord_messaging.py    # DiscordPoster: post_message, edit_message
+├── discord_commands.py     # Context menu command registration and handlers
+├── discord_ui.py           # RecategorizeModal (discord.py UI)
+├── migrate_to_sqlite.py    # One-time migration from legacy JSON → SQLite
+├── requirements.txt
+├── .env                    # Credentials (not committed)
 └── data/
-    ├── processed_ids.json     # Processed entry IDs
-    └── embeddings_cache.json  # Cached embeddings
+    └── newsbot.db          # SQLite database (auto-created)
 ```
 
-## Logging
+## Database
 
-The bot logs to both console and `bot.log` file with debug-level detail:
-- Feed/channel polling activities
-- Entry processing steps
-- Duplicate detection results
-- Media downloads
-- Discord posts
-- Errors with full stack traces
-- Cycle summary statistics
+SQLite database at `data/newsbot.db` with WAL mode enabled. Key tables:
 
-## Error Handling
+- **processed_ids** — tracks which entry IDs have been fully processed
+- **embeddings** — content embeddings for duplicate detection (loaded into memory at startup)
+- **message_mapping** — maps source entries to Discord messages (for edits, Source command)
+- **votes** — tracks user votes on Discord messages
+- **removed_entries** — stores voted-out entries for feedback learning
+- **retry_queue** — gallery-dl failures queued for retry
+- **last_message_ids** — last Telegram message ID seen per channel
 
-All operations use retry with exponential backoff:
-1. First attempt fails → wait 2s, retry
-2. Second attempt fails → wait 4s, retry
-3. Third attempt fails → wait 8s, retry
-4. After 3 retries → log error, skip item, continue
+Entries older than `DB_RETENTION_HOURS` (48h) are automatically cleaned up.
 
-## Database Management
+## Content Cleaning Pipeline
 
-- **processed_ids.json**: Tracks processed Twitter/Telegram IDs with timestamps
-- **embeddings_cache.json**: Stores content embeddings for duplicate detection
-- Both databases automatically clean up entries older than 48 hours
+Each entry passes through these text processing steps before posting:
 
-## Media Handling
-
-**Twitter**:
-- Uses gallery-dl to fetch full tweet text and all media
-- Downloads images and videos
-- Video URLs are hidden in Discord messages using markdown: `[.](video_url)`
-
-**Telegram**:
-- Uses Telethon to download images and videos
-- Handles media albums as single posts
-- Downloads all media types
+1. HTML tag removal and entity decoding
+2. Shortened URL resolution
+3. Emoji removal
+4. Corrupted emoji mark cleanup
+5. **Wire-prefix stripping** — removes `JUST IN:`, `BREAKING:`, `NEW:`, etc.
+6. Telegram formatting removal / Twitter attribution removal
+7. ALL CAPS fix (optional, via Ollama)
 
 ## Duplicate Detection
 
-Uses cosine similarity on embeddings:
-- Threshold: 0.65 (configurable)
-- Prevents posting the same story from multiple sources
-- Logs similarity scores for debugging
+Two-tier system using `nomic-embed-text` embeddings:
 
-## Tips
+1. **Exact duplicate** (similarity >= 0.95) — silently dropped
+2. **Similar story** (similarity >= 0.60) — LLM verifies whether it's truly the same story before dropping
 
-1. **First Run**: The bot may take longer on first run as it processes existing backlog
-2. **Ollama Performance**: Ensure Ollama has enough resources (RAM/GPU) for smooth operation
-3. **Discord File Size**: Files larger than 8MB are automatically skipped
-4. **Rate Limits**: 5-minute polling interval prevents rate limiting
-5. **Telegram Session**: First run will create `newsbot_session.session` file (keep this safe)
+This prevents both exact reposts and the same story from multiple sources, while allowing legitimately similar but distinct stories through.
+
+## Error Handling
+
+All external calls use `retry_with_backoff` (2s → 4s → 8s). gallery-dl failures are queued in the retry table and retried on subsequent poll cycles.
 
 ## Troubleshooting
 
-**Bot won't start**:
-- Check `.env` file has correct credentials
-- Verify Ollama is running: `curl http://localhost:11434/api/tags`
-- Ensure required models are pulled
-
-**No posts appearing**:
-- Check bot has permissions in Discord channels
-- Review `bot.log` for errors
-- Verify feed URLs are still active
-
-**Duplicate posts**:
-- Adjust `DUPLICATE_THRESHOLD` in `config.py`
-- Check embeddings are being generated correctly in logs
-
-**Media not downloading**:
-- Ensure gallery-dl is installed: `gallery-dl --version`
-- Check Telegram session is authenticated
-- Verify sufficient disk space in temp folder
-
-## License
-
-This project is provided as-is for personal use.
-
-## Support
-
-Check logs in `bot.log` for detailed debugging information. All operations are logged with timestamps and context.
-
+- **Bot won't start** — check `.env` credentials; verify Ollama is running (`curl http://localhost:11434/api/tags`)
+- **No posts appearing** — check `PAUSE_MODE` in config.py (routes everything to ignore when True); check bot permissions in Discord
+- **Duplicate posts** — adjust `DUPLICATE_THRESHOLD` / `SIMILARITY_THRESHOLD` in config.py
+- **Media not downloading** — verify `gallery-dl --version`; check Telegram session is authenticated
+- **Logs** — all output goes to `bot.log` and stdout at DEBUG level

@@ -425,6 +425,42 @@ def remove_corrupted_emoji_marks(text):
     
     return text
 
+def strip_wire_prefixes(text):
+    """
+    Remove wire-service style prefix labels from the start of content.
+    These add no information and clutter Discord posts.
+
+    Examples:
+        "JUST IN: Bitcoin hits $71,000" -> "Bitcoin hits $71,000"
+        "JUST IN : Bitcoin hits $70,000" -> "Bitcoin hits $70,000"
+        "BREAKING: Google says a new iOS..." -> "Google says a new iOS..."
+        "NEW: @Yield expands to @solana..." -> "@Yield expands to @solana..."
+        "NEW : FBI and Thai police seized..." -> "FBI and Thai police seized..."
+
+    Args:
+        text: Text potentially starting with a wire-service prefix
+
+    Returns:
+        str: Text with prefix removed
+    """
+    if not text:
+        return text
+
+    import re
+
+    # Match common wire-service prefixes at the start of text
+    # Handles optional space before colon: "JUST IN:" and "JUST IN :"
+    text = re.sub(
+        r'^(JUST IN|BREAKING|NEW|DEVELOPING|EXCLUSIVE|ALERT|FLASH|URGENT|UPDATE|REPORT|WATCH|LIVE|SCOOP|HAPPENING NOW)\s*:\s*',
+        '',
+        text
+    )
+
+    text = text.strip()
+
+    return text
+
+
 def format_quote_tweets(text):
     """
     Detect and reformat quote-tweet content from gallery-dl output.
