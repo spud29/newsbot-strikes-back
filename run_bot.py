@@ -2,7 +2,6 @@
 Bot Launcher Script
 
 Run this script to start the Discord News Aggregator Bot.
-The dashboard should be run separately using run_dashboard.py
 """
 import asyncio
 import sys

@@ -64,7 +64,7 @@ class NewsAggregatorBot:
         """Start the bot"""
         logger.info("Starting bot...")
         
-        # Write PID file for dashboard management
+        # Write PID file
         pid_file = os.path.join("data", "bot.pid")
         try:
             os.makedirs("data", exist_ok=True)

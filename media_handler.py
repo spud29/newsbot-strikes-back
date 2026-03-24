@@ -397,7 +397,7 @@ class MediaHandler:
     def cleanup_entry_media(self, entry):
         """
         Clean up temporary media files for an entry (only if older than 2 days)
-        Media files are kept for 2 days to allow viewing in dashboard
+        Media files are kept for 2 days before cleanup
         
         Args:
             entry: Entry dictionary with download_dir
