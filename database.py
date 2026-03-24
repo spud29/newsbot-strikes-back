@@ -162,7 +162,7 @@ class Database:
     def find_similar(self, embedding, threshold=None):
         """
         Find similar embeddings above threshold using cosine similarity.
-        Kept for backward compatibility (used by dashboard and other callers).
+        Kept for backward compatibility.
 
         Args:
             embedding: Embedding vector to compare

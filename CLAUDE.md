@@ -11,9 +11,6 @@ This file provides context for AI assistants (Claude Code and others) working on
 2. Deduplicates stories using embedding-based cosine similarity
 3. Categorizes content using a local Ollama LLM
 4. Posts to the appropriate Discord channel with media attachments
-5. Exposes a FastAPI web dashboard for monitoring and administration
-
-The system runs as two independent processes: the bot (`run_bot.py`) and the dashboard (`run_dashboard.py`).
 
 ---
 
@@ -24,7 +21,6 @@ newsbot-strikes-back/
 ├── main.py                 # NewsAggregatorBot orchestrator — start here
 ├── config.py               # All configuration and feature flags
 ├── run_bot.py              # Bot launcher (calls main.py)
-├── run_dashboard.py        # Dashboard launcher (uvicorn + optional ngrok)
 ├── utils.py                # Logging setup, retry_with_backoff decorator, helpers
 │
 ├── db_connection.py        # Singleton SQLite connection + table creation
@@ -44,20 +40,6 @@ newsbot-strikes-back/
 ├── discord_messaging.py    # DiscordPoster class: post_message, edit_message
 ├── discord_commands.py     # Context menu command registration & handlers
 ├── discord_ui.py           # RecategorizeModal (discord.py UI)
-│
-├── dashboard.py            # FastAPI app with all web routes (79 KB)
-├── templates/              # Jinja2 HTML templates for dashboard
-│   ├── base.html
-│   ├── index.html          # Main status page
-│   ├── database.html       # Browse/search DB entries
-│   ├── config.html         # View live config
-│   ├── logs.html           # Tail bot.log
-│   ├── manual.html         # Manually submit content
-│   ├── sources.html        # Feed/channel status
-│   └── removed.html        # Voted-out entries
-├── static/
-│   ├── style.css
-│   └── script.js
 │
 ├── migrate_to_sqlite.py    # One-time migration from JSON files → SQLite
 ├── notion_uploader.py      # Optional Notion integration (unused in main flow)
@@ -82,7 +64,6 @@ newsbot-strikes-back/
 | Language | Python 3.9+ |
 | Discord API | discord.py ≥ 2.3.2 |
 | Telegram API | Telethon ≥ 1.34.0 |
-| Web dashboard | FastAPI + Uvicorn + Jinja2 |
 | RSS parsing | feedparser |
 | Local AI | Ollama (HTTP API at `http://localhost:11434`) |
 | Embeddings | `nomic-embed-text` via Ollama |
@@ -111,12 +92,7 @@ TELEGRAM_API_HASH=your_telegram_api_hash
 # Optional — enables Perplexity "Get More Info" command
 PERPLEXITY_API_KEY=your_perplexity_api_key
 
-# Optional — enables dashboard authentication
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=your_secure_password
 ```
-
-If `DASHBOARD_PASSWORD` is unset, the dashboard logs a warning and is inaccessible.
 
 ---
 
@@ -147,15 +123,6 @@ python run_bot.py
 # or equivalently
 python main.py
 ```
-
-### Start the Dashboard (separate terminal)
-
-```bash
-python run_dashboard.py
-# Access at: http://localhost:8000
-```
-
-The dashboard launcher also attempts to start an `ngrok` tunnel for remote access (check `http://127.0.0.1:4040`). ngrok is optional.
 
 ### Logs
 
@@ -428,7 +395,6 @@ finally:
 | `discord_ui.py` | `RecategorizeModal` | Re-categorize modal dialog |
 | `removed_entries.py` | `RemovedEntriesDB` | Store & query voted-out entries; AI feedback |
 | `retry_queue.py` | `RetryQueue` | gallery-dl failure retry across cycles |
-| `dashboard.py` | FastAPI `app` | Web UI routes and API endpoints |
 
 ---
 
@@ -465,13 +431,9 @@ TELEGRAM_CHANNELS = [
 
 Set `PAUSE_MODE = True` in `config.py`. All entries are processed but routed to the `ignore` channel. The original AI category is preserved in the reasoning field.
 
-### Test AI Categorization Manually
-
-Use the dashboard's **Manual Processing** page (`/manual`) to submit content and see how the AI categorizes it without posting to Discord.
-
 ### Reset/Clear the Database
 
-Via the dashboard at `/database` — there is a Reset button. Or delete `data/newsbot.db` and restart the bot (all state is lost).
+Delete `data/newsbot.db` and restart the bot (all state is lost).
 
 ---
 
@@ -484,7 +446,6 @@ Via the dashboard at `/database` — there is a Reset button. Or delete `data/ne
 | `data/bot.pid` | Auto-written PID file |
 | `bot.log` | Auto-generated log file |
 | `temp_media/` | Ephemeral download directory |
-| `temp_media_serve/` | Dashboard media serving directory |
 | `*.session` | Telegram session files; contain credentials |
 
 ---
@@ -498,7 +459,7 @@ Key patterns in `.gitignore`:
 - `*.log`, `bot.log`
 - `newsbot.db*` (including WAL files)
 - `data/*.json` (runtime state files)
-- `temp_media/`, `temp_media_serve/`
+- `temp_media/`
 - `*.session*` (Telegram session)
 - `twitter_cookies.txt`
 - `.vscode/`, `.idea/`
@@ -514,7 +475,6 @@ The repo has many markdown files documenting individual features:
 | `README.md` | User-facing overview, setup, troubleshooting |
 | `SETUP.md` | Step-by-step installation guide |
 | `PROJECT_SUMMARY.md` | Technical architecture summary |
-| `DASHBOARD.md` / `DASHBOARD_QUICKSTART.md` | Web dashboard setup |
 | `DISCORD_SETUP.md` | Discord bot creation and permissions |
 | `TWITTER_AUTHENTICATION_SETUP.md` | gallery-dl Twitter auth |
 | `CONTEXT_MENU_MIGRATION.md` | Why buttons were replaced with context menus |
@@ -523,8 +483,6 @@ The repo has many markdown files documenting individual features:
 | `RECATEGORIZE_IGNORE_IMPLEMENTATION.md` | Re-categorize command |
 | `RETRY_MECHANISM.md` | gallery-dl retry queue |
 | `URL_TRACKING_FEATURE.md` | Source URL tracking |
-| `SEPARATE_PROCESSES_GUIDE.md` | Running bot and dashboard independently |
-| `REMOTE_ACCESS_GUIDE.md` | ngrok remote access |
 
 ---
 
