@@ -26,7 +26,6 @@ from discord_poster import DiscordPoster
 from media_handler import MediaHandler
 from telegram_poller import TelegramPoller
 from retry_queue import RetryQueue
-from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
 import config
 from utils import logger
@@ -60,12 +59,10 @@ if not DASHBOARD_PASSWORD:
 
 # Initialize shared components
 db = Database()
-vote_tracker = VoteTracker()
 removed_entries_db = RemovedEntriesDB()
 ollama = OllamaClient(removed_entries_db=removed_entries_db)
 discord_poster = DiscordPoster(
     database=db,
-    vote_tracker=vote_tracker,
     removed_entries_db=removed_entries_db
 )
 media_handler = MediaHandler()

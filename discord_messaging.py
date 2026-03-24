@@ -11,7 +11,6 @@ import aiohttp
 import tempfile
 from utils import logger, retry_with_backoff, ensure_url_on_own_line
 import config
-from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
 from discord_commands import register_commands
 
@@ -19,14 +18,13 @@ from discord_commands import register_commands
 class DiscordPoster:
     """Posts messages to Discord channels with context menu command support"""
 
-    def __init__(self, perplexity_client=None, database=None, vote_tracker=None, removed_entries_db=None):
+    def __init__(self, perplexity_client=None, database=None, removed_entries_db=None):
         """
         Initialize Discord client with app commands support
 
         Args:
             perplexity_client: Optional PerplexityClient instance for search commands
             database: Optional Database instance for entry removal
-            vote_tracker: Optional VoteTracker instance
             removed_entries_db: Optional RemovedEntriesDB instance
         """
         intents = discord.Intents.default()
@@ -43,9 +41,8 @@ class DiscordPoster:
         self._client_task = None
         self.perplexity_client = perplexity_client
 
-        # Initialize vote tracking and removed entries if not provided
+        # Initialize database and removed entries if not provided
         self.database = database
-        self.vote_tracker = vote_tracker if vote_tracker else VoteTracker()
         self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
 
         self.reprocess_callback = None  # Set by NewsAggregatorBot.start()

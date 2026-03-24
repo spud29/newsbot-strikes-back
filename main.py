@@ -18,7 +18,6 @@ from media_handler import MediaHandler, GalleryDlFailure
 from discord_poster import DiscordPoster
 from retry_queue import RetryQueue
 from perplexity_client import PerplexityClient
-from vote_tracker import VoteTracker
 from removed_entries import RemovedEntriesDB
 from ocr_handler import is_tradingview_chart_ocr
 
@@ -32,7 +31,6 @@ class NewsAggregatorBot:
         logger.info("=" * 80)
         
         self.db = Database()
-        self.vote_tracker = VoteTracker()
         self.removed_entries_db = RemovedEntriesDB()
         self.ollama = OllamaClient(removed_entries_db=self.removed_entries_db)
         self.perplexity = PerplexityClient()
@@ -42,7 +40,6 @@ class NewsAggregatorBot:
         self.discord_poster = DiscordPoster(
             perplexity_client=self.perplexity,
             database=self.db,
-            vote_tracker=self.vote_tracker,
             removed_entries_db=self.removed_entries_db
         )
         self.retry_queue = RetryQueue(max_retries=3, retry_delay_cycles=2)
@@ -214,57 +211,50 @@ class NewsAggregatorBot:
                 # Wrapped in asyncio.to_thread() to prevent blocking Discord interactions
                 logger.debug("Generating embedding for duplicate check...")
                 embedding = await asyncio.to_thread(self.ollama.generate_embedding, content)
-                
-                # Check for exact duplicates BEFORE downloading media
-                is_duplicate, duplicate_similarity, match_preview, _ = self.db.find_similar(
-                    embedding, 
-                    threshold=config.DUPLICATE_THRESHOLD
-                )
-                
-                # Store duplicate info to override category later (same pattern as similarity_info)
+
+                # Single-pass similarity scan: check both duplicate and similarity thresholds at once
+                best_similarity, match_preview, match_content = self.db.find_best_match(embedding)
+
+                # Classify the best match against both thresholds
                 duplicate_info = None
-                if is_duplicate:
+                if best_similarity >= config.DUPLICATE_THRESHOLD:
                     logger.info(
-                        f"Exact duplicate detected (similarity: {duplicate_similarity:.3f}): {entry_id}\n"
+                        f"Exact duplicate detected (similarity: {best_similarity:.3f}): {entry_id}\n"
                         f"Matches: {match_preview}"
                     )
                     self.stats['duplicates'] += 1
                     duplicate_info = {
-                        'similarity': duplicate_similarity,
+                        'similarity': best_similarity,
                         'match_preview': match_preview
                     }
-                
-                # Check for similar content (not exact duplicate)
-                is_similar, similar_similarity, similar_preview, similar_full_content = self.db.find_similar(
-                    embedding,
-                    threshold=config.SIMILARITY_THRESHOLD
-                )
-                
+
                 similarity_info = None
-                if is_similar and not is_duplicate:
+                is_similar = best_similarity >= config.SIMILARITY_THRESHOLD
+                similar_full_content = match_content
+                if is_similar and not duplicate_info:
                     # LLM verification: ask the AI if these are truly the same story,
                     # not just broadly similar topics (e.g. two different political headlines)
                     logger.info(
-                        f"Embedding similarity detected ({similar_similarity:.3f}), verifying with LLM..."
+                        f"Embedding similarity detected ({best_similarity:.3f}), verifying with LLM..."
                     )
                     is_truly_similar = await asyncio.to_thread(
                         self.ollama.verify_similarity, content, similar_full_content
                     )
-                    
+
                     if is_truly_similar:
                         similarity_info = {
-                            'similarity': similar_similarity,
-                            'match_preview': similar_preview
+                            'similarity': best_similarity,
+                            'match_preview': match_preview
                         }
                         logger.info(
-                            f"Similar content CONFIRMED by LLM (similarity: {similar_similarity:.3f}): {entry_id}\n"
-                            f"Matches: {similar_preview}"
+                            f"Similar content CONFIRMED by LLM (similarity: {best_similarity:.3f}): {entry_id}\n"
+                            f"Matches: {match_preview}"
                         )
                     else:
                         logger.info(
                             f"LLM says DIFFERENT story despite embedding similarity "
-                            f"({similar_similarity:.3f}): {entry_id}\n"
-                            f"Would have matched: {similar_preview}"
+                            f"({best_similarity:.3f}): {entry_id}\n"
+                            f"Would have matched: {match_preview}"
                         )
                 
                 # Download media (for both new and similar entries)
@@ -386,10 +376,11 @@ class NewsAggregatorBot:
                 
                 if success:
                     # Mark as processed and store embedding
-                    # Use combined content with OCR text for better duplicate detection in future
                     self.db.mark_processed(entry_id)
-                    if ocr_text:
-                        # Store embedding with OCR text included for better future duplicate detection
+                    if ocr_text and combined_content != content:
+                        # OCR added new text beyond the base content — regenerate embedding
+                        # for better future duplicate detection with OCR context included.
+                        # (Skips the extra Ollama call when content IS the OCR text, e.g. image-only entries)
                         combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
                         self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
                     else:
@@ -598,7 +589,7 @@ class NewsAggregatorBot:
         # Poll RSS feeds
         try:
             logger.info("\n--- Polling RSS feeds ---")
-            rss_entries = self.rss_poller.poll_all_feeds()
+            rss_entries = await asyncio.to_thread(self.rss_poller.poll_all_feeds)
             all_entries.extend(rss_entries)
         except Exception as e:
             logger.error(f"Error polling RSS feeds: {e}")

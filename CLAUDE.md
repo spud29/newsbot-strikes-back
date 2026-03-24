@@ -29,7 +29,6 @@ newsbot-strikes-back/
 │
 ├── db_connection.py        # Singleton SQLite connection + table creation
 ├── database.py             # Database class: processed_ids, embeddings, message_mapping
-├── vote_tracker.py         # Tracks "Not Valuable" votes per Discord message
 ├── removed_entries.py      # Stores voted-out entries; provides feedback examples
 ├── retry_queue.py          # Retries gallery-dl failures across poll cycles
 │
@@ -427,7 +426,6 @@ finally:
 | `discord_messaging.py` | `DiscordPoster` | `post_message`, `edit_message`, Discord client lifecycle |
 | `discord_commands.py` | `register_commands` | All four context menu commands |
 | `discord_ui.py` | `RecategorizeModal` | Re-categorize modal dialog |
-| `vote_tracker.py` | `VoteTracker` | Per-message vote counting |
 | `removed_entries.py` | `RemovedEntriesDB` | Store & query voted-out entries; AI feedback |
 | `retry_queue.py` | `RetryQueue` | gallery-dl failure retry across cycles |
 | `dashboard.py` | FastAPI `app` | Web UI routes and API endpoints |

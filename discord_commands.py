@@ -99,7 +99,7 @@ def register_commands(poster):
 
     Args:
         poster: DiscordPoster instance (provides .tree, .client,
-                .perplexity_client, .database, .vote_tracker, .removed_entries_db)
+                .perplexity_client, .database, .removed_entries_db)
     """
 
     def extract_message_text(message: discord.Message) -> str:
