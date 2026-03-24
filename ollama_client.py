@@ -109,18 +109,19 @@ class OllamaClient:
                 exclusion_note = f"\n\nIMPORTANT: Do NOT categorize this content as any of the following: {', '.join(exclude_categories)}. Choose the next most appropriate category."
                 system_prompt += exclusion_note
             
-            # Prepare the prompt - request JSON with category and reasoning
+            # Prepare the user prompt (content + response format instruction)
             prompt = (
-                f"{system_prompt}\n\n"
                 f"Content to categorize:\n{content}\n\n"
                 f"Respond with ONLY valid JSON: {{\"category\": \"<name>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
             )
-            
-            # Call Ollama API
+
+            # Call Ollama API — use separate 'system' field so Ollama can reuse
+            # KV cache for the system prompt across consecutive categorize calls
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json={
                     "model": self.categorization_model,
+                    "system": system_prompt,
                     "prompt": prompt,
                     "stream": False,
                     "options": {

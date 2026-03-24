@@ -3,6 +3,8 @@ RSS feed poller for Twitter feeds
 """
 import feedparser
 import re
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils import logger, retry_with_backoff, extract_urls_from_html, clean_text_content, remove_twitter_attribution
 import config
 
@@ -178,24 +180,38 @@ class RSSPoller:
     
     def poll_all_feeds(self):
         """
-        Poll all configured RSS feeds
-        
+        Poll all configured RSS feeds in parallel using a thread pool.
+
+        Sets a 30-second socket timeout to prevent feedparser.parse() from
+        hanging indefinitely on unresponsive feeds. Each feed is polled in
+        its own thread so total time is max-of-all-feeds instead of sum.
+
         Returns:
             list: Combined list of all entries from all feeds
         """
         logger.info(f"Polling {len(self.feeds)} RSS feeds...")
-        
+
+        # Protect against dead feeds hanging the bot indefinitely
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(30)
+
         all_entries = []
-        
-        for feed_name, feed_url in self.feeds.items():
-            try:
-                entries = self.poll_feed(feed_name, feed_url)
-                all_entries.extend(entries)
-            except Exception as e:
-                logger.error(f"Failed to poll feed {feed_name}: {e}")
-                # Continue with other feeds
-                continue
-        
+        try:
+            with ThreadPoolExecutor(max_workers=len(self.feeds)) as executor:
+                futures = {
+                    executor.submit(self.poll_feed, name, url): name
+                    for name, url in self.feeds.items()
+                }
+                for future in as_completed(futures):
+                    feed_name = futures[future]
+                    try:
+                        entries = future.result(timeout=35)
+                        all_entries.extend(entries)
+                    except Exception as e:
+                        logger.error(f"Failed to poll feed {feed_name}: {e}")
+        finally:
+            socket.setdefaulttimeout(old_timeout)
+
         logger.info(f"Total RSS entries collected: {len(all_entries)}")
         return all_entries
 

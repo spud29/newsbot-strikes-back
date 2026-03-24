@@ -6,6 +6,8 @@ import time
 import os
 import shutil
 import sys
+import asyncio
+import inspect
 from functools import wraps
 from pathlib import Path
 
@@ -47,38 +49,67 @@ logger = setup_logging()
 
 def retry_with_backoff(max_retries=3, initial_delay=2):
     """
-    Decorator for retrying functions with exponential backoff
-    
+    Decorator for retrying functions with exponential backoff.
+    Automatically detects async functions and uses await/asyncio.sleep
+    instead of blocking time.sleep.
+
     Args:
         max_retries: Maximum number of retry attempts
         initial_delay: Initial delay in seconds (doubles on each retry)
     """
     def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            delay = initial_delay
-            last_exception = None
-            
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_exception = e
-                    if attempt < max_retries:
-                        logger.warning(
-                            f"Attempt {attempt + 1}/{max_retries + 1} failed for {func.__name__}: {e}. "
-                            f"Retrying in {delay}s..."
-                        )
-                        time.sleep(delay)
-                        delay *= 2
-                    else:
-                        logger.error(
-                            f"All {max_retries + 1} attempts failed for {func.__name__}: {e}",
-                            exc_info=True
-                        )
-            
-            raise last_exception
-        return wrapper
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                delay = initial_delay
+                last_exception = None
+
+                for attempt in range(max_retries + 1):
+                    try:
+                        return await func(*args, **kwargs)
+                    except Exception as e:
+                        last_exception = e
+                        if attempt < max_retries:
+                            logger.warning(
+                                f"Attempt {attempt + 1}/{max_retries + 1} failed for {func.__name__}: {e}. "
+                                f"Retrying in {delay}s..."
+                            )
+                            await asyncio.sleep(delay)
+                            delay *= 2
+                        else:
+                            logger.error(
+                                f"All {max_retries + 1} attempts failed for {func.__name__}: {e}",
+                                exc_info=True
+                            )
+
+                raise last_exception
+            return async_wrapper
+        else:
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                delay = initial_delay
+                last_exception = None
+
+                for attempt in range(max_retries + 1):
+                    try:
+                        return func(*args, **kwargs)
+                    except Exception as e:
+                        last_exception = e
+                        if attempt < max_retries:
+                            logger.warning(
+                                f"Attempt {attempt + 1}/{max_retries + 1} failed for {func.__name__}: {e}. "
+                                f"Retrying in {delay}s..."
+                            )
+                            time.sleep(delay)
+                            delay *= 2
+                        else:
+                            logger.error(
+                                f"All {max_retries + 1} attempts failed for {func.__name__}: {e}",
+                                exc_info=True
+                            )
+
+                raise last_exception
+            return wrapper
     return decorator
 
 def cleanup_temp_files(temp_dir):

@@ -29,15 +29,22 @@ class Database:
         logger.info(f"Database initialized: {processed_count} processed IDs, {embeddings_count} embeddings, {mapping_count} message mappings")
     
     def _load_embeddings_cache(self):
-        """Load all embeddings from SQLite into memory for fast similarity search"""
+        """Load all embeddings from SQLite into memory for fast similarity search.
+        Pre-converts to numpy arrays and pre-computes L2 norms to avoid
+        repeated conversion and norm calculation during find_best_match()."""
         rows = self.conn.execute(
             "SELECT content_hash, embedding, timestamp, preview, content, entry_id FROM embeddings"
         ).fetchall()
-        
+
         self._embeddings_cache = {}
         for row in rows:
+            embedding_list = json.loads(row['embedding'])
+            embedding_np = np.array(embedding_list)
+            norm = np.linalg.norm(embedding_np)
             self._embeddings_cache[row['content_hash']] = {
-                'embedding': json.loads(row['embedding']),
+                'embedding': embedding_list,
+                'embedding_np': embedding_np,
+                'norm': norm,
                 'timestamp': row['timestamp'],
                 'preview': row['preview'],
                 'content': row['content'],
@@ -98,9 +105,13 @@ class Database:
         )
         self.conn.commit()
         
-        # Keep in-memory cache in sync
+        # Keep in-memory cache in sync (pre-compute numpy array and norm)
+        embedding_np = np.array(embedding_list)
+        norm = np.linalg.norm(embedding_np)
         self._embeddings_cache[content_hash] = {
             'embedding': embedding_list,
+            'embedding_np': embedding_np,
+            'norm': norm,
             'timestamp': now,
             'preview': preview,
             'content': content,
@@ -110,6 +121,44 @@ class Database:
         logger.debug(f"Stored embedding for: {content[:50]}...")
         return content_hash
     
+    def find_best_match(self, embedding):
+        """
+        Single-pass scan over all cached embeddings to find the best match.
+        Returns the highest cosine similarity and its metadata so the caller
+        can check against both DUPLICATE_THRESHOLD and SIMILARITY_THRESHOLD
+        without scanning twice.
+
+        Args:
+            embedding: Embedding vector to compare
+
+        Returns:
+            tuple: (best_similarity, best_preview, best_content) or (0.0, None, None)
+        """
+        if not self._embeddings_cache:
+            return 0.0, None, None
+
+        query = np.array(embedding)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return 0.0, None, None
+
+        best_sim = 0.0
+        best_data = None
+
+        for data in self._embeddings_cache.values():
+            stored_norm = data['norm']
+            if stored_norm == 0:
+                continue
+            similarity = np.dot(query, data['embedding_np']) / (query_norm * stored_norm)
+            if similarity > best_sim:
+                best_sim = similarity
+                best_data = data
+
+        if best_data is None:
+            return 0.0, None, None
+
+        return best_sim, best_data['preview'], best_data.get('content', best_data['preview'])
+
     def find_similar(self, embedding, threshold=None):
         """
         Find similar embeddings above threshold using cosine similarity.
@@ -118,49 +167,20 @@ class Database:
         Args:
             embedding: Embedding vector to compare
             threshold: Similarity threshold (0.0-1.0)
-        
+
         Returns:
             tuple: (is_match, similarity_score, matching_preview, full_content) or (False, 0.0, None, None)
         """
         import config
         if threshold is None:
             threshold = config.DUPLICATE_THRESHOLD
-            
-        if not self._embeddings_cache:
-            return False, 0.0, None, None
-        
-        embedding_array = np.array(embedding)
-        
-        for hash_key, data in self._embeddings_cache.items():
-            stored_embedding = np.array(data['embedding'])
-            similarity = self._cosine_similarity(embedding_array, stored_embedding)
-            
-            if similarity >= threshold:
-                logger.info(f"Duplicate detected! Similarity: {similarity:.3f} - {data['preview']}")
-                full_content = data.get('content', data['preview'])
-                return True, similarity, data['preview'], full_content
-        
+
+        best_sim, preview, content = self.find_best_match(embedding)
+        if best_sim >= threshold:
+            logger.info(f"Duplicate detected! Similarity: {best_sim:.3f} - {preview}")
+            return True, best_sim, preview, content
+
         return False, 0.0, None, None
-    
-    def _cosine_similarity(self, vec1, vec2):
-        """
-        Calculate cosine similarity between two vectors
-        
-        Args:
-            vec1: First vector
-            vec2: Second vector
-        
-        Returns:
-            float: Cosine similarity (0.0-1.0)
-        """
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        
-        return dot_product / (norm1 * norm2)
     
     def cleanup_old_entries(self):
         """Remove entries older than DB_RETENTION_HOURS"""
