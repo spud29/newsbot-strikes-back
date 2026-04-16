@@ -14,6 +14,15 @@ This file provides context for AI assistants (Claude Code and others) working on
 
 ---
 
+## Git Hygiene
+
+- **Commit after each meaningful change** — don't let modified files pile up across multiple features or refactors. One logical unit of work = one commit.
+- **Stage intentionally** — never `git add .` blindly. Skip `bot.log`, `.env`, screenshot files, and anything in `data/`.
+- **Write descriptive commit messages** — lead with what changed and why, not just filenames.
+- **New files need commits too** — untracked `.py` files are easy to forget; check `git status` before considering work "done".
+
+---
+
 ## Repository Structure
 
 ```
