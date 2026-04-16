@@ -7,7 +7,7 @@ import signal
 import sys
 import subprocess
 import os
-from utils import logger, setup_logging, is_all_caps
+from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question
 import config
 from db_connection import close_db_connection
 from database import Database
@@ -20,6 +20,7 @@ from retry_queue import RetryQueue
 from perplexity_client import PerplexityClient
 from removed_entries import RemovedEntriesDB
 from ocr_handler import is_tradingview_chart_ocr
+from dexerto_merger import DexertoMerger
 
 class NewsAggregatorBot:
     """Main bot orchestrator"""
@@ -32,7 +33,7 @@ class NewsAggregatorBot:
         
         self.db = Database()
         self.removed_entries_db = RemovedEntriesDB()
-        self.ollama = OllamaClient(removed_entries_db=self.removed_entries_db)
+        self.ollama = OllamaClient(removed_entries_db=self.removed_entries_db, database=self.db)
         self.perplexity = PerplexityClient()
         self.rss_poller = RSSPoller()
         self.telegram_poller = TelegramPoller()
@@ -43,7 +44,12 @@ class NewsAggregatorBot:
             removed_entries_db=self.removed_entries_db
         )
         self.retry_queue = RetryQueue(max_retries=3, retry_delay_cycles=2)
-        
+        self.dexerto_merger = DexertoMerger(
+            db=self.db,
+            process_entry_fn=self.process_entry,
+            max_pending_hours=getattr(config, 'DEXERTO_PENDING_MAX_AGE_HOURS', 4.0)
+        )
+
         self.running = False
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
         
@@ -213,11 +219,24 @@ class NewsAggregatorBot:
                 embedding = await asyncio.to_thread(self.ollama.generate_embedding, content)
 
                 # Single-pass similarity scan: check both duplicate and similarity thresholds at once
-                best_similarity, match_preview, match_content = self.db.find_best_match(embedding)
+                best_similarity, match_preview, match_content, match_entry_id = self.db.find_best_match(embedding)
 
-                # Classify the best match against both thresholds
+                # Classify the best match against both thresholds.
+                # IMPORTANT: if the matched entry was itself sent to 'ignore' (e.g. during
+                # PAUSE_MODE), it was never actually published — don't treat the new entry
+                # as a duplicate of something the user never saw.
+                matched_was_ignored = False
+                if match_entry_id:
+                    matched_mapping = self.db.get_discord_message_info(match_entry_id)
+                    if matched_mapping and matched_mapping.get('category') == 'ignore':
+                        matched_was_ignored = True
+                        logger.info(
+                            f"Matched entry {match_entry_id} was posted to ignore "
+                            f"(similarity: {best_similarity:.3f}) — not suppressing new entry"
+                        )
+
                 duplicate_info = None
-                if best_similarity >= config.DUPLICATE_THRESHOLD:
+                if best_similarity >= config.DUPLICATE_THRESHOLD and not matched_was_ignored:
                     logger.info(
                         f"Exact duplicate detected (similarity: {best_similarity:.3f}): {entry_id}\n"
                         f"Matches: {match_preview}"
@@ -229,33 +248,52 @@ class NewsAggregatorBot:
                     }
 
                 similarity_info = None
-                is_similar = best_similarity >= config.SIMILARITY_THRESHOLD
-                similar_full_content = match_content
-                if is_similar and not duplicate_info:
-                    # LLM verification: ask the AI if these are truly the same story,
-                    # not just broadly similar topics (e.g. two different political headlines)
-                    logger.info(
-                        f"Embedding similarity detected ({best_similarity:.3f}), verifying with LLM..."
+                if not duplicate_info and best_similarity >= config.SIMILARITY_THRESHOLD:
+                    # Get top-N candidates above threshold — the single best match is not
+                    # always the actual duplicate (a topically-related story can outscore it).
+                    top_matches = self.db.find_top_matches(
+                        embedding,
+                        threshold=config.SIMILARITY_THRESHOLD,
+                        limit=3
                     )
-                    is_truly_similar = await asyncio.to_thread(
-                        self.ollama.verify_similarity, content, similar_full_content
-                    )
+                    for cand_sim, cand_preview, cand_content, cand_entry_id in top_matches:
+                        # Skip candidates that were themselves routed to ignore —
+                        # they were never published, so don't suppress new entries against them.
+                        if cand_entry_id:
+                            cand_mapping = self.db.get_discord_message_info(cand_entry_id)
+                            if cand_mapping and cand_mapping.get('category') == 'ignore':
+                                logger.info(
+                                    f"Skipping similarity candidate {cand_entry_id} "
+                                    f"(was posted to ignore, score: {cand_sim:.3f})"
+                                )
+                                continue
 
-                    if is_truly_similar:
-                        similarity_info = {
-                            'similarity': best_similarity,
-                            'match_preview': match_preview
-                        }
                         logger.info(
-                            f"Similar content CONFIRMED by LLM (similarity: {best_similarity:.3f}): {entry_id}\n"
-                            f"Matches: {match_preview}"
+                            f"Verifying similarity candidate (score: {cand_sim:.3f}): "
+                            f"{cand_preview[:80]}"
                         )
-                    else:
-                        logger.info(
-                            f"LLM says DIFFERENT story despite embedding similarity "
-                            f"({best_similarity:.3f}): {entry_id}\n"
-                            f"Would have matched: {match_preview}"
+                        is_truly_similar = await asyncio.to_thread(
+                            self.ollama.verify_similarity, content, cand_content
                         )
+                        if is_truly_similar:
+                            similarity_info = {
+                                'similarity': cand_sim,
+                                'match_preview': cand_preview
+                            }
+                            # Update match vars so supersede logic targets the confirmed match
+                            match_entry_id = cand_entry_id
+                            match_content = cand_content
+                            match_preview = cand_preview
+                            logger.info(
+                                f"Similar content CONFIRMED by LLM (similarity: {cand_sim:.3f}): {entry_id}\n"
+                                f"Matches: {cand_preview}"
+                            )
+                            break
+                        else:
+                            logger.info(
+                                f"LLM says DIFFERENT story (score: {cand_sim:.3f}) vs "
+                                f"{cand_entry_id}: {cand_preview[:80]}"
+                            )
                 
                 # Download media (for both new and similar entries)
                 # Skip if already downloaded (e.g., for image-only Telegram entries)
@@ -265,6 +303,10 @@ class NewsAggregatorBot:
                         entry = await asyncio.to_thread(self.media_handler.download_twitter_media, entry)
                         # Update content with gallery-dl extracted text if available
                         content = entry.get('full_text') or content
+                        # Dexerto merger: append tweet 2 follow-up text (blurb + article URL)
+                        if entry.get('dexerto_follow_up'):
+                            content = f"{content}\n{entry['dexerto_follow_up']}"
+                            logger.debug(f"DexertoMerger: appended follow-up text to content for {entry_id}")
                     elif source_type == 'telegram':
                         entry = await self.media_handler.download_telegram_media(entry)
                         # Content should already be set, but update if needed
@@ -272,12 +314,16 @@ class NewsAggregatorBot:
                 else:
                     logger.debug("Media already downloaded, skipping download step...")
                 
-                # Combine OCR text with content for better categorization
+                # Combine OCR text and audio transcript with content for better categorization
                 ocr_text = entry.get('ocr_text', '')
+                audio_transcript = entry.get('audio_transcript', '')
                 combined_content = content
                 if ocr_text:
-                    combined_content = f"{content}\n\n[Text from images]:\n{ocr_text}"
+                    combined_content = f"{combined_content}\n\n[Text from images]:\n{ocr_text}"
                     logger.debug(f"Combined content with OCR text ({len(ocr_text)} chars from images)")
+                if audio_transcript:
+                    combined_content = f"{combined_content}\n\n[Video transcript]:\n{audio_transcript}"
+                    logger.debug(f"Combined content with audio transcript ({len(audio_transcript)} chars)")
                 
                 # Always run AI categorization to get reasoning
                 # NOTE: Ollama calls are wrapped in asyncio.to_thread() to prevent blocking the event loop
@@ -285,6 +331,17 @@ class NewsAggregatorBot:
                 logger.debug("Categorizing content...")
                 category, reasoning = await asyncio.to_thread(self.ollama.categorize, combined_content)
                 logger.info(f"Category: {category}")
+                _ai_category = category  # Capture before any overrides
+                placement_reason = None  # Will be set at each override point
+
+                # If Ollama timed out or errored during categorization, the category
+                # defaults to 'ignore' with an error reasoning. Don't post it — skip
+                # this entry so it gets retried on the next poll cycle.
+                if category == 'ignore' and reasoning and reasoning.startswith('Error during categorization'):
+                    logger.warning(
+                        f"Skipping {entry_id} — Ollama categorization failed, will retry next cycle: {reasoning}"
+                    )
+                    return False
                 
                 # Pause mode: route everything to ignore while preserving AI category
                 if getattr(config, 'PAUSE_MODE', False):
@@ -295,6 +352,7 @@ class NewsAggregatorBot:
                         f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
                     )
                     logger.info(f"Pause mode: routing '{original_category}' to 'ignore'")
+                    placement_reason = f"Pause mode override: bot was paused, routed to ignore instead of '{original_category}'"
 
                 # If exact duplicate was detected, override category to ignore
                 # but preserve the AI reasoning and append duplicate info
@@ -311,25 +369,102 @@ class NewsAggregatorBot:
                         f"Category overridden to 'ignore' due to duplicate "
                         f"(AI suggested: {ai_category})"
                     )
+                    placement_reason = (
+                        f"Duplicate override: exact duplicate detected "
+                        f"(score: {duplicate_info['similarity']:.3f}), "
+                        f"AI had suggested '{_ai_category}', routed to ignore"
+                    )
 
-                # If similar content was detected, override category to ignore
-                # but preserve the AI reasoning and append similarity info
+                # Category sanity check: if the AI assigned a real category to the new
+                # entry but it differs from the matched entry's stored category, this is
+                # almost certainly a false positive from the embedding model (e.g. a short
+                # crypto headline matching a sports headline at high similarity). Clear the
+                # similarity match and let the entry post normally.
+                if similarity_info and category != 'ignore' and match_entry_id:
+                    matched_cat_mapping = self.db.get_discord_message_info(match_entry_id)
+                    if matched_cat_mapping:
+                        old_cat = matched_cat_mapping.get('category')
+                        if old_cat and old_cat != 'ignore' and old_cat != category:
+                            if similarity_info['similarity'] < 0.80:
+                                logger.info(
+                                    f"Category mismatch at low confidence "
+                                    f"({similarity_info['similarity']:.3f}, {category} vs {old_cat}) "
+                                    f"— treating as false positive, posting normally"
+                                )
+                                similarity_info = None
+                            else:
+                                logger.info(
+                                    f"Category mismatch at high confidence: new entry is '{category}' "
+                                    f"but matched entry {match_entry_id} is '{old_cat}' "
+                                    f"(score: {similarity_info['similarity']:.3f}) — letting supersede logic decide"
+                                )
+
+                # If similar content was detected, try to supersede the old entry
+                # or fall back to routing to ignore
+                superseded = False
                 if similarity_info:
-                    ai_category = category
-                    category = 'ignore'
-                    reasoning = (
-                        f"AI suggested '{ai_category}': {reasoning or 'no reasoning provided'} "
-                        f"| OVERRIDDEN by similarity detector "
-                        f"(score: {similarity_info['similarity']:.3f}, "
-                        f"matches: {similarity_info['match_preview'][:100]})"
-                    )
-                    logger.info(
-                        f"Category overridden to 'ignore' due to similarity "
-                        f"(AI suggested: {ai_category})"
-                    )
+                    if getattr(config, 'SUPERSEDE_ENABLED', False) and match_entry_id:
+                        old_mapping = self.db.get_discord_message_info(match_entry_id)
+                        max_age = getattr(config, 'SUPERSEDE_MAX_AGE_HOURS', 24) * 3600
+                        old_is_fresh = (
+                            old_mapping
+                            and old_mapping.get('category') != 'ignore'
+                            and old_mapping.get('timestamp')
+                            and (time.time() - old_mapping['timestamp']) < max_age
+                        )
+                        if old_is_fresh:
+                            comparison = await asyncio.to_thread(
+                                self.ollama.compare_entries, content, match_content
+                            )
+                            if comparison['verdict'] == 'supersede':
+                                # Use the old entry's category so it posts to the same channel
+                                category = old_mapping['category']
+                                reasoning = (
+                                    f"AI suggested '{category}': {reasoning or 'no reasoning provided'} "
+                                    f"| SUPERSEDES {match_entry_id} "
+                                    f"(similarity: {similarity_info['similarity']:.3f}, "
+                                    f"reason: {comparison['reasoning']})"
+                                )
+                                # Delete old Discord message — only proceed if deletion succeeds
+                                deleted = await self.discord_poster.delete_message(
+                                    old_mapping['discord_channel_id'],
+                                    old_mapping['discord_message_id']
+                                )
+                                if deleted:
+                                    # Clean up old entry's embedding and mapping
+                                    self.db.delete_embedding_by_entry_id(match_entry_id)
+                                    self.db.delete_message_mapping(match_entry_id)
+                                    superseded = True
+                                    placement_reason = (
+                                        f"AI categorized as '{category}'. "
+                                        f"Reasoning: {reasoning or 'no reasoning provided'} "
+                                        f"| Superseded entry {match_entry_id} "
+                                        f"(similarity: {similarity_info['similarity']:.3f})"
+                                    )
+                                    logger.info(
+                                        f"Superseding {match_entry_id} with {entry_id} "
+                                        f"(reason: {comparison['reasoning']})"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Failed to delete Discord message {old_mapping['discord_message_id']} "
+                                        f"for supersede — aborting supersede of {match_entry_id}"
+                                    )
+
+                    if not superseded:
+                        logger.info(
+                            f"Similar story suppressed (not posted): {entry_id} "
+                            f"(score: {similarity_info['similarity']:.3f}, "
+                            f"matches: {similarity_info['match_preview'][:100]})"
+                        )
+                        self.stats['duplicates'] += 1
+                        self.db.mark_processed(entry_id)
+                        self.db.add_embedding(content, embedding, entry_id=entry_id)
+                        self.media_handler.cleanup_entry_media(entry)
+                        return True
                 
-                # Apply newsworthiness filter (only for non-similar, non-ignore categories)
-                if not similarity_info and category != 'ignore':
+                # Apply newsworthiness filter (skip for similar, superseded, or already-ignore entries)
+                if not similarity_info and not superseded and category != 'ignore':
                     if getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
                         logger.debug("Rating newsworthiness...")
                         newsworthiness = await asyncio.to_thread(self.ollama.rate_newsworthiness, combined_content, category)
@@ -337,6 +472,18 @@ class NewsAggregatorBot:
                         if not newsworthiness['passed']:
                             original_category = category
                             category = 'ignore'
+                            reasoning = (
+                                f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                                f"| OVERRIDDEN: newsworthiness filter failed "
+                                f"(score: {newsworthiness['score']:.1f}/10, "
+                                f"reason: {newsworthiness['reasoning']})"
+                            )
+                            placement_reason = (
+                                f"Content filter: newsworthiness filter failed "
+                                f"(score: {newsworthiness['score']:.1f}/10, "
+                                f"reason: {newsworthiness['reasoning']}), "
+                                f"AI had suggested '{original_category}', routed to ignore"
+                            )
                             logger.info(
                                 f"Newsworthiness filter: {newsworthiness['score']:.1f}/10 below threshold "
                                 f"- routing from '{original_category}' to 'ignore' "
@@ -344,7 +491,7 @@ class NewsAggregatorBot:
                             )
                 
                 # Filter short videos (under threshold) to ignore channel
-                if not similarity_info and category != 'ignore':
+                if not similarity_info and not superseded and category != 'ignore':
                     if getattr(config, 'SHORT_VIDEO_FILTER_ENABLED', False):
                         video_duration = entry.get('video_duration')
                         if video_duration is not None and video_duration < config.SHORT_VIDEO_THRESHOLD:
@@ -354,11 +501,39 @@ class NewsAggregatorBot:
                                 f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
                                 f"| OVERRIDDEN: short video ({video_duration:.0f}s < {config.SHORT_VIDEO_THRESHOLD}s threshold)"
                             )
+                            placement_reason = (
+                                f"Content filter: short video ({video_duration:.0f}s < {config.SHORT_VIDEO_THRESHOLD}s), "
+                                f"AI had suggested '{original_category}', routed to ignore"
+                            )
                             logger.info(
                                 f"Short video filter: {video_duration:.0f}s duration "
                                 f"- routing from '{original_category}' to 'ignore'"
                             )
                 
+                # Filter audience-engagement questions (e.g. "Do you agree?", "What do you think?")
+                if not similarity_info and not superseded and category != 'ignore':
+                    if getattr(config, 'AUDIENCE_QUESTION_FILTER_ENABLED', False):
+                        if is_audience_question(combined_content):
+                            original_category = category
+                            category = 'ignore'
+                            reasoning = (
+                                f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                                f"| OVERRIDDEN: audience engagement question detected"
+                            )
+                            placement_reason = (
+                                f"Content filter: audience engagement question detected, "
+                                f"AI had suggested '{original_category}', routed to ignore"
+                            )
+                            logger.info(
+                                f"Audience question filter: entry ends with reader-engagement question "
+                                f"- routing from '{original_category}' to 'ignore'"
+                            )
+
+                # Strip wire-service prefixes (e.g. "JUST IN:", "BREAKING:", "🚨NEW:")
+                # Done here as a final pass to catch ALL sources (RSS, Twitter, Telegram)
+                content = strip_wire_prefixes(content)
+                entry['content'] = content
+
                 # Post to Discord
                 media_files = entry.get('media_files', [])
                 video_urls = entry.get('video_urls', [])
@@ -377,9 +552,9 @@ class NewsAggregatorBot:
                 if success:
                     # Mark as processed and store embedding
                     self.db.mark_processed(entry_id)
-                    if ocr_text and combined_content != content:
-                        # OCR added new text beyond the base content — regenerate embedding
-                        # for better future duplicate detection with OCR context included.
+                    if (ocr_text or audio_transcript) and combined_content != content:
+                        # OCR or transcript added new text — regenerate embedding with full context
+                        # for better future duplicate detection.
                         # (Skips the extra Ollama call when content IS the OCR text, e.g. image-only entries)
                         combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
                         self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
@@ -400,6 +575,9 @@ class NewsAggregatorBot:
                                 channel_name_clean = channel_name.lstrip('@')
                                 source_url = f"https://t.me/{channel_name_clean}/{message_id}"
                         
+                        if placement_reason is None:
+                            placement_reason = f"AI categorized as '{category}'. Reasoning: {reasoning or 'no reasoning provided'}"
+
                         self.db.store_message_mapping(
                             telegram_entry_id=entry_id,
                             telegram_message_id=entry.get('message_id', 0),
@@ -410,7 +588,9 @@ class NewsAggregatorBot:
                             video_urls=entry.get('video_urls', []),
                             category=category,
                             source_type=source_type,
-                            reasoning=reasoning
+                            reasoning=reasoning,
+                            original_category=_ai_category,
+                            placement_reason=placement_reason
                         )
                     
                     # Update last message ID for Telegram entries
@@ -562,6 +742,9 @@ class NewsAggregatorBot:
         # Clean up old database entries
         logger.info("Cleaning up old database entries...")
         self.db.cleanup_old_entries()
+
+        # Flush Dexerto headlines that have been waiting too long with no follow-up tweet
+        await self.dexerto_merger.flush_stale()
         
         # Clean up old retry queue entries (older than 24 hours)
         self.retry_queue.cleanup_old_entries(max_age_hours=24)
@@ -607,11 +790,14 @@ class NewsAggregatorBot:
         # Sort entries by timestamp in reverse chronological order (newest first)
         def get_entry_timestamp(entry):
             """Extract timestamp from entry for sorting"""
+            # For Twitter entries, status_id is a snowflake ID — strictly chronological
+            # and more precise than pub_date which can be identical for thread replies
+            if entry.get('source_type') == 'twitter' and entry.get('status_id'):
+                return int(entry['status_id'])
             if 'timestamp' in entry and entry['timestamp']:
                 return entry['timestamp']
             elif 'pub_date' in entry and entry['pub_date']:
                 # Parse RSS pub_date to timestamp
-                import time
                 from email.utils import parsedate_to_datetime
                 try:
                     dt = parsedate_to_datetime(entry['pub_date'])
@@ -640,9 +826,15 @@ class NewsAggregatorBot:
                     # Remove from retry queue if it was a retry
                     self.retry_queue.remove_entry(entry['id'], reason="already_processed")
                     continue
-                
+
+                # Dexerto tweet pair merger: buffer headline tweets and wait for the
+                # matching follow-up tweet (blurb + article URL) before posting.
+                consumed = await self.dexerto_merger.handle(entry)
+                if consumed:
+                    continue
+
                 success = await self.process_entry(entry)
-                
+
                 # If successful and was in retry queue, remove it
                 if success:
                     self.retry_queue.remove_entry(entry['id'], reason="success")
@@ -762,7 +954,8 @@ class NewsAggregatorBot:
                 channel_id=discord_channel_id,
                 message_id=discord_message_id,
                 content=new_content,
-                source_type='telegram'
+                source_type='telegram',
+                category=mapping_info.get('category')
             )
             
             if success:
@@ -777,7 +970,8 @@ class NewsAggregatorBot:
                     video_urls=mapping_info.get('video_urls', []),
                     category=mapping_info.get('category'),
                     source_type=mapping_info.get('source_type', 'telegram'),
-                    reasoning=mapping_info.get('reasoning')
+                    reasoning=mapping_info.get('reasoning'),
+                    original_category=mapping_info.get('original_category')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

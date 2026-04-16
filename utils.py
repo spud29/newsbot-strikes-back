@@ -448,17 +448,79 @@ def strip_wire_prefixes(text):
 
     import re
 
+    # Strip leading emojis/symbols before checking for prefixes
+    # Handles cases like "🚨JUST IN:" or "🚨 BREAKING:"
+    text = re.sub(r'^[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u26A0\u203C\u2757\u2755\u274C\u274E\u2705\u267B\uFE0F]+\s*', '', text)
+
     # Match common wire-service prefixes at the start of text
     # Handles optional space before colon: "JUST IN:" and "JUST IN :"
+    # Case-insensitive to catch "New:", "Breaking:", etc.
     text = re.sub(
         r'^(JUST IN|BREAKING|NEW|DEVELOPING|EXCLUSIVE|ALERT|FLASH|URGENT|UPDATE|REPORT|WATCH|LIVE|SCOOP|HAPPENING NOW)\s*:\s*',
         '',
-        text
+        text,
+        flags=re.IGNORECASE
     )
 
     text = text.strip()
 
     return text
+
+
+def is_audience_question(content: str) -> bool:
+    """
+    Return True if content ends with an audience-engagement question.
+
+    Detects patterns like "Do you agree?", "What do you think?", "Thoughts?"
+    that solicit reader opinions rather than conveying news.
+
+    Examples that trigger:
+        '...Larry Fink has said. Do you agree?'        -> True
+        'Bitcoin hits $100k. What do you think?'       -> True
+        'Markets up 3%. Thoughts?'                     -> True
+        'Are you buying the dip?'                      -> True
+
+    Examples that do NOT trigger:
+        'Will the Fed raise rates this month?'         -> False (no 'you')
+        'He asked if investors would agree.'           -> False (no trailing ?)
+        'Analysts are cautious about the outlook.'     -> False
+    """
+    import re
+
+    if not content:
+        return False
+
+    # Split on sentence-ending punctuation, grab the last sentence
+    sentences = re.split(r'(?<=[.!?])\s+', content.strip())
+    last = sentences[-1].strip() if sentences else ''
+
+    if not last.endswith('?'):
+        return False
+
+    _PATTERN = re.compile(
+        r'^('
+        r'do you |'
+        r'what do you |'
+        r'what are your |'
+        r'are you |'
+        r'would you |'
+        r'will you |'
+        r'how do you |'
+        r'how would you |'
+        r'did you |'
+        r'have you |'
+        r'could you |'
+        r'should you |'
+        r'agree\?$|'
+        r'disagree\?$|'
+        r'thoughts\?$|'
+        r'your thoughts\?|'
+        r'your take\?|'
+        r'your opinion\?'
+        r')',
+        re.IGNORECASE
+    )
+    return bool(_PATTERN.search(last))
 
 
 def format_quote_tweets(text):

@@ -11,23 +11,25 @@ import config
 class OllamaClient:
     """Client for interacting with local Ollama API"""
     
-    def __init__(self, removed_entries_db=None):
+    def __init__(self, removed_entries_db=None, database=None):
         """
         Initialize Ollama client
-        
+
         Args:
             removed_entries_db: Optional RemovedEntriesDB instance for feedback learning
+            database: Optional Database instance for ignore-entry learning
         """
         self.base_url = config.OLLAMA_BASE_URL
         self.categorization_model = config.OLLAMA_CATEGORIZATION_MODEL
         self.embedding_model = config.OLLAMA_EMBEDDING_MODEL
         self.removed_entries_db = removed_entries_db
-        
+        self.database = database
+
         # Cache for enhanced system prompt (refreshed every hour)
         self._enhanced_prompt_cache = None
         self._cache_timestamp = 0
         self._cache_ttl = 3600  # 1 hour
-        
+
         logger.info(f"Ollama client initialized: {self.base_url}")
     
     def generate_enhanced_system_prompt(self):
@@ -78,10 +80,40 @@ class OllamaClient:
             except Exception as e:
                 logger.error(f"Error generating enhanced system prompt: {e}", exc_info=True)
         
+        # Add ignore-entry learning if enabled and database is available
+        if (getattr(config, 'IGNORE_EXAMPLES_ENABLED', True) and
+                self.database and
+                hasattr(self.database, 'get_ignore_entry_previews')):
+
+            try:
+                ignore_previews = self.database.get_ignore_entry_previews(
+                    limit=getattr(config, 'IGNORE_EXAMPLES_COUNT', 30),
+                    max_preview_length=150
+                )
+
+                if ignore_previews:
+                    enhanced_prompt += "\n\n" + "=" * 60
+                    enhanced_prompt += "\nThe following content has been routed to the ignore channel. Use these as additional guidance for what to categorize as 'ignore':\n\n"
+
+                    for i, (preview, user_flagged) in enumerate(ignore_previews, 1):
+                        clean_preview = " ".join(preview.split())
+                        flag = " (user-flagged)" if user_flagged else ""
+                        enhanced_prompt += f"{i}. {clean_preview}{flag}\n"
+
+                    enhanced_prompt += "\n" + "=" * 60
+                    enhanced_prompt += "\nPay particular attention to entries marked '(user-flagged)' — a human explicitly moved those to ignore."
+
+                    logger.debug(f"Enhanced system prompt with {len(ignore_previews)} ignore-channel examples")
+                else:
+                    logger.debug("No ignore entries available for learning")
+
+            except Exception as e:
+                logger.error(f"Error adding ignore entries to system prompt: {e}", exc_info=True)
+
         # Cache the enhanced prompt
         self._enhanced_prompt_cache = enhanced_prompt
         self._cache_timestamp = current_time
-        
+
         return enhanced_prompt
     
     @retry_with_backoff(max_retries=3, initial_delay=2)
@@ -233,7 +265,7 @@ class OllamaClient:
         # (avoids matching reasoning text, and prevents "" from matching everything)
         if category and len(category) < 50:
             for valid_cat in valid_categories:
-                if valid_cat in category or category in valid_cat:
+                if valid_cat in category:
                     mapped = valid_cat if valid_cat in config.DISCORD_CHANNELS else config.DEFAULT_CATEGORY
                     logger.debug(f"Partial match: '{category}' -> '{valid_cat}' -> channel: '{mapped}'")
                     return mapped
@@ -341,7 +373,21 @@ class OllamaClient:
             "- Two articles about Macron commenting on free speech = SAME story = yes\n"
             "- One article about Macron on free speech and another about Khamenei on warships = DIFFERENT stories = no\n"
             "- Two articles about Bitcoin hitting $100k = SAME story = yes\n"
-            "- One article about Bitcoin price and another about Ethereum upgrade = DIFFERENT stories = no\n\n"
+            "- One article about Bitcoin price and another about Ethereum upgrade = DIFFERENT stories = no\n"
+            "- 'Trump threatens 50% tariff on China' and 'Trump proposes 50% tariff on nations including China' = SAME story = yes\n"
+            "  (Same event from different sources with different wording still counts as SAME)\n"
+            "- A brief headline 'Justin Sun accuses WLFI of embedding a backdoor in its token contract' and a detailed article "
+            "'Justin Sun accuses Trump's crypto project WLFI of secretly embedding a backdoor — froze his $75M wallet, token down 83%' = SAME story = yes\n"
+            "  (A short summary and a detailed article covering the same event are still the SAME story)\n"
+            "- 'Trump has posted himself seemingly as Jesus on Truth Social' and "
+            "'Trump shares image depicting himself as Jesus Christ' = SAME story = yes\n"
+            "  (One headline using hedged/uncertain language and another being definitive "
+            "about the same action are still the SAME story)\n"
+            "- A tweet 'Something happened. pic.twitter.com/xyz123' and a headline "
+            "'Something happened' = SAME story = yes\n"
+            "  (Ignore appended Twitter media URLs — they don't change the story)\n"
+            "- A NYC mayor discussing racial wealth gaps and a US president discussing trade with Hungary = DIFFERENT stories = no\n"
+            "  (Sharing the same general domain like economics or politics does NOT make them the same story)\n\n"
             f"ARTICLE A:\n{new_content[:500]}\n\n"
             f"ARTICLE B:\n{existing_content[:500]}\n\n"
             "Are these about the SAME specific event or story? Answer ONLY \"yes\" or \"no\"."
@@ -355,25 +401,96 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "options": {
-                        "temperature": 0.1,
+                        "temperature": 0.0,
                         "num_predict": 100
                     }
                 },
-                timeout=15
+                timeout=60
             )
             response.raise_for_status()
             result = response.json().get('response', '').strip().lower()
-            
+
+            if not result:
+                raise ValueError("LLM returned empty response for similarity check")
+
             is_same = result.startswith('yes')
             logger.info(f"LLM similarity verdict: {'SAME story' if is_same else 'DIFFERENT stories'} (raw: '{result}')")
             return is_same
-            
+
         except Exception as e:
             logger.error(f"Error verifying similarity via LLM: {e}")
-            # Fail safe: if the LLM check fails, assume they ARE similar
-            # (preserves the old behavior of trusting the embedding match)
-            return True
+            # Fail open: if LLM check errors or times out after retries, allow the
+            # entry through rather than silently suppressing it. A missed duplicate
+            # is better than a missed genuine story.
+            return False
     
+    @retry_with_backoff(max_retries=2, initial_delay=2)
+    def compare_entries(self, new_content, existing_content):
+        """
+        Compare a new entry against an existing one about the same story.
+        Determines whether the new entry should supersede (replace) the old one.
+
+        Returns:
+            dict: {'verdict': 'supersede'|'ignore', 'reasoning': str}
+        """
+        logger.debug("Comparing entries for supersede decision...")
+
+        prompt = (
+            "You are comparing two news articles about the same story. "
+            "Decide if the NEW article should REPLACE the existing one.\n\n"
+            f"EXISTING ARTICLE (already published):\n{existing_content[:800]}\n\n"
+            f"NEW ARTICLE (just arrived):\n{new_content[:800]}\n\n"
+            "Should the new article replace the existing one?\n"
+            "- \"supersede\": New article is clearly better (more detail, newer developments, "
+            "corrects errors, more informative)\n"
+            "- \"ignore\": Existing article is equal or better, new one adds nothing significant\n\n"
+            "Respond with ONLY valid JSON: "
+            "{\"verdict\": \"supersede\" or \"ignore\", \"reasoning\": \"brief explanation\"}"
+        )
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.categorization_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 200
+                    }
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            response_text = response.json().get('response', '').strip()
+
+            # Try JSON parse
+            try:
+                json_match = re.search(r'\{[^}]+\}', response_text)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    verdict = parsed.get('verdict', '').lower().strip()
+                    reasoning = parsed.get('reasoning', '')
+                    if verdict in ('supersede', 'ignore'):
+                        logger.info(f"Compare verdict: {verdict} — {reasoning}")
+                        return {'verdict': verdict, 'reasoning': reasoning}
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+            # Fallback: look for keyword
+            text_lower = response_text.lower()
+            if 'supersede' in text_lower:
+                logger.info("Compare verdict (fallback): supersede")
+                return {'verdict': 'supersede', 'reasoning': 'Parsed from fallback'}
+
+            logger.info("Compare verdict (fallback): ignore")
+            return {'verdict': 'ignore', 'reasoning': 'Could not parse response, defaulting to ignore'}
+
+        except Exception as e:
+            logger.error(f"Error comparing entries: {e}")
+            return {'verdict': 'ignore', 'reasoning': f'Error: {e}'}
+
     @retry_with_backoff(max_retries=3, initial_delay=2)
     def generate_embedding(self, content):
         """
@@ -453,6 +570,10 @@ Score 1-3 for routine/mundane news (polls, surveys, scheduled events, minor upda
 Score 4-6 for moderately notable news (industry-relevant, limited broader impact).
 Score 7-10 for genuinely surprising, high-impact, or urgent news that would make someone say "wow".
 
+IMPORTANT CALIBRATION RULES:
+- Public statements, posts, or rants by major world leaders, heads of state, or highly influential public figures (e.g. presidents, prime ministers, billionaires with large public platforms) score at least 6 on impact regardless of tone — their words carry inherent news value even if the content is opinion or commentary.
+- Entertainment value and humor are valid reasons to score higher on "surprising".
+
 Category: {category}
 Content: {content[:1000]}
 
@@ -531,25 +652,27 @@ Respond with ONLY this JSON, no other text:
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse newsworthiness JSON: {e}")
-            # On parse error, fail closed — route to ignore for manual review
+            # Fail open — entry already passed AI categorization; don't silently drop it
+            # because Ollama returned a malformed response
             return {
-                'score': 0.0,
-                'surprising': 0,
-                'impact': 0,
-                'actionable': 0,
-                'reasoning': 'JSON parse error - defaulting to fail',
-                'passed': False
+                'score': 10.0,
+                'surprising': 10,
+                'impact': 10,
+                'actionable': 10,
+                'reasoning': f'JSON parse error — letting through: {str(e)[:50]}',
+                'passed': True
             }
         except Exception as e:
             logger.error(f"Error rating newsworthiness: {e}")
-            # On error, fail closed — route to ignore for manual review
+            # Fail open — if Ollama errors (empty response, timeout, etc.), give the
+            # entry the benefit of the doubt rather than silently dropping it
             return {
-                'score': 0.0,
-                'surprising': 0,
-                'impact': 0,
-                'actionable': 0,
-                'reasoning': f'Rating error: {str(e)[:50]}',
-                'passed': False
+                'score': 10.0,
+                'surprising': 10,
+                'impact': 10,
+                'actionable': 10,
+                'reasoning': f'Rating error — letting through: {str(e)[:50]}',
+                'passed': True
             }
     
     def health_check(self):

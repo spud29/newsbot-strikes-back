@@ -71,15 +71,6 @@ def _create_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_message_mapping_discord_msg
             ON message_mapping(discord_message_id);
 
-        CREATE TABLE IF NOT EXISTS votes (
-            discord_message_id TEXT PRIMARY KEY,
-            voters TEXT NOT NULL,
-            timestamp REAL,
-            entry_id TEXT,
-            content TEXT,
-            category TEXT,
-            discord_channel_id INTEGER
-        );
 
         CREATE TABLE IF NOT EXISTS removed_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +111,14 @@ def _run_migrations(conn):
 
     if 'user_edited' not in columns:
         conn.execute("ALTER TABLE message_mapping ADD COLUMN user_edited INTEGER DEFAULT 0")
+        conn.commit()
+
+    if 'original_category' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN original_category TEXT DEFAULT NULL")
+        conn.commit()
+
+    if 'placement_reason' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN placement_reason TEXT DEFAULT NULL")
         conn.commit()
 
 

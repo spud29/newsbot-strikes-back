@@ -120,7 +120,21 @@ class Database:
         
         logger.debug(f"Stored embedding for: {content[:50]}...")
         return content_hash
-    
+
+    def delete_embedding_by_entry_id(self, entry_id):
+        """Remove an embedding by its entry_id from both DB and in-memory cache."""
+        # Remove from DB
+        self.conn.execute("DELETE FROM embeddings WHERE entry_id = ?", (entry_id,))
+        self.conn.commit()
+
+        # Remove from in-memory cache
+        to_remove = [k for k, v in self._embeddings_cache.items() if v.get('entry_id') == entry_id]
+        for key in to_remove:
+            del self._embeddings_cache[key]
+
+        if to_remove:
+            logger.info(f"Deleted embedding for superseded entry: {entry_id}")
+
     def find_best_match(self, embedding):
         """
         Single-pass scan over all cached embeddings to find the best match.
@@ -132,15 +146,15 @@ class Database:
             embedding: Embedding vector to compare
 
         Returns:
-            tuple: (best_similarity, best_preview, best_content) or (0.0, None, None)
+            tuple: (best_similarity, best_preview, best_content, best_entry_id) or (0.0, None, None, None)
         """
         if not self._embeddings_cache:
-            return 0.0, None, None
+            return 0.0, None, None, None
 
         query = np.array(embedding)
         query_norm = np.linalg.norm(query)
         if query_norm == 0:
-            return 0.0, None, None
+            return 0.0, None, None, None
 
         best_sim = 0.0
         best_data = None
@@ -155,9 +169,43 @@ class Database:
                 best_data = data
 
         if best_data is None:
-            return 0.0, None, None
+            return 0.0, None, None, None
 
-        return best_sim, best_data['preview'], best_data.get('content', best_data['preview'])
+        return best_sim, best_data['preview'], best_data.get('content', best_data['preview']), best_data.get('entry_id')
+
+    def find_top_matches(self, embedding, threshold=0.0, limit=3):
+        """
+        Return the top-N matches above threshold, sorted by similarity descending.
+        Used for the similarity check so we verify against the most likely candidates,
+        not just the single highest-scoring entry (which may not be the actual duplicate).
+
+        Returns:
+            list of tuples: [(similarity, preview, content, entry_id), ...]
+        """
+        if not self._embeddings_cache:
+            return []
+
+        query = np.array(embedding)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+
+        results = []
+        for data in self._embeddings_cache.values():
+            stored_norm = data['norm']
+            if stored_norm == 0:
+                continue
+            similarity = np.dot(query, data['embedding_np']) / (query_norm * stored_norm)
+            if similarity >= threshold:
+                results.append((
+                    similarity,
+                    data['preview'],
+                    data.get('content', data['preview']),
+                    data.get('entry_id')
+                ))
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results[:limit]
 
     def find_similar(self, embedding, threshold=None):
         """
@@ -175,7 +223,7 @@ class Database:
         if threshold is None:
             threshold = config.DUPLICATE_THRESHOLD
 
-        best_sim, preview, content = self.find_best_match(embedding)
+        best_sim, preview, content, entry_id = self.find_best_match(embedding)
         if best_sim >= threshold:
             logger.info(f"Duplicate detected! Similarity: {best_sim:.3f} - {preview}")
             return True, best_sim, preview, content
@@ -229,10 +277,10 @@ class Database:
             'message_mappings': mapping_count
         }
     
-    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None):
+    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None, original_category=None, placement_reason=None):
         """
         Store mapping between Telegram and Discord messages
-        
+
         Args:
             telegram_entry_id: Full entry ID (e.g., 'telegram_channelname_123' or 'twitter_123')
             telegram_message_id: Numeric Telegram message ID (or 0 for non-Telegram)
@@ -244,12 +292,14 @@ class Database:
             category: Category the message was posted to
             source_type: Source type ('twitter', 'telegram', etc.) for re-categorization
             reasoning: Brief explanation of why this category was chosen
+            original_category: The AI's initial category before any user re-categorization
+            placement_reason: Human-readable explanation of why this entry is in its current category
         """
         self.conn.execute(
-            """INSERT OR REPLACE INTO message_mapping 
+            """INSERT OR REPLACE INTO message_mapping
                (entry_id, telegram_message_id, discord_channel_id, discord_message_id,
-                content, source_url, video_urls, category, source_type, reasoning, timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                content, source_url, video_urls, category, source_type, reasoning, timestamp, original_category, placement_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 telegram_entry_id,
                 telegram_message_id,
@@ -261,11 +311,13 @@ class Database:
                 category,
                 source_type,
                 reasoning,
-                time.time()
+                time.time(),
+                original_category if original_category is not None else category,
+                placement_reason
             )
         )
         self.conn.commit()
-        
+
         logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id} (category: {category}, source_type: {source_type})")
     
     def get_discord_message_info(self, telegram_entry_id):
@@ -285,6 +337,7 @@ class Database:
         if row is None:
             return None
         
+        keys = row.keys()
         return {
             'telegram_message_id': row['telegram_message_id'],
             'discord_channel_id': row['discord_channel_id'],
@@ -296,7 +349,9 @@ class Database:
             'source_type': row['source_type'],
             'reasoning': row['reasoning'],
             'timestamp': row['timestamp'],
-            'user_edited': row['user_edited'] if 'user_edited' in row.keys() else 0
+            'user_edited': row['user_edited'] if 'user_edited' in keys else 0,
+            'original_category': row['original_category'] if 'original_category' in keys else row['category'],
+            'placement_reason': row['placement_reason'] if 'placement_reason' in keys else None
         }
     
     def get_entry_id_by_discord_message(self, discord_message_id):
@@ -321,13 +376,48 @@ class Database:
     def delete_message_mapping(self, entry_id):
         """
         Delete a message mapping by entry ID
-        
+
         Args:
             entry_id: Entry ID to delete
         """
         self.conn.execute("DELETE FROM message_mapping WHERE entry_id = ?", (entry_id,))
         self.conn.commit()
         logger.debug(f"Deleted message mapping: {entry_id}")
+
+    def get_ignore_entry_previews(self, limit=30, max_preview_length=150):
+        """
+        Get content previews for entries categorized as 'ignore', for use as negative
+        examples in the AI system prompt. User-recategorized ignores (where the AI
+        originally chose a different category) are prioritized as stronger signals.
+
+        Args:
+            limit: Maximum number of entries to return
+            max_preview_length: Truncate each preview to this many characters
+
+        Returns:
+            list of (preview_str, user_flagged_bool) tuples
+        """
+        rows = self.conn.execute(
+            """SELECT content, original_category
+               FROM message_mapping
+               WHERE category = 'ignore'
+                 AND content IS NOT NULL
+                 AND content != ''
+               ORDER BY
+                   CASE WHEN original_category IS NOT NULL AND original_category != 'ignore' THEN 0 ELSE 1 END,
+                   timestamp DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        results = []
+        for row in rows:
+            preview = (row['content'] or '')[:max_preview_length]
+            user_flagged = (
+                row['original_category'] is not None and
+                row['original_category'] != 'ignore'
+            )
+            results.append((preview, user_flagged))
+        return results
     
     def update_message_mapping_fields(self, entry_id, **kwargs):
         """

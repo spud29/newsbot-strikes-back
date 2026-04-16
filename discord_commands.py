@@ -4,93 +4,61 @@ Discord context menu command registration for the news aggregator bot
 import discord
 from discord import app_commands
 import asyncio
-import re
 import time
-import requests
 import config
 from utils import logger
-from discord_ui import RecategorizeView, EditTextModal
+from discord_ui import RecategorizeView, SetCategoryView, EditTextModal
 
 
-def generate_thread_title(content):
-    """
-    Generate a concise thread title from content using Ollama
 
-    Args:
-        content: The content to summarize
+def _build_entry_info_embed(entry_id, entry_data):
+    """Build a Discord embed showing full metadata for an entry."""
+    import datetime
 
-    Returns:
-        str: A short thread title (max 100 chars for Discord)
-    """
-    try:
-        # Use Ollama to generate a very short summary for the thread title
-        prompt = f"""Summarize this news headline in 5-8 words for a thread title. Be concise and capture the main topic.
+    category = entry_data.get('category', 'unknown')
+    original_category = entry_data.get('original_category')
+    placement_reason = entry_data.get('placement_reason') or 'Not recorded (legacy entry)'
+    reasoning = entry_data.get('reasoning') or 'None'
+    source_url = entry_data.get('source_url') or 'None'
+    source_type = entry_data.get('source_type') or 'unknown'
+    user_edited = bool(entry_data.get('user_edited'))
+    timestamp = entry_data.get('timestamp')
 
-IMPORTANT RULES:
-- Use ONLY plain text words (no emojis, no special characters)
-- Do not use quotes or punctuation at the end
-- Keep it simple and descriptive
-- Example: "Company Layoffs Increase 44 Percent"
+    recategorized = original_category and original_category != category
+    embed = discord.Embed(
+        title="Entry Info",
+        color=discord.Color.orange() if recategorized else discord.Color.blurple()
+    )
 
-News: {content[:500]}
+    embed.add_field(name="Entry ID", value=f"`{entry_id}`", inline=False)
+    embed.add_field(name="Current Category", value=category, inline=True)
+    if recategorized:
+        embed.add_field(name="Original Category", value=original_category, inline=True)
+    embed.add_field(name="Source Type", value=source_type, inline=True)
 
-Thread title:"""
+    # Truncate placement_reason and reasoning to fit Discord's 1024-char field limit
+    if len(placement_reason) > 1020:
+        placement_reason = placement_reason[:1020] + "..."
+    embed.add_field(name="Why It's Here", value=placement_reason, inline=False)
 
-        payload = {
-            "model": config.OLLAMA_CATEGORIZATION_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.3,
-                "num_predict": 30  # Limit tokens for short response
-            }
-        }
+    if len(reasoning) > 1020:
+        reasoning = reasoning[:1020] + "..."
+    embed.add_field(name="AI Reasoning", value=reasoning, inline=False)
 
-        response = requests.post(
-            f"{config.OLLAMA_BASE_URL}/api/generate",
-            json=payload,
-            timeout=10
-        )
+    embed.add_field(name="Source URL", value=source_url if source_url != 'None' else 'None', inline=False)
 
-        if response.status_code == 200:
-            result = response.json()
-            title = result.get('response', '').strip()
+    flags = []
+    if recategorized:
+        flags.append("Re-categorized")
+    if user_edited:
+        flags.append("Text edited")
+    embed.add_field(name="Flags", value=", ".join(flags) if flags else "None", inline=True)
 
-            # Clean up the title
-            title = title.replace('"', '').replace("'", "").strip()
+    if timestamp:
+        dt = datetime.datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M UTC")
+        embed.add_field(name="Processed At", value=dt, inline=True)
 
-            # Remove any leading/trailing emojis and validate it contains actual text
-            # Check if title is empty or contains only emojis/special chars
-            # Remove all emojis and special characters to check if there's actual text
-            text_only = re.sub(r'[^\w\s]', '', title)
-
-            if not text_only.strip():
-                # Title is empty or only contains emojis/special chars
-                logger.warning(f"Ollama returned invalid title (no text): '{title}', using fallback")
-                # Fallback to simple truncation of content
-                simple_title = content[:70].strip()
-                if len(content) > 70:
-                    simple_title += "..."
-                return f"🔍 {simple_title}"
-
-            # Ensure it fits Discord's 100 char limit (with emoji prefix)
-            max_length = 97  # Leave room for emoji
-            if len(title) > max_length:
-                title = title[:max_length-3] + "..."
-
-            # Add emoji and return
-            return f"🔍 {title}"
-        else:
-            logger.warning(f"Failed to generate thread title, using default")
-            return "🔍 Additional Context"
-
-    except Exception as e:
-        logger.error(f"Error generating thread title: {e}")
-        # Fallback to simple truncation of content
-        simple_title = content[:70].strip()
-        if len(content) > 70:
-            simple_title += "..."
-        return f"🔍 {simple_title}"
+    return embed
 
 
 def register_commands(poster):
@@ -102,181 +70,53 @@ def register_commands(poster):
                 .perplexity_client, .database, .removed_entries_db)
     """
 
-    def extract_message_text(message: discord.Message) -> str:
-        """Extract all readable text from a message, including rich embed fields."""
-        parts = []
-
-        if message.content:
-            parts.append(message.content)
-
-        for embed in message.embeds:
-            if embed.author and embed.author.name:
-                parts.append(embed.author.name)
-            if embed.title:
-                parts.append(embed.title)
-            if embed.description:
-                parts.append(embed.description)
-            for field in embed.fields:
-                if field.name:
-                    parts.append(field.name)
-                if field.value:
-                    parts.append(field.value)
-            if embed.footer and embed.footer.text:
-                parts.append(embed.footer.text)
-
-        return "\n".join(parts).strip()
-
-    # Define the command function
-    async def get_more_info(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to get additional information via Perplexity AI"""
-        logger.debug(f"'Get More Info' command triggered by user {interaction.user.id} on message {message.id}")
+    # Define the Entry Info command function
+    async def entry_info(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to show full entry metadata for a bot message"""
+        logger.debug(f"'Entry Info' command triggered by user {interaction.user.id} on message {message.id}")
         try:
-            # Defer response IMMEDIATELY to avoid timeout (Discord gives 3 seconds)
-            logger.debug("Deferring interaction response...")
-            await interaction.response.defer(ephemeral=True)
-            logger.debug("Interaction deferred successfully")
-
-            # Check if Perplexity is enabled
-            enable_perplexity = getattr(config, 'PERPLEXITY_BUTTON_ENABLED', True)
-            if not enable_perplexity or not poster.perplexity_client or not poster.perplexity_client.is_available():
-                await interaction.followup.send(
-                    "❌ Perplexity search is not available. API key may not be configured.",
+            if message.author != poster.client.user:
+                await interaction.response.send_message(
+                    "❌ This command only works on messages posted by the bot.",
                     ephemeral=True
                 )
                 return
 
-            content = extract_message_text(message)
-            if not content:
-                await interaction.followup.send(
-                    "❌ No readable text found in this message.",
+            entry_id = None
+            entry_data = None
+
+            if poster.database:
+                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                if entry_id:
+                    entry_data = poster.database.get_discord_message_info(entry_id)
+
+            if not entry_id or not entry_data:
+                await interaction.response.send_message(
+                    "❌ No database record found for this message.",
                     ephemeral=True
                 )
                 return
 
-            logger.info(f"'Get More Info' command invoked by user {interaction.user.id} on message {message.id}")
-
-            # Perform the Perplexity search
-            result = poster.perplexity_client.search(content)
-
-            if result['success'] and result.get('answer'):
-                answer = result['answer']
-                citations = result.get('citations', [])
-
-                # Generate a descriptive thread name based on content
-                logger.debug("Generating thread title from content...")
-                thread_name = await asyncio.to_thread(generate_thread_title, content)
-                logger.debug(f"Generated thread title: {thread_name}")
-
-                try:
-                    thread = await message.create_thread(
-                        name=thread_name,
-                        auto_archive_duration=1440  # 24 hours
-                    )
-                    logger.info(f"Created thread {thread.id} for Perplexity response")
-
-                    # Truncate if needed
-                    max_length = 3900
-                    truncated = False
-                    if len(answer) > max_length:
-                        answer = answer[:max_length] + "..."
-                        truncated = True
-
-                    # Create embed for answer
-                    embed = discord.Embed(
-                        title="Additional Context from Perplexity AI",
-                        description=answer,
-                        color=discord.Color.blue()
-                    )
-
-                    if truncated:
-                        embed.set_footer(text="⚠️ Answer truncated due to length")
-                    else:
-                        embed.set_footer(text="Powered by Perplexity AI")
-
-                    await thread.send(embed=embed)
-
-                    # Add citations if available
-                    if citations:
-                        logger.info(f"Adding {len(citations)} citations to thread")
-                        citations_text = ""
-
-                        if isinstance(citations, list):
-                            for i, citation in enumerate(citations, 1):
-                                if isinstance(citation, dict):
-                                    url = citation.get('url', citation.get('link', ''))
-                                    title = citation.get('title', citation.get('name', citation.get('domain', 'Source')))
-                                    if url:
-                                        citations_text += f"{i}. [{title}]({url})\n"
-                                    else:
-                                        citations_text += f"{i}. {title}\n"
-                                elif isinstance(citation, str):
-                                    citations_text += f"{i}. {citation}\n"
-                                else:
-                                    citations_text += f"{i}. {str(citation)}\n"
-
-                        if len(citations_text) > 3900:
-                            citations_text = citations_text[:3900] + "..."
-
-                        citations_embed = discord.Embed(
-                            title="📚 Sources & Citations",
-                            description=citations_text if citations_text else "No citations available.",
-                            color=discord.Color.green()
-                        )
-                        citations_embed.set_footer(text=f"{len(citations)} source(s)")
-                        await thread.send(embed=citations_embed)
-
-                    await interaction.followup.send(
-                        f"✅ Additional context posted in thread: {thread.mention}",
-                        ephemeral=True
-                    )
-                    logger.info(f"Successfully posted Perplexity response in thread {thread.id}")
-
-                except discord.Forbidden:
-                    logger.error("Bot lacks permission to create threads")
-                    await interaction.followup.send(
-                        "❌ Unable to create thread. Bot may lack thread permissions.",
-                        ephemeral=True
-                    )
-                except discord.HTTPException as e:
-                    logger.error(f"Failed to create thread: {e}")
-                    await interaction.followup.send(
-                        f"❌ Failed to create thread: {str(e)}",
-                        ephemeral=True
-                    )
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                await interaction.followup.send(
-                    f"❌ Search failed: {error_msg}",
-                    ephemeral=True
-                )
-                logger.error(f"Perplexity search failed: {error_msg}")
+            embed = _build_entry_info_embed(entry_id, entry_data)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            logger.info(f"'Entry Info' shown for entry {entry_id} to user {interaction.user.id}")
 
         except Exception as e:
-            logger.error(f"Error in 'Get More Info' command: {e}", exc_info=True)
+            logger.error(f"Error in 'Entry Info' command: {e}", exc_info=True)
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                    await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
                 else:
-                    await interaction.response.send_message(
-                        f"❌ An error occurred: {str(e)}",
-                        ephemeral=True
-                    )
+                    await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
             except:
                 pass
 
-    # Manually add the command to the tree
-    get_more_info_cmd = app_commands.ContextMenu(
-        name="Get More Info",
-        callback=get_more_info
+    entry_info_cmd = app_commands.ContextMenu(
+        name="Entry Info",
+        callback=entry_info
     )
-    poster.tree.add_command(get_more_info_cmd)
-    logger.debug("Registered 'Get More Info' context menu command")
-
-    # NOTE: "Not Valuable" context menu command was removed to stay within
-    # Discord's 5 message context menu command limit. Edit Text took its slot.
+    poster.tree.add_command(entry_info_cmd)
+    logger.debug("Registered 'Entry Info' context menu command")
 
     # Define the Re-categorize command function
     async def recategorize(interaction: discord.Interaction, message: discord.Message):
@@ -335,13 +175,13 @@ def register_commands(poster):
                 f"Entry {entry_id} currently in {current_category}"
             )
 
-            # Get available categories
-            available_categories = list(config.DISCORD_CHANNELS.keys())
+            # Get available categories (only ignore and unified channel for simplified routing)
+            available_categories = [config.DEFAULT_CATEGORY, "__unified__"]
 
-            # Show an ephemeral dropdown so the user can pick a category
+            # Show an ephemeral dropdown so the user can pick a channel
             view = RecategorizeView(current_category, available_categories, entry_id, entry_data, message, poster)
             await interaction.response.send_message(
-                f"Select a new category for this entry (currently **{current_category}**):",
+                f"Route this entry (currently **{current_category}**):",
                 view=view,
                 ephemeral=True
             )
@@ -362,25 +202,37 @@ def register_commands(poster):
             except:
                 pass
 
-    # Manually add the Re-categorize command to the tree
+    # Manually add the Move to Channel command to the tree
     recategorize_cmd = app_commands.ContextMenu(
-        name="Re-categorize",
+        name="Move to Channel",
         callback=recategorize
     )
     poster.tree.add_command(recategorize_cmd)
-    logger.debug("Registered 'Re-categorize' context menu command")
+    logger.debug("Registered 'Move to Channel' context menu command")
 
-    # Define the Source command function
-    async def source(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to show the original Telegram/Twitter source URL"""
-        logger.debug(f"'Source' command triggered by user {interaction.user.id} on message {message.id}")
+    # Define the Re-categorize (label-only) command function
+    async def recategorize_label(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to re-categorize an entry and update its category tag"""
+        logger.debug(f"'Re-categorize' (label) command triggered by user {interaction.user.id} on message {message.id}")
         try:
-            # Check if Source command is enabled
-            if not getattr(config, 'SOURCE_COMMAND_ENABLED', True):
+            # FAST CHECKS FIRST - these don't require database lookups
+            # Check if re-categorize is enabled
+            enable_recategorize = getattr(config, 'RECATEGORIZE_COMMAND_ENABLED', True)
+            if not enable_recategorize:
                 await interaction.response.send_message(
                     "❌ This feature is not enabled.",
                     ephemeral=True
                 )
+                return
+
+            # Check if user is authorized
+            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+            if interaction.user.id not in allowed_user_ids:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.",
+                    ephemeral=True
+                )
+                logger.warning(f"Unauthorized re-categorize attempt by user {interaction.user.id}")
                 return
 
             # Check if message is from the bot
@@ -391,14 +243,17 @@ def register_commands(poster):
                 )
                 return
 
-            # Look up the entry in the database
+            # Find the entry in the database using optimized reverse lookup
             entry_id = None
             entry_data = None
+            current_category = None
 
             if poster.database:
+                # Use reverse index if available, otherwise fall back to iteration
                 entry_id = poster.database.get_entry_id_by_discord_message(message.id)
                 if entry_id:
                     entry_data = poster.database.get_discord_message_info(entry_id)
+                    current_category = entry_data.get('category', 'unknown') if entry_data else 'unknown'
 
             if not entry_id or not entry_data:
                 await interaction.response.send_message(
@@ -407,24 +262,24 @@ def register_commands(poster):
                 )
                 return
 
-            source_url = entry_data.get('source_url')
+            logger.info(
+                f"Re-categorize (label) command from user {interaction.user.id}: "
+                f"Entry {entry_id} currently in {current_category}"
+            )
 
-            if not source_url:
-                await interaction.response.send_message(
-                    "❌ No source URL found for this entry.",
-                    ephemeral=True
-                )
-                return
+            # Get available categories (all except ignore, and excluding current category)
+            available_categories = [cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY]
 
-            # Send the source URL wrapped in angle brackets to suppress Discord embeds
+            # Show an ephemeral dropdown so the user can pick a category
+            view = SetCategoryView(current_category, available_categories, entry_id, entry_data, message, poster)
             await interaction.response.send_message(
-                f"<{source_url}>",
+                f"Select a new category for this entry (currently **{current_category}**):",
+                view=view,
                 ephemeral=True
             )
-            logger.info(f"'Source' shown for entry {entry_id}: {source_url}")
 
         except Exception as e:
-            logger.error(f"Error in 'Source' command: {e}", exc_info=True)
+            logger.error(f"Error in 'Re-categorize' (label) command: {e}", exc_info=True)
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(
@@ -439,13 +294,13 @@ def register_commands(poster):
             except:
                 pass
 
-    # Manually add the Source command to the tree
-    source_cmd = app_commands.ContextMenu(
-        name="Source",
-        callback=source
+    # Manually add the Re-categorize (label-only) command to the tree
+    recategorize_label_cmd = app_commands.ContextMenu(
+        name="Re-categorize",
+        callback=recategorize_label
     )
-    poster.tree.add_command(source_cmd)
-    logger.debug("Registered 'Source' context menu command")
+    poster.tree.add_command(recategorize_label_cmd)
+    logger.debug("Registered 'Re-categorize' (label-only) context menu command")
 
     # Define the Edit Text command function
     async def edit_text(interaction: discord.Interaction, message: discord.Message):
@@ -524,12 +379,12 @@ def register_commands(poster):
     poster.tree.add_command(edit_text_cmd)
     logger.debug("Registered 'Edit Text' context menu command")
 
-    # Define the Reprocess Entry command function
-    async def reprocess_entry(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to re-run the full pipeline on an already-posted bot message (admin only)"""
-        logger.debug(f"'Reprocess Entry' triggered by user {interaction.user.id} on message {message.id}")
+    # Define the Delete Message command function
+    async def delete_message(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to force-delete any bot message from Discord (admin only)"""
+        logger.debug(f"'Delete Message' triggered by user {interaction.user.id} on message {message.id}")
         try:
-            if not getattr(config, 'REPROCESS_COMMAND_ENABLED', True):
+            if not getattr(config, 'DELETE_COMMAND_ENABLED', True):
                 await interaction.response.send_message("❌ This feature is not enabled.", ephemeral=True)
                 return
 
@@ -538,7 +393,7 @@ def register_commands(poster):
                 await interaction.response.send_message(
                     "❌ You don't have permission to use this command.", ephemeral=True
                 )
-                logger.warning(f"Unauthorized reprocess attempt by user {interaction.user.id}")
+                logger.warning(f"Unauthorized delete attempt by user {interaction.user.id}")
                 return
 
             if message.author != poster.client.user:
@@ -547,44 +402,39 @@ def register_commands(poster):
                 )
                 return
 
-            if not poster.reprocess_callback:
-                await interaction.response.send_message(
-                    "❌ Reprocess is not available (callback not registered).", ephemeral=True
-                )
-                return
+            # Delete the Discord message directly — no DB lookup required.
+            # This works even for duplicate posts that have no database mapping.
+            await message.delete()
 
-            entry_id = poster.database.get_entry_id_by_discord_message(message.id) if poster.database else None
-            if not entry_id:
-                await interaction.response.send_message(
-                    "❌ Could not find entry data for this message.", ephemeral=True
-                )
-                return
+            # Best-effort DB cleanup: remove the record if one exists.
+            entry_id = None
+            if poster.database:
+                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+                if entry_id:
+                    try:
+                        poster.database.delete_processed(entry_id)
+                        poster.database.delete_embedding_by_entry_id(entry_id)
+                        poster.database.delete_message_mapping(entry_id)
+                        logger.info(f"Cleaned up DB records for deleted entry {entry_id}")
+                    except Exception as db_err:
+                        logger.warning(f"DB cleanup after delete failed for {entry_id}: {db_err}")
 
-            entry_data = poster.database.get_discord_message_info(entry_id)
-            if not entry_data:
-                await interaction.response.send_message(
-                    "❌ Could not retrieve entry details.", ephemeral=True
-                )
-                return
+            confirmation = f"✅ Message deleted."
+            if entry_id:
+                confirmation += f" (entry `{entry_id}` removed from database)"
+            else:
+                confirmation += " (no database record found — duplicate or unmapped message)"
 
+            await interaction.response.send_message(confirmation, ephemeral=True)
+            logger.info(f"User {interaction.user.id} deleted bot message {message.id} (entry: {entry_id})")
+
+        except discord.Forbidden:
+            logger.error(f"Bot lacks permission to delete message {message.id}")
             await interaction.response.send_message(
-                f"⚙️ Reprocessing `{entry_id}`... A new post will appear shortly.",
-                ephemeral=True
+                "❌ Bot lacks permission to delete this message.", ephemeral=True
             )
-
-            original_channel_id = message.channel.id
-            original_message_id = message.id
-
-            async def run_reprocess():
-                try:
-                    await poster.reprocess_callback(entry_id, entry_data, original_channel_id, original_message_id)
-                except Exception as e:
-                    logger.error(f"Background reprocess task failed for {entry_id}: {e}", exc_info=True)
-
-            asyncio.create_task(run_reprocess())
-
         except Exception as e:
-            logger.error(f"Error in 'Reprocess Entry' command: {e}", exc_info=True)
+            logger.error(f"Error in 'Delete Message' command: {e}", exc_info=True)
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
@@ -593,9 +443,9 @@ def register_commands(poster):
             except:
                 pass
 
-    reprocess_entry_cmd = app_commands.ContextMenu(name="Reprocess Entry", callback=reprocess_entry)
-    poster.tree.add_command(reprocess_entry_cmd)
-    logger.debug("Registered 'Reprocess Entry' context menu command")
+    delete_message_cmd = app_commands.ContextMenu(name="Delete Message", callback=delete_message)
+    poster.tree.add_command(delete_message_cmd)
+    logger.debug("Registered 'Delete Message' context menu command")
 
     # --- /news slash command ---
     # Per-user cooldown tracking

@@ -2,6 +2,7 @@
 Media handler for downloading media from Twitter and Telegram
 """
 import os
+import sys
 import json
 import subprocess
 import asyncio
@@ -9,6 +10,7 @@ from pathlib import Path
 from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, strip_wire_prefixes, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls
 import config
 from ocr_handler import OCRHandler
+from transcription_handler import TranscriptionHandler
 
 class GalleryDlFailure(Exception):
     """Raised when gallery-dl fails to extract tweet content"""
@@ -27,6 +29,7 @@ class MediaHandler:
         self.telegram_client = telegram_client
         self.temp_dir = get_temp_dir()
         self.ocr_handler = OCRHandler()
+        self.transcription_handler = TranscriptionHandler()
         logger.info("Media handler initialized")
     
     @retry_with_backoff(max_retries=3, initial_delay=2)
@@ -58,7 +61,7 @@ class MediaHandler:
             # text-only tweets (--print only outputs when media items are found)
             logger.debug(f"Extracting tweet text using gallery-dl from: {link}")
             text_cmd = [
-                'gallery-dl',
+                sys.executable, '-m', 'gallery_dl',
                 '--dump-json',
                 '--range', '1',
                 '--no-download',
@@ -109,10 +112,15 @@ class MediaHandler:
             if not full_text:
                 logger.info(f"gallery-dl returned no content, falling back to RSS feed content")
                 full_text = entry.get('content', '')
-                # Apply basic cleaning to RSS fallback content
+                # Apply the same cleaning pipeline as gallery-dl content
                 if full_text:
                     full_text = clean_text_content(full_text)
                     full_text = resolve_shortened_urls(full_text)
+                    full_text = remove_emojis(full_text)
+                    full_text = remove_corrupted_emoji_marks(full_text)
+                    full_text = strip_wire_prefixes(full_text)
+                    full_text = remove_xcom_urls(full_text)
+                    full_text = remove_twitter_attribution(full_text)
                 else:
                     # Only raise exception if both gallery-dl AND RSS have no content
                     logger.warning(f"No content available from gallery-dl or RSS for: {link}")
@@ -121,7 +129,7 @@ class MediaHandler:
             # Extract video URLs using gallery-dl -g
             video_urls = []
             video_url_cmd = [
-                'gallery-dl',
+                sys.executable, '-m', 'gallery_dl',
                 '--range', '1',
                 '-g',
                 link
@@ -149,7 +157,7 @@ class MediaHandler:
             video_duration = None
             if video_urls:
                 duration_cmd = [
-                    'gallery-dl',
+                    sys.executable, '-m', 'gallery_dl',
                     '--print', '{duration}',
                     '--range', '1',
                     '--no-download',
@@ -175,7 +183,7 @@ class MediaHandler:
             # Now download media files (images only, skip videos)
             # Videos are handled via video_urls to avoid Discord file size limits
             media_cmd = [
-                'gallery-dl',
+                sys.executable, '-m', 'gallery_dl',
                 '--dest', download_dir,
                 '--filename', '{num:>03}.{extension}',
                 '--no-mtime',
@@ -191,7 +199,13 @@ class MediaHandler:
                 errors='replace',
                 timeout=120
             )
-            
+
+            if media_result.returncode != 0:
+                logger.warning(f"gallery-dl image download failed (return code: {media_result.returncode}) for {link}")
+                if media_result.stderr:
+                    logger.debug(f"gallery-dl image download stderr: {media_result.stderr[:500]}")
+                raise GalleryDlFailure(f"gallery-dl image download failed for {link}")
+
             # Collect downloaded media files (images only, not videos)
             media_files = []
             
@@ -222,13 +236,20 @@ class MediaHandler:
                 ocr_text = self.ocr_handler.extract_text_from_images(media_files)
                 if ocr_text:
                     logger.info(f"✓ OCR extracted {len(ocr_text)} characters from Twitter images")
-            
+
+            # Transcribe audio from the first video URL (if any)
+            audio_transcript = ""
+            if video_urls:
+                logger.debug(f"Transcribing audio from Twitter video URL...")
+                audio_transcript = self.transcription_handler.transcribe_from_url(video_urls[0])
+
             logger.debug("Assigning entry values...")
             entry['media_files'] = media_files
             entry['video_urls'] = video_urls
             entry['video_duration'] = video_duration
             entry['full_text'] = full_text
             entry['ocr_text'] = ocr_text
+            entry['audio_transcript'] = audio_transcript
             entry['download_dir'] = download_dir
             logger.debug("Entry values assigned successfully")
             
@@ -240,6 +261,7 @@ class MediaHandler:
             logger.error("gallery-dl timed out")
             entry['media_files'] = []
             entry['ocr_text'] = ""
+            entry['audio_transcript'] = ""
             return entry
         except GalleryDlFailure:
             # Re-raise GalleryDlFailure so it can be handled by retry queue
@@ -248,6 +270,7 @@ class MediaHandler:
             logger.error(f"Error downloading Twitter media: {e}")
             entry['media_files'] = []
             entry['ocr_text'] = ""
+            entry['audio_transcript'] = ""
             return entry
     
     async def download_telegram_media(self, entry):
@@ -341,10 +364,20 @@ class MediaHandler:
                     ocr_text = await asyncio.to_thread(self.ocr_handler.extract_text_from_images, image_files)
                     if ocr_text:
                         logger.info(f"✓ OCR extracted {len(ocr_text)} characters from Telegram images")
-            
+
+            # Transcribe audio from downloaded video files (if any)
+            audio_transcript = ""
+            video_files = [f for f in media_files if os.path.splitext(f)[1].lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']]
+            if video_files:
+                logger.debug(f"Transcribing audio from {len(video_files)} Telegram video(s)...")
+                audio_transcript = await asyncio.to_thread(
+                    self.transcription_handler.transcribe_audio_file, video_files[0]
+                )
+
             entry['media_files'] = media_files
             entry['video_urls'] = video_urls
             entry['ocr_text'] = ocr_text
+            entry['audio_transcript'] = audio_transcript
             entry['download_dir'] = download_dir
             
             logger.info(f"Downloaded {len(media_files)} media files from Telegram")
@@ -354,6 +387,7 @@ class MediaHandler:
             logger.error(f"Error downloading Telegram media: {e}")
             entry['media_files'] = []
             entry['ocr_text'] = ""
+            entry['audio_transcript'] = ""
             return entry
     
     async def _download_media_file(self, message, download_dir, filename_prefix):

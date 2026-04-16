@@ -9,6 +9,7 @@ import asyncio
 import re
 import aiohttp
 import tempfile
+import hashlib
 from utils import logger, retry_with_backoff, ensure_url_on_own_line
 import config
 from removed_entries import RemovedEntriesDB
@@ -179,9 +180,9 @@ class DiscordPoster:
 
     @retry_with_backoff(max_retries=3, initial_delay=2)
     async def post_message(self, category, content, media_files=None, video_urls=None, source_type=None,
-                          enable_perplexity_button=None, enable_not_valuable_button=None, entry_id=None):
+                          entry_id=None, display_category=None):
         """
-        Post a message to Discord channel (now without buttons - using context menu commands)
+        Post a message to Discord channel (context menu commands only — no buttons)
 
         Args:
             category: Category name (maps to channel ID)
@@ -189,16 +190,25 @@ class DiscordPoster:
             media_files: List of file paths to attach
             video_urls: List of video URLs to hide in message
             source_type: Type of source ('twitter' or 'telegram') to determine URL embedding
-            enable_perplexity_button: Ignored (kept for backward compatibility)
-            enable_not_valuable_button: Ignored (kept for backward compatibility)
             entry_id: Entry ID for tracking
 
         Returns:
             tuple: (success: bool, discord_message_id: int or None, discord_channel_id: int or None)
         """
+        # Derive a stable nonce from entry_id so all retry attempts use the same value.
+        # Discord deduplicates within a 5-minute window: if the first send succeeds but
+        # the response times out (causing an exception that triggers the retry), the
+        # second attempt will return the original message instead of creating a duplicate.
+        nonce = (
+            int(hashlib.sha256(entry_id.encode()).hexdigest()[:15], 16)
+            if entry_id else None
+        )
         try:
             # Get channel ID from category
-            channel_id = self.channels.get(category, self.channels[config.DEFAULT_CATEGORY])
+            if config.UNIFIED_CHANNEL_MODE and category != config.DEFAULT_CATEGORY:
+                channel_id = config.UNIFIED_CHANNEL_ID
+            else:
+                channel_id = self.channels.get(category, self.channels[config.DEFAULT_CATEGORY])
 
             logger.debug(f"Posting to category '{category}' (channel {channel_id})")
 
@@ -222,6 +232,11 @@ class DiscordPoster:
             # Ensure URLs are on their own line (fixes formatting when emoji removal
             # or text cleaning causes URLs to be glued to preceding text)
             message_text = ensure_url_on_own_line(message_text)
+
+            # Prepend bold category tag in unified channel mode
+            tag_cat = display_category or category
+            if config.UNIFIED_CHANNEL_MODE and category != config.DEFAULT_CATEGORY:
+                message_text = f"**[{tag_cat.title()}]**\n{message_text}"
 
             # Determine whether to suppress embeds using Discord's native API
             suppress_embeds = True  # Default: suppress all embeds
@@ -274,7 +289,7 @@ class DiscordPoster:
                 if len(message_text) > 4093:
                     message_text = message_text[:4093] + "..."
                 embed = discord.Embed(description=message_text, color=discord.Color.dark_grey())
-                sent_message = await channel.send(embed=embed, files=files)
+                sent_message = await channel.send(embed=embed, files=files, nonce=nonce)
             else:
                 if len(message_text) > 2000:
                     logger.warning(f"Message too long ({len(message_text)} chars), truncating to 2000")
@@ -282,7 +297,8 @@ class DiscordPoster:
                 sent_message = await channel.send(
                     content=message_text,
                     files=files,
-                    suppress_embeds=suppress_embeds
+                    suppress_embeds=suppress_embeds,
+                    nonce=nonce
                 )
 
             logger.info(
@@ -326,7 +342,7 @@ class DiscordPoster:
             raise
 
     async def recategorize_entry(self, message_id, channel_id, new_category, entry_id, content,
-                                  media_files=None, video_urls=None, source_type=None):
+                                  media_files=None, video_urls=None, source_type=None, user=None):
         """
         Move a Discord message to a different category channel
 
@@ -358,6 +374,50 @@ class DiscordPoster:
                 return False, None, None, f"Original message not found: {message_id}"
             except Exception as e:
                 return False, None, None, f"Error fetching original message: {str(e)}"
+
+            # In unified mode, recategorizing between two non-ignore categories means
+            # the message stays in the same channel — just update the tag via in-place edit.
+            if (config.UNIFIED_CHANNEL_MODE
+                    and new_category != config.DEFAULT_CATEGORY
+                    and channel_id == config.UNIFIED_CHANNEL_ID):
+
+                # Use the original AI category for the tag, not the user's routing choice
+                old_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
+                original_ai_cat = (old_info.get('original_category') if old_info else None) or new_category
+                new_text = f"**[{original_ai_cat.title()}]**\n{ensure_url_on_own_line(content)}"
+
+                if original_message.embeds and not original_message.content:
+                    if len(new_text) > 4093:
+                        new_text = new_text[:4093] + "..."
+                    updated_embed = discord.Embed(description=new_text, color=discord.Color.dark_grey())
+                    await original_message.edit(embed=updated_embed)
+                else:
+                    if len(new_text) > 2000:
+                        new_text = new_text[:1997] + "..."
+                    await original_message.edit(content=new_text, suppress=True)
+
+                # Update DB with new category (message/channel IDs stay the same)
+                if self.database and entry_id:
+                    try:
+                        import datetime
+                        old_category = old_info.get('category') if old_info else 'unknown'
+                        user_display = f"@{user.name}" if user else "unknown user"
+                        date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                        new_placement_reason = (
+                            f"User re-categorization: moved from '{old_category}' to '{new_category}' "
+                            f"by {user_display} on {date_str}"
+                        )
+                        self.database.update_message_mapping_fields(
+                            entry_id,
+                            category=new_category,
+                            placement_reason=new_placement_reason
+                        )
+                        logger.info(f"Updated message mapping category for entry {entry_id}")
+                    except Exception as e:
+                        logger.error(f"Error updating database: {e}")
+
+                logger.info(f"In-place re-categorized entry {entry_id} to {new_category} (message {message_id})")
+                return True, message_id, channel_id, None
 
             # Check if the message has a thread and extract Perplexity content
             thread_data = None
@@ -409,6 +469,10 @@ class DiscordPoster:
                         pass
                 return False, None, None, f"Error deleting original message: {str(e)}"
 
+            # Look up the original AI category so the tag reflects topic, not routing choice
+            cross_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
+            original_ai_cat = (cross_info.get('original_category') if cross_info else None) or new_category
+
             # Post to new channel
             success, new_message_id, new_channel_id = await self.post_message(
                 category=new_category,
@@ -416,7 +480,8 @@ class DiscordPoster:
                 media_files=media_files,
                 video_urls=video_urls,
                 source_type=source_type,
-                entry_id=entry_id
+                entry_id=None,  # no nonce — avoids 5-min deduplication collision with the just-deleted original
+                display_category=original_ai_cat,
             )
 
             # Clean up downloaded temporary files
@@ -469,12 +534,21 @@ class DiscordPoster:
             # Update database message mapping
             if self.database and entry_id:
                 try:
-                    # Update the message mapping with new Discord message ID and channel
+                    import datetime
+                    old_info = self.database.get_discord_message_info(entry_id)
+                    old_category = old_info.get('category') if old_info else 'unknown'
+                    user_display = f"@{user.name}" if user else "unknown user"
+                    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    new_placement_reason = (
+                        f"User re-categorization: moved from '{old_category}' to '{new_category}' "
+                        f"by {user_display} on {date_str}"
+                    )
                     self.database.update_message_mapping_fields(
                         entry_id,
                         discord_message_id=new_message_id,
                         discord_channel_id=new_channel_id,
-                        category=new_category
+                        category=new_category,
+                        placement_reason=new_placement_reason
                     )
                     logger.info(f"Updated message mapping for entry {entry_id}")
                 except Exception as e:
@@ -488,8 +562,97 @@ class DiscordPoster:
             logger.error(f"Error in recategorize_entry: {e}", exc_info=True)
             return False, None, None, str(e)
 
+    async def update_category_tag(self, message_id, channel_id, new_category, entry_id, content, user=None):
+        """
+        Update the category tag of a message in-place without moving it to a different channel.
+        This only updates the **[Category]** prefix and the database category field.
+
+        Args:
+            message_id: Discord message ID
+            channel_id: Discord channel ID where message is located
+            new_category: New category string (e.g. 'crypto')
+            entry_id: Database entry ID
+            content: Current message content
+            user: discord.Member who triggered (for audit trail)
+
+        Returns:
+            tuple: (success: bool, error_msg: str|None)
+        """
+        try:
+            logger.debug(f"Updating category tag for message {message_id}: '{new_category}'")
+
+            # Get the channel
+            channel = self.client.get_channel(channel_id)
+            if not channel:
+                return False, f"Could not find Discord channel: {channel_id}"
+
+            # Fetch the original message
+            try:
+                original_message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                return False, f"Discord message not found: {message_id}"
+            except discord.Forbidden:
+                return False, f"No permission to access message: {message_id}"
+
+            # Get the old category from database for logging
+            old_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
+            old_category = old_info.get('category') if old_info else 'unknown'
+
+            # Build new text with updated category tag
+            new_text = f"**[{new_category.title()}]**\n{ensure_url_on_own_line(content)}"
+
+            # Re-append hidden video URL links so the embed persists (same logic as post_message)
+            suppress_embeds = True
+            video_urls = old_info.get('video_urls', []) if old_info else []
+            source_type = old_info.get('source_type') if old_info else None
+            if source_type == 'twitter' and video_urls:
+                suppress_embeds = False
+                for video_url in video_urls:
+                    if video_url.startswith('http'):
+                        new_text += f" [.]({video_url})"
+
+            # Handle both embed and plain text messages
+            if original_message.embeds and not original_message.content:
+                # Message was posted as an embed (long Telegram format)
+                if len(new_text) > 4093:
+                    new_text = new_text[:4093] + "..."
+                updated_embed = discord.Embed(description=new_text, color=discord.Color.dark_grey())
+                await original_message.edit(embed=updated_embed)
+            else:
+                # Plain text message
+                if len(new_text) > 2000:
+                    new_text = new_text[:1997] + "..."
+                await original_message.edit(content=new_text, suppress=suppress_embeds)
+
+            # Update database with new category
+            if self.database and entry_id:
+                try:
+                    import datetime
+                    user_display = f"@{user.name}" if user else "unknown user"
+                    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    new_placement_reason = (
+                        f"User label update: changed category from '{old_category}' to '{new_category}' "
+                        f"by {user_display} on {date_str}"
+                    )
+                    self.database.update_message_mapping_fields(
+                        entry_id,
+                        category=new_category,
+                        placement_reason=new_placement_reason
+                    )
+                    logger.info(f"Updated category tag for entry {entry_id} to {new_category}")
+                except Exception as e:
+                    logger.error(f"Error updating database: {e}")
+                    return False, f"Database update failed: {str(e)}"
+
+            logger.info(f"Successfully updated category tag for entry {entry_id} from {old_category} to {new_category}")
+            return True, None
+
+        except Exception as e:
+            logger.error(f"Error in update_category_tag: {e}", exc_info=True)
+            return False, str(e)
+
     @retry_with_backoff(max_retries=3, initial_delay=2)
-    async def edit_message(self, channel_id, message_id, content, source_type=None):
+    async def edit_message(self, channel_id, message_id, content, source_type=None, category=None):
         """
         Edit an existing Discord message
 
@@ -528,6 +691,10 @@ class DiscordPoster:
             # Ensure URLs are on their own line (fixes formatting when emoji removal
             # or text cleaning causes URLs to be glued to preceding text)
             message_text = ensure_url_on_own_line(message_text)
+
+            # Re-prepend category tag in unified channel mode
+            if config.UNIFIED_CHANNEL_MODE and category and category != config.DEFAULT_CATEGORY:
+                message_text = f"**[{category.title()}]**\n{message_text}"
 
             # For edits, always suppress embeds by default
             # (edit_message doesn't receive video_urls parameter, so we keep it simple)

@@ -42,7 +42,7 @@ class TelegramPoller:
             session_path = os.path.join(session_dir, 'newsbot_session')
             
             self.client = TelegramClient(session_path, self.api_id, self.api_hash)
-            await self.client.start()
+            await self.client.start(password=config.TELEGRAM_2FA_PASSWORD or None)
             logger.info(f"Telegram client started (session: {session_path})")
             
             # Set up real-time event handlers
