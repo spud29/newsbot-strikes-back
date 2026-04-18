@@ -77,3 +77,9 @@ twitter_cookies.txt
 .DS_Store
 Thumbs.db
 
+# Eval harness — per-run reports and pending variants are ephemeral;
+# golden set, history, baseline variant, weekly reports, and scheduler scripts are checked in.
+evals/runs/
+evals/variants/pending/
+evals/.tuning.lock
+
