@@ -47,6 +47,7 @@ class DiscordPoster:
         self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
 
         self.reprocess_callback = None  # Set by NewsAggregatorBot.start()
+        self.media_handler = None       # Set by NewsAggregatorBot.start()
 
         # Register context menu commands
         register_commands(self)
@@ -758,6 +759,52 @@ class DiscordPoster:
             return True
         except Exception as e:
             logger.error(f"delete_message error: {e}", exc_info=True)
+            return False
+
+    async def post_superseded_entry(self, old_mapping, new_entry_preview):
+        """
+        Post a record of a superseded entry to the dedicated superseded channel.
+
+        Args:
+            old_mapping: dict from get_discord_message_info() for the superseded entry
+            new_entry_preview: first ~200 chars of the new entry that superseded it
+
+        Returns:
+            bool: True if posted, False on error (non-fatal)
+        """
+        channel_id = getattr(config, 'SUPERSEDED_CHANNEL_ID', None)
+        if not channel_id:
+            return False
+        channel = self.client.get_channel(channel_id)
+        if not channel:
+            logger.warning(f"post_superseded_entry: could not find superseded channel {channel_id}")
+            return False
+        try:
+            import datetime
+            ts = old_mapping.get('timestamp')
+            posted_at = (
+                datetime.datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+                if ts else 'unknown'
+            )
+            old_content = old_mapping.get('content', '') or ''
+            preview = old_content[:300] + ('…' if len(old_content) > 300 else '')
+            source_url = old_mapping.get('source_url') or 'N/A'
+            category = old_mapping.get('category', 'unknown')
+            new_preview = (new_entry_preview or '')[:200]
+
+            lines = [
+                "**[SUPERSEDED]**",
+                f"**Was in:** `{category}`",
+                f"**Posted at:** {posted_at}",
+                f"**Source:** {source_url}",
+                f"**Original content:**\n{preview}",
+                f"**Superseded by:** {new_preview}",
+            ]
+            await channel.send('\n'.join(lines))
+            logger.info(f"Posted superseded entry to channel {channel_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"post_superseded_entry error (non-fatal): {e}")
             return False
 
     async def _verify_channel_access(self):

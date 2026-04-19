@@ -4,6 +4,7 @@ Discord context menu command registration for the news aggregator bot
 import discord
 from discord import app_commands
 import asyncio
+import json
 import time
 import config
 from utils import logger
@@ -36,14 +37,21 @@ def _build_entry_info_embed(entry_id, entry_data):
         embed.add_field(name="Original Category", value=original_category, inline=True)
     embed.add_field(name="Source Type", value=source_type, inline=True)
 
-    # Truncate placement_reason and reasoning to fit Discord's 1024-char field limit
     if len(placement_reason) > 1020:
         placement_reason = placement_reason[:1020] + "..."
     embed.add_field(name="Why It's Here", value=placement_reason, inline=False)
 
-    if len(reasoning) > 1020:
-        reasoning = reasoning[:1020] + "..."
-    embed.add_field(name="AI Reasoning", value=reasoning, inline=False)
+    # Show only the AI's categorization rationale, not the filter override details
+    # (those are already covered by "Why It's Here")
+    import re
+    display_reasoning = reasoning
+    if " | OVERRIDDEN:" in reasoning:
+        ai_part = reasoning.split(" | OVERRIDDEN:")[0]
+        ai_part = re.sub(r"^AI suggested '[^']+': ", "", ai_part).strip()
+        display_reasoning = ai_part or reasoning
+    if len(display_reasoning) > 1020:
+        display_reasoning = display_reasoning[:1020] + "..."
+    embed.add_field(name="AI Reasoning", value=display_reasoning, inline=False)
 
     embed.add_field(name="Source URL", value=source_url if source_url != 'None' else 'None', inline=False)
 
@@ -379,13 +387,17 @@ def register_commands(poster):
     poster.tree.add_command(edit_text_cmd)
     logger.debug("Registered 'Edit Text' context menu command")
 
-    # Define the Delete Message command function
-    async def delete_message(interaction: discord.Interaction, message: discord.Message):
-        """Context menu command to force-delete any bot message from Discord (admin only)"""
-        logger.debug(f"'Delete Message' triggered by user {interaction.user.id} on message {message.id}")
+
+
+    # Define the Restore Original command function
+    async def restore_original(interaction: discord.Interaction, message: discord.Message):
+        """Context menu command to reverse a supersede and restore the original entry"""
+        logger.debug(f"'Restore Original' triggered by user {interaction.user.id} on message {message.id}")
         try:
-            if not getattr(config, 'DELETE_COMMAND_ENABLED', True):
-                await interaction.response.send_message("❌ This feature is not enabled.", ephemeral=True)
+            if not getattr(config, 'SUPERSEDE_ENABLED', False):
+                await interaction.response.send_message(
+                    "❌ Supersede is not enabled.", ephemeral=True
+                )
                 return
 
             allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
@@ -393,7 +405,7 @@ def register_commands(poster):
                 await interaction.response.send_message(
                     "❌ You don't have permission to use this command.", ephemeral=True
                 )
-                logger.warning(f"Unauthorized delete attempt by user {interaction.user.id}")
+                logger.warning(f"Unauthorized 'Restore Original' attempt by user {interaction.user.id}")
                 return
 
             if message.author != poster.client.user:
@@ -402,39 +414,102 @@ def register_commands(poster):
                 )
                 return
 
-            # Delete the Discord message directly — no DB lookup required.
-            # This works even for duplicate posts that have no database mapping.
-            await message.delete()
+            if not poster.database:
+                await interaction.response.send_message(
+                    "❌ Database unavailable.", ephemeral=True
+                )
+                return
 
-            # Best-effort DB cleanup: remove the record if one exists.
-            entry_id = None
-            if poster.database:
-                entry_id = poster.database.get_entry_id_by_discord_message(message.id)
-                if entry_id:
-                    try:
-                        poster.database.delete_processed(entry_id)
-                        poster.database.delete_embedding_by_entry_id(entry_id)
-                        poster.database.delete_message_mapping(entry_id)
-                        logger.info(f"Cleaned up DB records for deleted entry {entry_id}")
-                    except Exception as db_err:
-                        logger.warning(f"DB cleanup after delete failed for {entry_id}: {db_err}")
+            # Look up which entry this Discord message maps to
+            superseder_entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+            if not superseder_entry_id:
+                await interaction.response.send_message(
+                    "❌ No database record found for this message.", ephemeral=True
+                )
+                return
 
-            confirmation = f"✅ Message deleted."
-            if entry_id:
-                confirmation += f" (entry `{entry_id}` removed from database)"
-            else:
-                confirmation += " (no database record found — duplicate or unmapped message)"
+            # Find the original entry that was superseded by this one
+            original = poster.database.get_entry_superseded_by(superseder_entry_id)
+            if not original:
+                await interaction.response.send_message(
+                    "ℹ️ This message has not superseded any entry.", ephemeral=True
+                )
+                return
 
-            await interaction.response.send_message(confirmation, ephemeral=True)
-            logger.info(f"User {interaction.user.id} deleted bot message {message.id} (entry: {entry_id})")
+            await interaction.response.defer(ephemeral=True)
 
-        except discord.Forbidden:
-            logger.error(f"Bot lacks permission to delete message {message.id}")
-            await interaction.response.send_message(
-                "❌ Bot lacks permission to delete this message.", ephemeral=True
+            original_entry_id    = original['entry_id']
+            original_content     = original['content'] or ''
+            original_category    = original['category'] or config.DEFAULT_CATEGORY
+            original_source_type = original['source_type']
+            original_source_url  = original.get('source_url')
+            original_video_urls  = json.loads(original['video_urls']) if original.get('video_urls') else []
+            original_telegram_id = original.get('telegram_message_id')
+
+            # Re-download media from the source so images are restored too
+            media_files = []
+            if poster.media_handler:
+                try:
+                    media_files, redownloaded_video_urls = await poster.media_handler.redownload_media(
+                        entry_id=original_entry_id,
+                        source_type=original_source_type,
+                        source_url=original_source_url,
+                        telegram_message_id=original_telegram_id,
+                    )
+                    if redownloaded_video_urls:
+                        original_video_urls = redownloaded_video_urls
+                    if media_files:
+                        logger.info(f"Re-downloaded {len(media_files)} file(s) for restore of {original_entry_id}")
+                except Exception as media_err:
+                    logger.warning(f"Media re-download failed for restore of {original_entry_id}: {media_err}")
+
+            # Re-post the original content to Discord
+            success, new_msg_id, new_channel_id = await poster.post_message(
+                category=original_category,
+                content=original_content,
+                media_files=media_files or None,
+                video_urls=original_video_urls,
+                source_type=original_source_type,
+                entry_id=original_entry_id,
             )
+
+            if not success or not new_msg_id:
+                await interaction.followup.send(
+                    "❌ Failed to re-post the original entry. No changes made.", ephemeral=True
+                )
+                return
+
+            # Delete the superseder Discord message
+            try:
+                await message.delete()
+            except Exception as del_err:
+                logger.warning(f"Could not delete superseder message {message.id}: {del_err}")
+
+            # Restore the original entry in the DB (clear superseded_by, update message ID)
+            poster.database.restore_superseded_entry(original_entry_id, new_msg_id, new_channel_id)
+
+            # Clean up the superseder from message_mapping and embeddings
+            # (keep processed_entries so it isn't re-fetched)
+            try:
+                poster.database.delete_message_mapping(superseder_entry_id)
+                poster.database.delete_embedding_by_entry_id(superseder_entry_id)
+            except Exception as cleanup_err:
+                logger.warning(f"Partial cleanup failure for superseder {superseder_entry_id}: {cleanup_err}")
+
+            preview = original_content[:80] + ('...' if len(original_content) > 80 else '')
+            media_note = f" ({len(media_files)} file(s) re-attached)" if media_files else " (no media)"
+            await interaction.followup.send(
+                f"✅ Original entry restored to **{original_category}**{media_note}.\n"
+                f"Preview: *{preview}*",
+                ephemeral=True
+            )
+            logger.info(
+                f"User {interaction.user.id} restored {original_entry_id} "
+                f"(superseded by {superseder_entry_id})"
+            )
+
         except Exception as e:
-            logger.error(f"Error in 'Delete Message' command: {e}", exc_info=True)
+            logger.error(f"Error in 'Restore Original' command: {e}", exc_info=True)
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
@@ -443,9 +518,9 @@ def register_commands(poster):
             except:
                 pass
 
-    delete_message_cmd = app_commands.ContextMenu(name="Delete Message", callback=delete_message)
-    poster.tree.add_command(delete_message_cmd)
-    logger.debug("Registered 'Delete Message' context menu command")
+    restore_original_cmd = app_commands.ContextMenu(name="Restore Original", callback=restore_original)
+    poster.tree.add_command(restore_original_cmd)
+    logger.debug("Registered 'Restore Original' context menu command")
 
     # --- /news slash command ---
     # Per-user cooldown tracking

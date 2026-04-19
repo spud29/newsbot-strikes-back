@@ -1,4 +1,18 @@
 {
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m py_compile \"$CLAUDE_FILE_PATH\" 2>&1 || echo 'SYNTAX ERROR'",
+            "statusMessage": "Checking syntax..."
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
       "Bash(ls:*)",

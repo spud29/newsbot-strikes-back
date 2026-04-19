@@ -384,6 +384,58 @@ class Database:
         self.conn.commit()
         logger.debug(f"Deleted message mapping: {entry_id}")
 
+    def mark_as_superseded(self, entry_id, superseded_by_entry_id):
+        """
+        Mark an entry as superseded rather than deleting it.
+
+        Args:
+            entry_id: The entry that was superseded
+            superseded_by_entry_id: The new entry that superseded it
+        """
+        self.conn.execute(
+            "UPDATE message_mapping SET superseded_by = ? WHERE entry_id = ?",
+            (superseded_by_entry_id, entry_id)
+        )
+        self.conn.commit()
+        logger.debug(f"Marked {entry_id} as superseded by {superseded_by_entry_id}")
+
+    def get_entry_superseded_by(self, superseder_entry_id):
+        """
+        Find the original entry that was superseded by the given entry.
+
+        Args:
+            superseder_entry_id: entry_id of the entry that did the superseding
+
+        Returns:
+            dict of the original entry's columns, or None if not found
+        """
+        row = self.conn.execute(
+            "SELECT * FROM message_mapping WHERE superseded_by = ?",
+            (superseder_entry_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        keys = row.keys()
+        return {k: row[k] for k in keys}
+
+    def restore_superseded_entry(self, original_entry_id, new_discord_message_id, new_discord_channel_id):
+        """
+        Clear the superseded_by flag and update the Discord message IDs for a restored entry.
+
+        Args:
+            original_entry_id: entry_id of the entry being restored
+            new_discord_message_id: ID of the freshly re-posted Discord message
+            new_discord_channel_id: Channel ID of the freshly re-posted message
+        """
+        self.conn.execute(
+            """UPDATE message_mapping
+               SET superseded_by = NULL, discord_message_id = ?, discord_channel_id = ?
+               WHERE entry_id = ?""",
+            (new_discord_message_id, new_discord_channel_id, original_entry_id)
+        )
+        self.conn.commit()
+        logger.debug(f"Restored {original_entry_id} with new Discord message {new_discord_message_id}")
+
     def get_ignore_entry_previews(self, limit=30, max_preview_length=150):
         """
         Get content previews for entries categorized as 'ignore', for use as negative

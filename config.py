@@ -61,6 +61,7 @@ RSS_FEEDS = {
 DISCORD_CHANNELS = {
     "crypto": 775513484221743124,
     "politics": 1379921787629867138,
+    "general news": 1379921787629867138,
     "stocks": 854937605590220810,
     "artificial intelligence": 985273104483885137,
     "video games": 1317592652044046347,
@@ -81,7 +82,7 @@ DISCORD_CHANNELS = {
 VALID_CATEGORIES = [
     "crypto", "politics", "stocks", "artificial intelligence",
     "video games", "sports", "food", "technology",
-    "music", "fashion", "pop culture", "software development", "fitness", "ignore"
+    "music", "fashion", "pop culture", "software development", "fitness", "general news", "ignore"
 ]
 
 # Default category for uncertain/unmatched content
@@ -111,7 +112,7 @@ TELEGRAM_CHANNELS = [
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_CATEGORIZATION_MODEL = "gpt-oss:20b"
+OLLAMA_CATEGORIZATION_MODEL = "qwen2.5:7b"
 OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 
 # System prompt for categorization
@@ -132,8 +133,16 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - War, military conflict, and armed operations
 - Social issues, protests, activism
 - Legal cases and legislation
-- General breaking news and current events
+- Use 'general news' for breaking events that aren't driven by government, policy, or ideology
 - Economic policy and government decisions
+
+### general news
+- Natural disasters, extreme weather events, and accidents
+- Crime, law enforcement, and court cases without a political angle
+- Public health and medical news (outbreaks, drug approvals, hospital incidents)
+- Science and nature (non-AI): discoveries, space exploration, climate data
+- Human interest and society: local events, viral real-world stories
+- Consumer and economic news affecting everyday people (inflation, housing, jobs) without a direct government policy angle
 
 ### stocks
 - Stock market movements and indices
@@ -273,6 +282,11 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Bitcoin reaches new all-time high" → crypto
 "Bitcoin jumps 3% as traders respond to Fed rate decision" → crypto (categorizable event, even if modest)
 "Fed raises interest rates by 0.25%" → politics
+"7.8 magnitude earthquake strikes Turkey, rescue operations underway" → general news
+"CDC confirms new measles outbreak across 4 states" → general news
+"Man arrested after largest bank heist in US history" → general news
+"NASA's James Webb captures image of earliest known galaxy" → general news
+"UK Parliament debates new immigration policy" → politics
 "Iran estimates $270 billion in war damage" → politics
 "US airstrikes target Houthi positions in Yemen" → politics
 "Call of Duty releases new battle pass" → video games
@@ -306,7 +320,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 Respond with ONLY valid JSON matching this format exactly:
 {"category": "<category name>", "reasoning": "<1-2 sentence explanation of why this category was chosen over others>"}
 
-Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, software development, fitness, ignore"""
+Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, software development, fitness, general news, ignore"""
 
 # Duplicate detection thresholds (cosine similarity)
 DUPLICATE_THRESHOLD = 0.95  # Exact duplicates only (>0.95 similarity)
@@ -391,6 +405,7 @@ NEWSWORTHINESS_WEIGHTS = {
 # the old Discord message if the new one is clearly better
 SUPERSEDE_ENABLED = True
 SUPERSEDE_MAX_AGE_HOURS = 24  # Don't supersede entries older than this
+SUPERSEDED_CHANNEL_ID = 1344412433552248973  # Channel to archive superseded entries
 
 # Audio Transcription (Whisper via faster-whisper, runs 100% locally)
 # Models are downloaded automatically to ~/.cache/huggingface/ on first use.

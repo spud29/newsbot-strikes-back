@@ -116,7 +116,7 @@ class OllamaClient:
 
         return enhanced_prompt
     
-    @retry_with_backoff(max_retries=3, initial_delay=2)
+    @retry_with_backoff(max_retries=4, initial_delay=3)
     def categorize(self, content, exclude_categories=None):
         """
         Categorize content using Ollama
@@ -156,12 +156,13 @@ class OllamaClient:
                     "system": system_prompt,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
                         "num_predict": 500
                     }
                 },
-                timeout=60
+                timeout=300
             )
 
             response.raise_for_status()
@@ -275,34 +276,51 @@ class OllamaClient:
         return config.DEFAULT_CATEGORY
     
     @retry_with_backoff(max_retries=2, initial_delay=1)
-    def fix_capitalization(self, content):
+    def format_text(self, content):
         """
-        Rewrite ALL CAPS text to proper sentence capitalization using Ollama.
+        Clean up text using Ollama: fix ALL CAPS, grammar, punctuation, and spelling.
 
-        Handles proper nouns, acronyms, and abbreviations intelligently.
-        Only changes casing — never alters wording, meaning, or structure.
+        Preserves all meaning, wording, URLs, numbers, acronyms, and structure.
+        Only the four surface-level issues above are corrected.
 
         Args:
-            content: ALL CAPS text to rewrite
+            content: Raw text to clean up
 
         Returns:
-            str: Text with proper capitalization, or original text on failure
+            str: Cleaned text, or original text on failure
         """
-        logger.debug(f"Fixing capitalization for: {content[:100]}...")
+        logger.debug(f"Formatting text for: {content[:100]}...")
 
         try:
             prompt = (
-                "Rewrite the following ALL CAPS text using proper sentence capitalization. "
-                "Rules:\n"
-                "- Capitalize proper nouns (names, countries, companies, etc.)\n"
-                "- Keep acronyms uppercase (U.S., NATO, SEC, ETF, AI, CEO, GDP, FBI, etc.)\n"
-                "- Capitalize the first letter of each sentence\n"
-                "- Do NOT change any words, punctuation, or meaning\n"
-                "- Do NOT add or remove any text\n"
-                "- Preserve all URLs, numbers, and special characters exactly\n"
-                "- If text contains multiple lines, preserve the line structure\n\n"
-                f"ALL CAPS TEXT:\n{content}\n\n"
-                "PROPERLY CAPITALIZED TEXT:"
+                "You are a text-cleanup assistant for a news feed. "
+                "Clean up the following text by fixing ALL FOUR of these issues and NOTHING ELSE:\n\n"
+                "1. CAPITALIZATION: Convert ALL CAPS words to proper sentence case. "
+                "Capitalize the first letter of each sentence and proper nouns "
+                "(names, cities, countries, companies, organisations). "
+                "This applies INSIDE quotation marks too — quoted text that is ALL CAPS "
+                "is wire-service style, not preserved speech, and must be corrected. "
+                "Example: '@handle ASKS \"STOP THE HACK NOW\" - \"WE AGREE\"' "
+                "→ '@handle asks \"Stop the hack now\" - \"We agree\"'\n"
+                "2. GRAMMAR: Fix obvious grammatical errors (wrong verb tense, "
+                "subject-verb disagreement, misused words like their/there/they're).\n"
+                "3. PUNCTUATION: Remove excessive punctuation (e.g. '!!!' → '!', "
+                "'???' → '?'). Add a missing full stop at the end of a sentence if "
+                "clearly absent. Do not add commas or other punctuation speculatively.\n"
+                "4. SPELLING: Correct obvious misspellings. Do not change correctly "
+                "spelled uncommon words or proper nouns you are unsure about.\n\n"
+                "STRICT RULES — violating any of these means the output is rejected:\n"
+                "- Do NOT add any words, sentences, commentary, or explanations\n"
+                "- Do NOT remove any words or sentences\n"
+                "- Do NOT change the meaning, tone, or factual content\n"
+                "- Keep ALL acronyms uppercase: U.S., NATO, SEC, ETF, AI, CEO, "
+                "GDP, FBI, EU, UK, UN, IMF, IPO, DeFi, TVL, and similar\n"
+                "- Preserve ALL URLs exactly character-for-character\n"
+                "- Preserve ALL numbers, percentages, and currency values exactly\n"
+                "- If text contains multiple lines, preserve the line structure exactly\n"
+                "- Output ONLY the cleaned text — no labels, no quotes, no preamble\n\n"
+                f"INPUT TEXT:\n{content}\n\n"
+                "CLEANED TEXT:"
             )
 
             response = requests.post(
@@ -311,12 +329,13 @@ class OllamaClient:
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
                         "num_predict": 500
                     }
                 },
-                timeout=30
+                timeout=300
             )
 
             response.raise_for_status()
@@ -325,7 +344,7 @@ class OllamaClient:
             rewritten = result.get('response', '').strip()
 
             if not rewritten:
-                logger.warning("Ollama returned empty capitalization fix, using original")
+                logger.warning("Ollama returned empty format_text response, using original")
                 return content
 
             # Sanity check: rewritten text should be roughly the same length
@@ -333,17 +352,17 @@ class OllamaClient:
             len_ratio = len(rewritten) / len(content) if content else 1.0
             if len_ratio < 0.7 or len_ratio > 1.3:
                 logger.warning(
-                    f"Capitalization fix length mismatch "
+                    f"format_text length mismatch "
                     f"(original: {len(content)}, rewritten: {len(rewritten)}, "
                     f"ratio: {len_ratio:.2f}), using original"
                 )
                 return content
 
-            logger.info(f"Capitalization fixed: '{content[:60]}...' -> '{rewritten[:60]}...'")
+            logger.info(f"Text formatted: '{content[:60]}...' -> '{rewritten[:60]}...'")
             return rewritten
 
         except Exception as e:
-            logger.error(f"Error fixing capitalization: {e}")
+            logger.error(f"Error in format_text: {e}")
             return content
 
     @retry_with_backoff(max_retries=2, initial_delay=1)
@@ -400,12 +419,13 @@ class OllamaClient:
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "temperature": 0.0,
                         "num_predict": 100
                     }
                 },
-                timeout=60
+                timeout=300
             )
             response.raise_for_status()
             result = response.json().get('response', '').strip().lower()
@@ -437,15 +457,22 @@ class OllamaClient:
 
         prompt = (
             "You are comparing two news articles about the same story. "
-            "Decide if the NEW article should REPLACE the existing one.\n\n"
+            "Decide what to do with the NEW article.\n\n"
             f"EXISTING ARTICLE (already published):\n{existing_content[:800]}\n\n"
             f"NEW ARTICLE (just arrived):\n{new_content[:800]}\n\n"
-            "Should the new article replace the existing one?\n"
-            "- \"supersede\": New article is clearly better (more detail, newer developments, "
-            "corrects errors, more informative)\n"
-            "- \"ignore\": Existing article is equal or better, new one adds nothing significant\n\n"
+            "Choose one verdict:\n"
+            "- \"supersede\": New article covers all the same facts AND adds more detail or "
+            "corrections — the existing article adds nothing the new one doesn't already cover. "
+            "Replace the old one.\n"
+            "- \"keep_both\": Both articles contain important information the other does NOT "
+            "cover. Use this when the existing article describes specific actions or statements "
+            "(e.g. 'markets frozen', 'contracts safe', mitigation steps) AND the new article "
+            "describes different outcomes or scale (e.g. TVL drop, exploit size) — and neither "
+            "fully captures the other's key facts. Post both.\n"
+            "- \"ignore\": Existing article is equal or better; new one adds nothing not already "
+            "covered. Discard the new one.\n\n"
             "Respond with ONLY valid JSON: "
-            "{\"verdict\": \"supersede\" or \"ignore\", \"reasoning\": \"brief explanation\"}"
+            "{\"verdict\": \"supersede\", \"keep_both\", or \"ignore\", \"reasoning\": \"brief explanation\"}"
         )
 
         try:
@@ -455,12 +482,13 @@ class OllamaClient:
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "temperature": 0.2,
                         "num_predict": 200
                     }
                 },
-                timeout=30
+                timeout=300
             )
             response.raise_for_status()
             response_text = response.json().get('response', '').strip()
@@ -472,7 +500,7 @@ class OllamaClient:
                     parsed = json.loads(json_match.group())
                     verdict = parsed.get('verdict', '').lower().strip()
                     reasoning = parsed.get('reasoning', '')
-                    if verdict in ('supersede', 'ignore'):
+                    if verdict in ('supersede', 'keep_both', 'ignore'):
                         logger.info(f"Compare verdict: {verdict} — {reasoning}")
                         return {'verdict': verdict, 'reasoning': reasoning}
             except (json.JSONDecodeError, AttributeError):
@@ -480,6 +508,9 @@ class OllamaClient:
 
             # Fallback: look for keyword
             text_lower = response_text.lower()
+            if 'keep_both' in text_lower or 'keep both' in text_lower:
+                logger.info("Compare verdict (fallback): keep_both")
+                return {'verdict': 'keep_both', 'reasoning': 'Parsed from fallback'}
             if 'supersede' in text_lower:
                 logger.info("Compare verdict (fallback): supersede")
                 return {'verdict': 'supersede', 'reasoning': 'Parsed from fallback'}
@@ -491,7 +522,7 @@ class OllamaClient:
             logger.error(f"Error comparing entries: {e}")
             return {'verdict': 'ignore', 'reasoning': f'Error: {e}'}
 
-    @retry_with_backoff(max_retries=3, initial_delay=2)
+    @retry_with_backoff(max_retries=4, initial_delay=3)
     def generate_embedding(self, content):
         """
         Generate embedding vector for content
@@ -509,14 +540,15 @@ class OllamaClient:
                 f"{self.base_url}/api/embeddings",
                 json={
                     "model": self.embedding_model,
-                    "prompt": content
+                    "prompt": content,
+                    "keep_alive": "30m"
                 },
-                timeout=30
+                timeout=120
             )
-            
+
             response.raise_for_status()
             result = response.json()
-            
+
             embedding = result.get('embedding', [])
             
             if not embedding:
@@ -587,17 +619,18 @@ Respond with ONLY this JSON, no other text:
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30m",
                     "options": {
                         "temperature": 0.3,  # Lower temperature for more consistent ratings
                         "num_predict": 200   # Give model enough room for JSON response
                     }
                 },
-                timeout=60
+                timeout=300
             )
-            
+
             response.raise_for_status()
             result = response.json()
-            
+
             # Parse the JSON response
             response_text = result.get('response', '').strip()
             
@@ -613,7 +646,7 @@ Respond with ONLY this JSON, no other text:
             surprising = max(1, min(10, int(rating_data.get('surprising', 5))))
             impact = max(1, min(10, int(rating_data.get('impact', 5))))
             actionable = max(1, min(10, int(rating_data.get('actionable', 5))))
-            reasoning = str(rating_data.get('reasoning', 'No reasoning provided'))[:100]
+            reasoning = str(rating_data.get('reasoning', 'No reasoning provided'))
             
             # Calculate weighted score
             weights = getattr(config, 'NEWSWORTHINESS_WEIGHTS', {
@@ -683,7 +716,7 @@ Respond with ONLY this JSON, no other text:
             bool: True if healthy
         """
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            response = requests.get(f"{self.base_url}/api/tags", timeout=10)
             response.raise_for_status()
             
             models = response.json().get('models', [])

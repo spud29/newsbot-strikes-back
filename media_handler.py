@@ -429,6 +429,84 @@ class MediaHandler:
             )
             return None
     
+    async def redownload_media(self, entry_id, source_type, source_url, telegram_message_id):
+        """
+        Re-download media for an entry that was previously processed.
+        Used by the 'Restore Original' command to re-attach images when restoring
+        a superseded entry.
+
+        Args:
+            entry_id: Full entry ID (e.g., 'telegram_ChannelName_12345')
+            source_type: 'telegram' or 'twitter'
+            source_url: Original source URL (used for Twitter re-downloads)
+            telegram_message_id: Telegram message ID integer (used for Telegram re-downloads)
+
+        Returns:
+            tuple: (media_files: list[str], video_urls: list[str])
+        """
+        try:
+            if source_type == 'telegram' and telegram_message_id:
+                return await self._redownload_telegram_media(entry_id, telegram_message_id)
+            elif source_url and source_type in ('twitter', 'rss'):
+                return await asyncio.to_thread(self._redownload_twitter_media, entry_id, source_url)
+        except Exception as e:
+            logger.error(f"redownload_media failed for {entry_id}: {e}", exc_info=True)
+        return [], []
+
+    async def _redownload_telegram_media(self, entry_id, telegram_message_id):
+        """Re-fetch a Telegram message and download its media."""
+        if not self.telegram_client or not self.telegram_client.client:
+            logger.warning("Telegram client unavailable for media re-download")
+            return [], []
+
+        # Parse channel name: entry_id is "telegram_{channel}_{message_id}"
+        without_prefix = entry_id[len('telegram_'):]
+        channel_name = without_prefix.rsplit('_', 1)[0]
+
+        client = self.telegram_client.client
+        channel_entity = await client.get_entity(channel_name)
+
+        # Fetch the original message
+        message = await client.get_messages(channel_entity, ids=telegram_message_id)
+        if not message or not message.media:
+            logger.info(f"No media found on re-fetched Telegram message {telegram_message_id}")
+            return [], []
+
+        # For albums, fetch siblings that share the same grouped_id
+        if message.grouped_id:
+            id_range = list(range(telegram_message_id, telegram_message_id + 10))
+            candidates = await client.get_messages(channel_entity, ids=id_range)
+            album_msgs = sorted(
+                [m for m in candidates if m and m.grouped_id == message.grouped_id],
+                key=lambda m: m.id
+            )
+        else:
+            album_msgs = [message]
+
+        download_dir = os.path.join(self.temp_dir, f"telegram_{telegram_message_id}_restored")
+        os.makedirs(download_dir, exist_ok=True)
+
+        media_files = []
+        video_urls = []
+        for i, msg in enumerate(album_msgs):
+            if not msg.media:
+                continue
+            file_path = await self._download_media_file(msg, download_dir, f"media_{i}")
+            if file_path:
+                media_files.append(file_path)
+                if os.path.splitext(file_path)[1].lower() in ('.mp4', '.mov', '.avi'):
+                    video_urls.append("telegram_video")
+
+        logger.info(f"Re-downloaded {len(media_files)} file(s) for {entry_id}")
+        return media_files, video_urls
+
+    def _redownload_twitter_media(self, entry_id, source_url):
+        """Re-download Twitter media via gallery-dl."""
+        status_id = entry_id.split('_')[-1] if entry_id else 'unknown'
+        entry = {'id': entry_id, 'link': source_url, 'status_id': status_id}
+        updated = self.download_twitter_media(entry)
+        return updated.get('media_files', []), updated.get('video_urls', [])
+
     def cleanup_entry_media(self, entry):
         """
         Clean up temporary media files for an entry (only if older than 2 days)

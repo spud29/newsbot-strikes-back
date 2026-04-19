@@ -66,7 +66,8 @@ def _create_tables(conn):
             category TEXT,
             source_type TEXT,
             reasoning TEXT,
-            timestamp REAL
+            timestamp REAL,
+            superseded_by TEXT DEFAULT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_message_mapping_discord_msg
             ON message_mapping(discord_message_id);
@@ -119,6 +120,10 @@ def _run_migrations(conn):
 
     if 'placement_reason' not in columns:
         conn.execute("ALTER TABLE message_mapping ADD COLUMN placement_reason TEXT DEFAULT NULL")
+        conn.commit()
+
+    if 'superseded_by' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN superseded_by TEXT DEFAULT NULL")
         conn.commit()
 
 

@@ -87,6 +87,7 @@ class NewsAggregatorBot:
 
         # Wire up the reprocess callback so discord_commands.py can trigger it
         self.discord_poster.reprocess_callback = self._handle_reprocess
+        self.discord_poster.media_handler = self.media_handler
 
         # Start Telegram client
         await self.telegram_poller.start()
@@ -203,14 +204,14 @@ class NewsAggregatorBot:
                 # Rewrites to proper sentence case before embedding/categorization/posting
                 if getattr(config, 'CAPS_FIX_ENABLED', False):
                     if is_all_caps(content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
-                        logger.info(f"ALL CAPS detected in {source_type} entry, fixing capitalization...")
+                        logger.info(f"ALL CAPS detected in {source_type} entry, running text cleanup...")
                         original_content = content
-                        content = await asyncio.to_thread(self.ollama.fix_capitalization, content)
+                        content = await asyncio.to_thread(self.ollama.format_text, content)
                         entry['content'] = content
                         if content != original_content:
-                            logger.info(f"Capitalization fixed for {entry_id}")
+                            logger.info(f"Text formatted for {entry_id}")
                         else:
-                            logger.debug(f"Capitalization unchanged (fix returned original)")
+                            logger.debug(f"Text unchanged after format_text (returned original)")
 
                 # Generate embedding for duplicate detection BEFORE downloading media
                 # Note: OCR text will be added after media download for enhanced detection
@@ -402,6 +403,7 @@ class NewsAggregatorBot:
                 # If similar content was detected, try to supersede the old entry
                 # or fall back to routing to ignore
                 superseded = False
+                keep_both = False
                 if similarity_info:
                     if getattr(config, 'SUPERSEDE_ENABLED', False) and match_entry_id:
                         old_mapping = self.db.get_discord_message_info(match_entry_id)
@@ -416,7 +418,13 @@ class NewsAggregatorBot:
                             comparison = await asyncio.to_thread(
                                 self.ollama.compare_entries, content, match_content
                             )
-                            if comparison['verdict'] == 'supersede':
+                            if comparison['verdict'] == 'keep_both':
+                                keep_both = True
+                                logger.info(
+                                    f"Keeping both entries — unique info in each: "
+                                    f"{comparison['reasoning']}"
+                                )
+                            elif comparison['verdict'] == 'supersede':
                                 # Use the old entry's category so it posts to the same channel
                                 category = old_mapping['category']
                                 reasoning = (
@@ -431,9 +439,12 @@ class NewsAggregatorBot:
                                     old_mapping['discord_message_id']
                                 )
                                 if deleted:
-                                    # Clean up old entry's embedding and mapping
+                                    # Archive superseded entry to dedicated channel, clean up embedding
+                                    await self.discord_poster.post_superseded_entry(
+                                        old_mapping, content[:200]
+                                    )
                                     self.db.delete_embedding_by_entry_id(match_entry_id)
-                                    self.db.delete_message_mapping(match_entry_id)
+                                    self.db.mark_as_superseded(match_entry_id, entry_id)
                                     superseded = True
                                     placement_reason = (
                                         f"AI categorized as '{category}'. "
@@ -451,7 +462,7 @@ class NewsAggregatorBot:
                                         f"for supersede — aborting supersede of {match_entry_id}"
                                     )
 
-                    if not superseded:
+                    if not superseded and not keep_both:
                         logger.info(
                             f"Similar story suppressed (not posted): {entry_id} "
                             f"(score: {similarity_info['similarity']:.3f}, "
@@ -933,8 +944,8 @@ class NewsAggregatorBot:
             # Fix ALL CAPS in edited Telegram messages too
             if new_content and getattr(config, 'CAPS_FIX_ENABLED', False):
                 if is_all_caps(new_content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
-                    logger.info(f"ALL CAPS detected in edited Telegram message, fixing capitalization...")
-                    new_content = await asyncio.to_thread(self.ollama.fix_capitalization, new_content)
+                    logger.info(f"ALL CAPS detected in edited Telegram message, running text cleanup...")
+                    new_content = await asyncio.to_thread(self.ollama.format_text, new_content)
 
             if not new_content:
                 logger.warning(f"No content in edited message: {entry_id}")

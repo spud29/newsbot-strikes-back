@@ -22,7 +22,7 @@ import time
 from db_connection import get_db_connection
 from utils import logger
 
-DEXERTO_URL_PATTERN = re.compile(r'https?://(?:www\.)?dexerto\.com/\S+')
+DEXERTO_URL_PATTERN = re.compile(r'https?://(?:(?:www\.)?dexerto\.com|t\.co)/\S+')
 
 
 def is_dexerto_follow_up_tweet(entry: dict) -> bool:
@@ -109,12 +109,24 @@ class DexertoMerger:
                 f"DexertoMerger: headline {entry_id} waited {age_hours:.1f}h with no "
                 f"follow-up tweet — posting alone"
             )
-            conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
-            conn.commit()
+            # Only remove from pending after the entry has been handled (posted or
+            # marked processed by a filter). If process_entry fails transiently
+            # (e.g. Ollama down) the row stays in pending so the next flush cycle
+            # retries it — otherwise the entry would be silently lost.
             try:
-                await self._process_entry(json.loads(entry_json))
+                success = await self._process_entry(json.loads(entry_json))
             except Exception as e:
                 logger.error(f"DexertoMerger: error flushing stale entry {entry_id}: {e}", exc_info=True)
+                success = False
+
+            if success or self._db.is_processed(entry_id):
+                conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
+                conn.commit()
+            else:
+                logger.warning(
+                    f"DexertoMerger: stale flush of {entry_id} did not complete — "
+                    f"leaving in pending buffer to retry next cycle"
+                )
 
     # ------------------------------------------------------------------
     # Internal handlers
