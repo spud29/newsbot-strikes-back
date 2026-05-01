@@ -14,14 +14,10 @@ from pathlib import Path
 # Set up logging
 def setup_logging():
     """Configure logging with debug level for comprehensive diagnostics"""
-    # Configure file handler
-    file_handler = logging.FileHandler('bot.log', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    
     # Configure console handler with UTF-8 encoding
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
-    
+
     # Set UTF-8 encoding for console on Windows
     if sys.platform == 'win32':
         try:
@@ -31,16 +27,26 @@ def setup_logging():
             # Python < 3.7, use a different approach
             import codecs
             sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-    
+
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
+
+    handlers = [console_handler]
+    # Configure file handler — may fail when bot.log is already locked by another
+    # process (e.g. the main bot holds it while the eval subprocess runs).
+    try:
+        file_handler = logging.FileHandler('bot.log', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+    except PermissionError:
+        pass  # console-only logging; caller's stdout redirection captures output
+
     # Configure root logger
     logging.basicConfig(
         level=logging.DEBUG,
-        handlers=[file_handler, console_handler]
+        handlers=handlers
     )
     
     return logging.getLogger(__name__)
