@@ -31,7 +31,8 @@ def load_overlay(path: str | None) -> dict:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    allowed = {"system_prompt", "duplicate_threshold", "similarity_threshold"}
+    allowed = {"system_prompt", "duplicate_threshold", "similarity_threshold",
+               "newsworthiness_threshold"}
     extra = set(data) - allowed - {"name", "notes", "rationale"}
     if extra:
         raise ValueError(f"variant overlay has disallowed keys: {extra}")
@@ -47,6 +48,8 @@ def apply_overlay(overlay: dict) -> str:
         config.DUPLICATE_THRESHOLD = float(overlay["duplicate_threshold"])
     if "similarity_threshold" in overlay:
         config.SIMILARITY_THRESHOLD = float(overlay["similarity_threshold"])
+    if "newsworthiness_threshold" in overlay:
+        config.NEWSWORTHINESS_THRESHOLD = float(overlay["newsworthiness_threshold"])
     h = hashlib.sha256()
     h.update(config.SYSTEM_PROMPT.encode("utf-8"))
     h.update(f"|{config.DUPLICATE_THRESHOLD}|{config.SIMILARITY_THRESHOLD}".encode("utf-8"))

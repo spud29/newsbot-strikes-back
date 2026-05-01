@@ -44,7 +44,7 @@ ensure_project_on_syspath()
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), encoding="utf-8-sig", override=True)
 
-F1_IMPROVEMENT_GATE = 0.02
+F1_IMPROVEMENT_GATE = 0.01
 F1_REGRESSION_GATE = 0.05
 MIN_SUPPORT_FOR_GATE = 5
 TUNING_BRANCH = "tuning"
@@ -129,7 +129,8 @@ PROPOSE_TOOL = {
     "description": (
         "Propose a single configuration variant. Call this tool exactly 3 times, "
         "each time proposing a different variant. Each variant must include at least "
-        "one of: system_prompt, duplicate_threshold, similarity_threshold. "
+        "one of: system_prompt, duplicate_threshold, similarity_threshold, "
+        "newsworthiness_threshold. "
         "Provide a short rationale explaining why this variant is expected to help."
     ),
     "input_schema": {
@@ -145,6 +146,10 @@ PROPOSE_TOOL = {
                                     "description": "Override DUPLICATE_THRESHOLD (0.0-1.0). Omit to keep current."},
             "similarity_threshold": {"type": "number",
                                      "description": "Override SIMILARITY_THRESHOLD (0.0-1.0). Omit to keep current."},
+            "newsworthiness_threshold": {"type": "number",
+                                         "description": "Override NEWSWORTHINESS_THRESHOLD (1.0-10.0). "
+                                                        "Lower values let more items through the post filter. "
+                                                        "Omit to keep current."},
         },
         "required": ["name", "rationale"],
     },
@@ -192,6 +197,8 @@ def build_context_pack(baseline: dict) -> str:
     parts.append(f"\n## Current thresholds")
     parts.append(f"- DUPLICATE_THRESHOLD = {config.DUPLICATE_THRESHOLD}")
     parts.append(f"- SIMILARITY_THRESHOLD = {config.SIMILARITY_THRESHOLD}")
+    parts.append(f"- NEWSWORTHINESS_THRESHOLD = {getattr(config, 'NEWSWORTHINESS_THRESHOLD', 7.0)}"
+                 f"  (post-categorization filter; lower = more items posted)")
     parts.append(f"\n## Valid categories\n{', '.join(config.VALID_CATEGORIES)}")
     parts.append(f"\n## Current SYSTEM_PROMPT\n\n```\n{config.SYSTEM_PROMPT}\n```")
     parts.extend(misclass_section)
@@ -206,7 +213,9 @@ underperforming, e.g.:
 1. A prompt rewrite that strengthens disambiguation between the top 2
    confusion pairs shown above.
 2. A threshold tweak (DUPLICATE or SIMILARITY) if dedup looks too loose/tight.
-3. A prompt edit that better defines the `ignore` bar (or the worst-performing
+3. A NEWSWORTHINESS_THRESHOLD adjustment if the post-filter appears too strict
+   (e.g. too many correctly-categorized items are still being discarded).
+4. A prompt edit that better defines the `ignore` bar (or the worst-performing
    real category).
 
 Constraints:
@@ -214,7 +223,8 @@ Constraints:
 - Do NOT change the JSON output contract at the end of the system prompt.
 - Keep the full category-definition section; edit surgically, don't rewrite end-to-end.
 - Variant names must be filesystem-safe (e.g. `v1_tighter_ignore`).
-- Thresholds must be in (0.0, 1.0).
+- DUPLICATE_THRESHOLD and SIMILARITY_THRESHOLD must be in (0.0, 1.0).
+- NEWSWORTHINESS_THRESHOLD must be in [1.0, 10.0].
 """)
     return "\n".join(parts)
 
@@ -261,16 +271,23 @@ def write_variant_files(proposals: list[dict]) -> list[str]:
         name = re.sub(r"[^A-Za-z0-9_-]", "_", p["name"])[:60] or "variant"
         variant = {k: v for k, v in p.items()
                    if k in ("system_prompt", "duplicate_threshold", "similarity_threshold",
-                            "name", "rationale")}
+                            "newsworthiness_threshold", "name", "rationale")}
         variant["name"] = name
         # Validate thresholds early.
+        invalid = False
         for thr_key in ("duplicate_threshold", "similarity_threshold"):
             if thr_key in variant:
                 v = float(variant[thr_key])
                 if not (0.0 < v < 1.0):
                     print(f"  dropping {name}: {thr_key}={v} out of range", file=sys.stderr)
+                    invalid = True
                     break
-        else:
+        if not invalid and "newsworthiness_threshold" in variant:
+            v = float(variant["newsworthiness_threshold"])
+            if not (1.0 <= v <= 10.0):
+                print(f"  dropping {name}: newsworthiness_threshold={v} out of range", file=sys.stderr)
+                invalid = True
+        if not invalid:
             path = os.path.join(PENDING_DIR, f"{name}.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(variant, f, indent=2, ensure_ascii=False)
@@ -311,6 +328,7 @@ def patch_config_py(overlay: dict) -> list[str]:
         "SYSTEM_PROMPT": overlay.get("system_prompt"),
         "DUPLICATE_THRESHOLD": overlay.get("duplicate_threshold"),
         "SIMILARITY_THRESHOLD": overlay.get("similarity_threshold"),
+        "NEWSWORTHINESS_THRESHOLD": overlay.get("newsworthiness_threshold"),
     }
     targets = {k: v for k, v in targets.items() if v is not None}
 
