@@ -70,7 +70,9 @@ def current_branch() -> str:
 
 def working_tree_clean() -> bool:
     out = git("status", "--porcelain", capture=True).stdout
-    return out.strip() == ""
+    # Ignore untracked files (lines starting with "??") — they don't affect commits.
+    tracked_changes = [l for l in out.splitlines() if not l.startswith("??")]
+    return len(tracked_changes) == 0
 
 
 # ----- lock -----
