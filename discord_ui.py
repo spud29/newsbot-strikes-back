@@ -256,11 +256,11 @@ class SetCategoryView(discord.ui.View):
         self.message = message
         self.poster = poster
 
-        # Build select options — all categories except the current one
+        # Build select options — all categories (current category included so the user
+        # can re-apply it to fix a display/DB mismatch without needing an intermediate step)
         options = [
             discord.SelectOption(label=cat.title(), value=cat)
             for cat in sorted(available_categories)
-            if cat != current_cat
         ]
 
         select = discord.ui.Select(

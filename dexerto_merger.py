@@ -1,22 +1,23 @@
 """
 Dexerto tweet pair merger.
 
-Dexerto always posts stories as two consecutive tweets:
-  Tweet 1: headline/summary text (no dexerto.com URL)
-  Tweet 2: short blurb + dexerto.com article link
+Dexerto always posts stories as two tweets:
+  Tweet 1: headline/summary text (no dexerto.com URL, usually has images)
+  Tweet 2: short blurb + dexerto.com article link (a self-reply with no image)
 
-This module buffers tweet 1 in a SQLite table (`dexerto_pending`) and waits
-for tweet 2 to arrive — however long that takes, including across bot restarts.
-When tweet 2 arrives it merges the follow-up content into the headline entry
-and hands it to process_entry. The result is a single Discord post instead
-of two.
+Tweet 1 is buffered in a SQLite table (`dexerto_pending`). Tweet 2 is no longer
+delivered by the rss.app RSS feed (the feed now surfaces only media tweets and
+excludes text-only replies). Instead, `flush_stale()` fetches the conversation
+via gallery-dl with `conversations=true` to find tweet 2 directly, then merges
+its article URL into the headline entry before posting.
 
-The `flush_stale()` method is called once per poll cycle to post any headlines
-that have been waiting longer than DEXERTO_PENDING_MAX_AGE_HOURS with no
-matching follow-up (fallback for when tweet 2 never arrives).
+The `flush_stale()` method is called once per poll cycle during cleanup.
 """
+import asyncio
 import json
 import re
+import subprocess
+import sys
 import time
 
 from db_connection import get_db_connection
@@ -105,16 +106,33 @@ class DexertoMerger:
 
         for entry_id, entry_json, buffered_at in rows:
             age_hours = (time.time() - buffered_at) / 3600
-            logger.warning(
-                f"DexertoMerger: headline {entry_id} waited {age_hours:.1f}h with no "
-                f"follow-up tweet — posting alone"
+            entry = json.loads(entry_json)
+
+            # Try one final conversation fetch before posting alone.
+            # The RSS feed no longer delivers tweet 2 (Dexerto's self-reply with the
+            # article URL), but gallery-dl with conversations=true can fetch it directly.
+            follow_up, tweet2_entry_id = await asyncio.to_thread(
+                self._find_follow_up_sync, entry
             )
+            if follow_up:
+                logger.info(
+                    f"DexertoMerger: found follow-up for {entry_id} at flush time — merging"
+                )
+                entry['dexerto_follow_up'] = follow_up
+                if tweet2_entry_id:
+                    self._db.mark_processed(tweet2_entry_id)
+            else:
+                logger.warning(
+                    f"DexertoMerger: headline {entry_id} waited {age_hours:.1f}h with no "
+                    f"follow-up tweet — posting alone"
+                )
+
             # Only remove from pending after the entry has been handled (posted or
             # marked processed by a filter). If process_entry fails transiently
             # (e.g. Ollama down) the row stays in pending so the next flush cycle
             # retries it — otherwise the entry would be silently lost.
             try:
-                success = await self._process_entry(json.loads(entry_json))
+                success = await self._process_entry(entry)
             except Exception as e:
                 logger.error(f"DexertoMerger: error flushing stale entry {entry_id}: {e}", exc_info=True)
                 success = False
@@ -147,7 +165,7 @@ class DexertoMerger:
     async def _handle_follow_up_tweet(self, entry: dict) -> bool:
         """Match tweet 2 (blurb + URL) to the most recent buffered headline."""
         follow_up_entry_id = entry['id']
-        follow_up_content = entry.get('content', '').strip()
+        follow_up_content = re.sub(r'\n{2,}', '\n', entry.get('content', '').strip())
 
         conn = get_db_connection()
         row = conn.execute(
@@ -186,6 +204,79 @@ class DexertoMerger:
         )
         await self._process_entry(headline_entry)
         return True  # consumed
+
+    # ------------------------------------------------------------------
+    # Conversation fetch
+    # ------------------------------------------------------------------
+
+    def _find_follow_up_sync(self, entry: dict) -> tuple:
+        """
+        Fetch the tweet conversation via gallery-dl and look for Dexerto's
+        self-reply (tweet 2) containing a dexerto.com article URL.
+
+        The rss.app RSS feed stopped delivering tweet 2 because it is a
+        text-only reply with no image — the feed now surfaces only media
+        tweets. This method bypasses the RSS feed by fetching the full
+        conversation directly.
+
+        Returns (follow_up_content, tweet2_entry_id) or (None, None).
+        Blocking — call with asyncio.to_thread().
+        """
+        link = entry.get('link')
+        if not link:
+            return None, None
+
+        cmd = [
+            sys.executable, '-m', 'gallery_dl',
+            '--dump-json',
+            '--no-download',
+            '--option', 'extractor.twitter.conversations=true',
+            link,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                logger.debug(
+                    f"DexertoMerger: conversation fetch returned nothing for {entry.get('id')} "
+                    f"(exit {result.returncode})"
+                )
+                return None, None
+            items = json.loads(result.stdout.strip())
+        except Exception as e:
+            logger.warning(
+                f"DexertoMerger: conversation fetch failed for {entry.get('id')}: {e}"
+            )
+            return None, None
+
+        tweet1_id = int(entry['id'].split('_')[1])
+        dexerto_user_id = 76766018  # Dexerto's stable Twitter user ID
+
+        for item in items:
+            if not (isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict)):
+                continue
+            d = item[1]
+            if (
+                d.get('reply_id') == tweet1_id
+                and d.get('user', {}).get('id') == dexerto_user_id
+                and 'dexerto.com' in d.get('content', '')
+            ):
+                follow_up = re.sub(r'\n{2,}', '\n', d['content'].strip())
+                tweet2_id = d.get('tweet_id')
+                tweet2_entry_id = f"twitter_{tweet2_id}" if tweet2_id else None
+                logger.debug(
+                    f"DexertoMerger: found tweet2 {tweet2_entry_id} in conversation: "
+                    f"{follow_up[:80]}"
+                )
+                return follow_up, tweet2_entry_id
+
+        return None, None
 
     # ------------------------------------------------------------------
     # Setup

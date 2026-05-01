@@ -420,21 +420,32 @@ def register_commands(poster):
                 )
                 return
 
-            # Look up which entry this Discord message maps to
+            # PRIMARY LOOKUP: user right-clicked the superseder in the main channel
             superseder_entry_id = poster.database.get_entry_id_by_discord_message(message.id)
+            clicked_original_row = None
+
+            if not superseder_entry_id:
+                # SECONDARY LOOKUP: user right-clicked the archived copy in the superseded channel
+                clicked_original_row = poster.database.get_entry_by_superseded_channel_message(message.id)
+                if clicked_original_row:
+                    superseder_entry_id = clicked_original_row.get('superseded_by')
+
             if not superseder_entry_id:
                 await interaction.response.send_message(
                     "❌ No database record found for this message.", ephemeral=True
                 )
                 return
 
-            # Find the original entry that was superseded by this one
-            original = poster.database.get_entry_superseded_by(superseder_entry_id)
-            if not original:
-                await interaction.response.send_message(
-                    "ℹ️ This message has not superseded any entry.", ephemeral=True
-                )
-                return
+            # Resolve the original entry
+            if clicked_original_row:
+                original = clicked_original_row
+            else:
+                original = poster.database.get_entry_superseded_by(superseder_entry_id)
+                if not original:
+                    await interaction.response.send_message(
+                        "ℹ️ This message has not superseded any entry.", ephemeral=True
+                    )
+                    return
 
             await interaction.response.defer(ephemeral=True)
 
@@ -479,14 +490,41 @@ def register_commands(poster):
                 )
                 return
 
-            # Delete the superseder Discord message
-            try:
-                await message.delete()
-            except Exception as del_err:
-                logger.warning(f"Could not delete superseder message {message.id}: {del_err}")
+            # Delete the superseder Discord message (and stale archive if restoring from superseded channel)
+            if clicked_original_row:
+                # Flow B: clicked the archive — delete the superseder from the main channel
+                superseder_mapping = poster.database.get_discord_message_info(superseder_entry_id)
+                if superseder_mapping and superseder_mapping.get('discord_message_id'):
+                    try:
+                        sup_channel = poster.client.get_channel(superseder_mapping['discord_channel_id'])
+                        if sup_channel:
+                            sup_msg = await sup_channel.fetch_message(superseder_mapping['discord_message_id'])
+                            await sup_msg.delete()
+                    except Exception as del_err:
+                        logger.warning(f"Could not delete superseder message {superseder_mapping.get('discord_message_id')}: {del_err}")
+                # Also remove the now-stale archive message
+                try:
+                    await message.delete()
+                except Exception as del_err:
+                    logger.warning(f"Could not delete archived superseded message {message.id}: {del_err}")
+            else:
+                # Flow A: clicked the superseder directly
+                try:
+                    await message.delete()
+                except Exception as del_err:
+                    logger.warning(f"Could not delete superseder message {message.id}: {del_err}")
 
             # Restore the original entry in the DB (clear superseded_by, update message ID)
             poster.database.restore_superseded_entry(original_entry_id, new_msg_id, new_channel_id)
+
+            # Re-apply stored emoji reactions to the freshly re-posted message
+            try:
+                restored_channel = poster.client.get_channel(new_channel_id)
+                if restored_channel:
+                    restored_msg = await restored_channel.fetch_message(new_msg_id)
+                    await poster.restore_reactions(original_entry_id, restored_msg)
+            except Exception as react_err:
+                logger.warning(f"Could not restore reactions for {original_entry_id}: {react_err}")
 
             # Clean up the superseder from message_mapping and embeddings
             # (keep processed_entries so it isn't re-fetched)

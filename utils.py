@@ -174,6 +174,43 @@ def cleanup_old_media_files(media_dir="temp_media", retention_days=2):
     except Exception as e:
         logger.error(f"Error cleaning up old media files: {e}")
 
+
+def cleanup_bot_log(log_path: str = 'bot.log', max_age_hours: int = 24) -> None:
+    import re
+    from datetime import datetime, timedelta
+    if not os.path.exists(log_path):
+        return
+    cutoff = datetime.now() - timedelta(hours=max_age_hours)
+    ts_re = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)')
+    kept, include_block = [], False
+    with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            m = ts_re.match(line)
+            if m:
+                try:
+                    include_block = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S,%f') >= cutoff
+                except ValueError:
+                    include_block = True
+            if include_block:
+                kept.append(line)
+    # On Windows os.replace() fails while the logging FileHandler holds bot.log open.
+    # Close all FileHandlers pointing to this path, overwrite in place, then reopen them.
+    abs_path = os.path.abspath(log_path)
+    open_handlers = [
+        h for h in logging.getLogger().handlers
+        if isinstance(h, logging.FileHandler) and os.path.abspath(h.baseFilename) == abs_path
+    ]
+    for h in open_handlers:
+        h.close()
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.writelines(kept)
+    finally:
+        for h in open_handlers:
+            h.stream = open(h.baseFilename, h.mode, encoding='utf-8')
+    logger.info(f"Log cleanup complete: retained {len(kept)} lines (last {max_age_hours}h)")
+
+
 def ensure_directory(directory):
     """
     Ensure a directory exists, create it if it doesn't

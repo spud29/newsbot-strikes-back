@@ -107,6 +107,34 @@ class DiscordPoster:
             if message.author == self.client.user:
                 return
 
+        @self.client.event
+        async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+            if payload.user_id == self.client.user.id:
+                return
+            if self.database is None:
+                return
+            entry_id = self.database.get_entry_id_by_discord_message(payload.message_id)
+            if not entry_id:
+                return
+            emoji_str = str(payload.emoji)
+            reactions = self.database.get_reactions(entry_id)
+            users = reactions.get(emoji_str, [])
+            if str(payload.user_id) not in users:
+                users.append(str(payload.user_id))
+            self.database.upsert_reaction(entry_id, emoji_str, users)
+            logger.debug(f"Reaction {emoji_str} added to {entry_id} by {payload.user_id}")
+
+        @self.client.event
+        async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+            if self.database is None:
+                return
+            entry_id = self.database.get_entry_id_by_discord_message(payload.message_id)
+            if not entry_id:
+                return
+            emoji_str = str(payload.emoji)
+            self.database.remove_reaction_user(entry_id, emoji_str, str(payload.user_id))
+            logger.debug(f"Reaction {emoji_str} removed from {entry_id} by {payload.user_id}")
+
         logger.info("Discord poster initialized with app commands support")
 
     async def _extract_thread_perplexity_content(self, thread):
@@ -385,6 +413,8 @@ class DiscordPoster:
                 # Use the original AI category for the tag, not the user's routing choice
                 old_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
                 original_ai_cat = (old_info.get('original_category') if old_info else None) or new_category
+                if not original_ai_cat or original_ai_cat == config.DEFAULT_CATEGORY:
+                    original_ai_cat = new_category
                 new_text = f"**[{original_ai_cat.title()}]**\n{ensure_url_on_own_line(content)}"
 
                 if original_message.embeds and not original_message.content:
@@ -473,6 +503,8 @@ class DiscordPoster:
             # Look up the original AI category so the tag reflects topic, not routing choice
             cross_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
             original_ai_cat = (cross_info.get('original_category') if cross_info else None) or new_category
+            if not original_ai_cat or original_ai_cat == config.DEFAULT_CATEGORY:
+                original_ai_cat = new_category
 
             # Post to new channel
             success, new_message_id, new_channel_id = await self.post_message(
@@ -761,6 +793,24 @@ class DiscordPoster:
             logger.error(f"delete_message error: {e}", exc_info=True)
             return False
 
+    async def restore_reactions(self, entry_id: str, message: discord.Message) -> None:
+        """Seed emoji reactions from DB onto a freshly re-posted Discord message.
+
+        Called after un-superseding an entry so the community's prior reactions
+        are visible again. The bot adds each emoji once; users can re-react to
+        increment counts. The full per-user history is preserved in the DB.
+        """
+        if self.database is None:
+            return
+        reactions = self.database.get_reactions(entry_id)
+        for emoji, user_ids in reactions.items():
+            if not user_ids:
+                continue
+            try:
+                await message.add_reaction(emoji)
+            except Exception as e:
+                logger.warning(f"Could not restore reaction {emoji} on {entry_id}: {e}")
+
     async def post_superseded_entry(self, old_mapping, new_entry_preview):
         """
         Post a record of a superseded entry to the dedicated superseded channel.
@@ -774,11 +824,11 @@ class DiscordPoster:
         """
         channel_id = getattr(config, 'SUPERSEDED_CHANNEL_ID', None)
         if not channel_id:
-            return False
+            return False, None
         channel = self.client.get_channel(channel_id)
         if not channel:
             logger.warning(f"post_superseded_entry: could not find superseded channel {channel_id}")
-            return False
+            return False, None
         try:
             import datetime
             ts = old_mapping.get('timestamp')
@@ -800,12 +850,12 @@ class DiscordPoster:
                 f"**Original content:**\n{preview}",
                 f"**Superseded by:** {new_preview}",
             ]
-            await channel.send('\n'.join(lines))
+            sent = await channel.send('\n'.join(lines))
             logger.info(f"Posted superseded entry to channel {channel_id}")
-            return True
+            return True, sent.id
         except Exception as e:
             logger.warning(f"post_superseded_entry error (non-fatal): {e}")
-            return False
+            return False, None
 
     async def _verify_channel_access(self):
         """

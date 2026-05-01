@@ -406,6 +406,7 @@ NEWSWORTHINESS_WEIGHTS = {
 SUPERSEDE_ENABLED = True
 SUPERSEDE_MAX_AGE_HOURS = 24  # Don't supersede entries older than this
 SUPERSEDED_CHANNEL_ID = 1344412433552248973  # Channel to archive superseded entries
+SUPERSEDE_SIMILARITY_THRESHOLD = 0.85  # Min similarity to even attempt supersede (above SIMILARITY_THRESHOLD)
 
 # Audio Transcription (Whisper via faster-whisper, runs 100% locally)
 # Models are downloaded automatically to ~/.cache/huggingface/ on first use.

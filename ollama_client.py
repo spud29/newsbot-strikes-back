@@ -461,16 +461,23 @@ class OllamaClient:
             f"EXISTING ARTICLE (already published):\n{existing_content[:800]}\n\n"
             f"NEW ARTICLE (just arrived):\n{new_content[:800]}\n\n"
             "Choose one verdict:\n"
-            "- \"supersede\": New article covers all the same facts AND adds more detail or "
-            "corrections — the existing article adds nothing the new one doesn't already cover. "
-            "Replace the old one.\n"
-            "- \"keep_both\": Both articles contain important information the other does NOT "
-            "cover. Use this when the existing article describes specific actions or statements "
-            "(e.g. 'markets frozen', 'contracts safe', mitigation steps) AND the new article "
-            "describes different outcomes or scale (e.g. TVL drop, exploit size) — and neither "
-            "fully captures the other's key facts. Post both.\n"
-            "- \"ignore\": Existing article is equal or better; new one adds nothing not already "
-            "covered. Discard the new one.\n\n"
+            "- \"supersede\": The new article is a STRICT UPGRADE — it contains every key fact "
+            "from the existing article AND adds corrections or critical new details. The existing "
+            "article has NOTHING unique that the new one doesn't already cover. Replacing it loses "
+            "ZERO information. Use this sparingly and only when you are certain.\n"
+            "- \"keep_both\": The new article adds significant new information, BUT the existing "
+            "article still contains facts, context, or details NOT found in the new one. This "
+            "includes update/follow-up articles (e.g. initial alert vs confirmed details), "
+            "articles with different scope or angle, or any case where you are uncertain. "
+            "When in doubt, choose this.\n"
+            "- \"ignore\": The new article covers the same story and adds nothing not already in "
+            "the existing article. Discard the new one.\n\n"
+            "Important signals:\n"
+            "- If the existing article contains a DIRECT QUOTE (someone's exact words in "
+            "quotation marks) that the new article does not, the existing article has unique "
+            "information — choose keep_both.\n"
+            "- If the new article is noticeably shorter than the existing article, it likely "
+            "omits details — lean toward keep_both unless you are certain nothing was lost.\n\n"
             "Respond with ONLY valid JSON: "
             "{\"verdict\": \"supersede\", \"keep_both\", or \"ignore\", \"reasoning\": \"brief explanation\"}"
         )
@@ -506,17 +513,9 @@ class OllamaClient:
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-            # Fallback: look for keyword
-            text_lower = response_text.lower()
-            if 'keep_both' in text_lower or 'keep both' in text_lower:
-                logger.info("Compare verdict (fallback): keep_both")
-                return {'verdict': 'keep_both', 'reasoning': 'Parsed from fallback'}
-            if 'supersede' in text_lower:
-                logger.info("Compare verdict (fallback): supersede")
-                return {'verdict': 'supersede', 'reasoning': 'Parsed from fallback'}
-
-            logger.info("Compare verdict (fallback): ignore")
-            return {'verdict': 'ignore', 'reasoning': 'Could not parse response, defaulting to ignore'}
+            # Fallback: could not parse clean JSON — default to keep_both (safe)
+            logger.info("Compare verdict (fallback): keep_both — could not parse clean JSON")
+            return {'verdict': 'keep_both', 'reasoning': 'Could not parse response, defaulting to keep_both'}
 
         except Exception as e:
             logger.error(f"Error comparing entries: {e}")

@@ -418,6 +418,79 @@ class Database:
         keys = row.keys()
         return {k: row[k] for k in keys}
 
+    def update_superseded_channel_message_id(self, entry_id, channel_msg_id):
+        """Store the Discord message ID of the archived copy in the superseded channel."""
+        self.conn.execute(
+            "UPDATE message_mapping SET superseded_channel_discord_message_id = ? WHERE entry_id = ?",
+            (channel_msg_id, entry_id)
+        )
+        self.conn.commit()
+        logger.debug(f"Stored superseded-channel message ID {channel_msg_id} for {entry_id}")
+
+    def get_entry_by_superseded_channel_message(self, channel_msg_id):
+        """Look up the original entry by its archived-copy message ID in the superseded channel."""
+        row = self.conn.execute(
+            "SELECT * FROM message_mapping WHERE superseded_channel_discord_message_id = ?",
+            (channel_msg_id,)
+        ).fetchone()
+        return {k: row[k] for k in row.keys()} if row else None
+
+    # ------------------------------------------------------------------
+    # Reaction tracking
+    # ------------------------------------------------------------------
+
+    def upsert_reaction(self, entry_id: str, emoji: str, user_ids: list) -> None:
+        self.conn.execute(
+            """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
+               ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
+            (entry_id, emoji, json.dumps(user_ids))
+        )
+        self.conn.commit()
+
+    def remove_reaction_user(self, entry_id: str, emoji: str, user_id: str) -> None:
+        row = self.conn.execute(
+            "SELECT user_ids FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
+            (entry_id, emoji)
+        ).fetchone()
+        if row is None:
+            return
+        users = json.loads(row['user_ids'])
+        users = [u for u in users if u != user_id]
+        if users:
+            self.conn.execute(
+                "UPDATE entry_reactions SET user_ids = ? WHERE entry_id = ? AND emoji = ?",
+                (json.dumps(users), entry_id, emoji)
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
+                (entry_id, emoji)
+            )
+        self.conn.commit()
+
+    def get_reactions(self, entry_id: str) -> dict:
+        rows = self.conn.execute(
+            "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
+            (entry_id,)
+        ).fetchall()
+        return {row['emoji']: json.loads(row['user_ids']) for row in rows}
+
+    def copy_reactions(self, src_entry_id: str, dst_entry_id: str) -> None:
+        rows = self.conn.execute(
+            "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
+            (src_entry_id,)
+        ).fetchall()
+        for row in rows:
+            self.conn.execute(
+                """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
+                   ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
+                (dst_entry_id, row['emoji'], row['user_ids'])
+            )
+        self.conn.commit()
+        logger.debug(f"Copied {len(rows)} reaction(s) from {src_entry_id} to {dst_entry_id}")
+
+    # ------------------------------------------------------------------
+
     def restore_superseded_entry(self, original_entry_id, new_discord_message_id, new_discord_channel_id):
         """
         Clear the superseded_by flag and update the Discord message IDs for a restored entry.

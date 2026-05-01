@@ -7,7 +7,7 @@ import signal
 import sys
 import subprocess
 import os
-from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question
+from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, cleanup_bot_log
 import config
 from db_connection import close_db_connection
 from database import Database
@@ -52,6 +52,7 @@ class NewsAggregatorBot:
 
         self.running = False
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
+        self._last_log_cleanup: float = 0.0
         
         # Statistics
         self.stats = {
@@ -200,19 +201,6 @@ class NewsAggregatorBot:
                     self.stats['errors'] += 1
                     return False
 
-                # Fix ALL CAPS content (wire-service style headlines from any source)
-                # Rewrites to proper sentence case before embedding/categorization/posting
-                if getattr(config, 'CAPS_FIX_ENABLED', False):
-                    if is_all_caps(content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
-                        logger.info(f"ALL CAPS detected in {source_type} entry, running text cleanup...")
-                        original_content = content
-                        content = await asyncio.to_thread(self.ollama.format_text, content)
-                        entry['content'] = content
-                        if content != original_content:
-                            logger.info(f"Text formatted for {entry_id}")
-                        else:
-                            logger.debug(f"Text unchanged after format_text (returned original)")
-
                 # Generate embedding for duplicate detection BEFORE downloading media
                 # Note: OCR text will be added after media download for enhanced detection
                 # Wrapped in asyncio.to_thread() to prevent blocking Discord interactions
@@ -306,7 +294,7 @@ class NewsAggregatorBot:
                         content = entry.get('full_text') or content
                         # Dexerto merger: append tweet 2 follow-up text (blurb + article URL)
                         if entry.get('dexerto_follow_up'):
-                            content = f"{content}\n{entry['dexerto_follow_up']}"
+                            content = f"{content.rstrip()}\n{entry['dexerto_follow_up']}"
                             logger.debug(f"DexertoMerger: appended follow-up text to content for {entry_id}")
                     elif source_type == 'telegram':
                         entry = await self.media_handler.download_telegram_media(entry)
@@ -314,6 +302,21 @@ class NewsAggregatorBot:
                         content = entry.get('content', content)
                 else:
                     logger.debug("Media already downloaded, skipping download step...")
+
+                # Fix ALL CAPS content (wire-service style headlines from any source)
+                # Runs after gallery-dl so the final tweet text is what gets checked and rewritten.
+                # Must be after line above — gallery-dl full_text can restore all-caps if checked earlier.
+                if getattr(config, 'CAPS_FIX_ENABLED', False):
+                    if is_all_caps(content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
+                        logger.info(f"ALL CAPS detected in {source_type} entry, running text cleanup...")
+                        original_content = content
+                        content = await asyncio.to_thread(self.ollama.format_text, content)
+                        entry['content'] = content
+                        if content != original_content:
+                            logger.info(f"Text formatted for {entry_id}")
+                        else:
+                            logger.debug(f"Text unchanged after format_text (returned original)")
+
                 
                 # Combine OCR text and audio transcript with content for better categorization
                 ocr_text = entry.get('ocr_text', '')
@@ -414,10 +417,14 @@ class NewsAggregatorBot:
                             and old_mapping.get('timestamp')
                             and (time.time() - old_mapping['timestamp']) < max_age
                         )
+                        supersede_threshold = getattr(config, 'SUPERSEDE_SIMILARITY_THRESHOLD', 0.85)
                         if old_is_fresh:
-                            comparison = await asyncio.to_thread(
-                                self.ollama.compare_entries, content, match_content
-                            )
+                            if similarity_info['similarity'] >= supersede_threshold:
+                                comparison = await asyncio.to_thread(
+                                    self.ollama.compare_entries, content, match_content
+                                )
+                            else:
+                                comparison = {'verdict': 'keep_both', 'reasoning': 'Similarity below supersede threshold'}
                             if comparison['verdict'] == 'keep_both':
                                 keep_both = True
                                 logger.info(
@@ -440,9 +447,11 @@ class NewsAggregatorBot:
                                 )
                                 if deleted:
                                     # Archive superseded entry to dedicated channel, clean up embedding
-                                    await self.discord_poster.post_superseded_entry(
+                                    archived, archived_msg_id = await self.discord_poster.post_superseded_entry(
                                         old_mapping, content[:200]
                                     )
+                                    if archived and archived_msg_id:
+                                        self.db.update_superseded_channel_message_id(match_entry_id, archived_msg_id)
                                     self.db.delete_embedding_by_entry_id(match_entry_id)
                                     self.db.mark_as_superseded(match_entry_id, entry_id)
                                     superseded = True
@@ -763,7 +772,14 @@ class NewsAggregatorBot:
         # Clean up old media files (older than 2 days)
         from utils import cleanup_old_media_files
         cleanup_old_media_files(retention_days=2)
-        
+
+        # Trim bot.log to last 24 hours once every 7 days
+        _LOG_CLEANUP_INTERVAL = 7 * 24 * 3600
+        _now = time.time()
+        if _now - self._last_log_cleanup >= _LOG_CLEANUP_INTERVAL:
+            await asyncio.to_thread(cleanup_bot_log)
+            self._last_log_cleanup = _now
+
         # Get database stats
         db_stats = self.db.get_stats()
         retry_stats = self.retry_queue.get_stats()
@@ -999,7 +1015,11 @@ class NewsAggregatorBot:
         await self.start()
         
         logger.info(f"\nStarting main loop (polling every {config.POLL_INTERVAL}s)...")
-        
+
+        # Trim log to last 24 hours on startup, then every 7 days thereafter
+        await asyncio.to_thread(cleanup_bot_log)
+        self._last_log_cleanup = time.time()
+
         # Start Telegram queue processors as background tasks
         telegram_queue_task = asyncio.create_task(self.process_telegram_queue())
         telegram_edit_task = asyncio.create_task(self.process_telegram_edits())

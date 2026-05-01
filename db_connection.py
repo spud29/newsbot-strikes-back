@@ -101,6 +101,13 @@ def _create_tables(conn):
             channel_name TEXT PRIMARY KEY,
             message_id INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS entry_reactions (
+            entry_id TEXT NOT NULL,
+            emoji    TEXT NOT NULL,
+            user_ids TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (entry_id, emoji)
+        );
     """)
     conn.commit()
 
@@ -124,6 +131,10 @@ def _run_migrations(conn):
 
     if 'superseded_by' not in columns:
         conn.execute("ALTER TABLE message_mapping ADD COLUMN superseded_by TEXT DEFAULT NULL")
+        conn.commit()
+
+    if 'superseded_channel_discord_message_id' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN superseded_channel_discord_message_id INTEGER DEFAULT NULL")
         conn.commit()
 
 
