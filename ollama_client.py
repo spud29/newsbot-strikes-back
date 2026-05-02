@@ -110,6 +110,66 @@ class OllamaClient:
             except Exception as e:
                 logger.error(f"Error adding ignore entries to system prompt: {e}", exc_info=True)
 
+        # Add category-correction examples (AI said X, user changed to Y)
+        if (getattr(config, 'CORRECTION_EXAMPLES_ENABLED', True) and
+                self.database and
+                hasattr(self.database, 'get_recategorization_examples')):
+
+            try:
+                corrections = self.database.get_recategorization_examples(
+                    limit=getattr(config, 'CORRECTION_EXAMPLES_COUNT', 15),
+                    max_preview_length=150
+                )
+
+                if corrections:
+                    enhanced_prompt += "\n\n" + "=" * 60
+                    enhanced_prompt += "\nKNOWN CATEGORIZATION CORRECTIONS — the AI was wrong about these. Learn from them:\n\n"
+
+                    for i, (preview, orig_cat, corrected_cat) in enumerate(corrections, 1):
+                        clean_preview = " ".join(preview.split())
+                        enhanced_prompt += (
+                            f"{i}. AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
+                        )
+
+                    enhanced_prompt += "\n" + "=" * 60
+                    enhanced_prompt += "\nWhen content resembles the examples above, choose the corrected category shown, not the AI's original guess."
+
+                    logger.debug(f"Enhanced system prompt with {len(corrections)} category-correction examples")
+                else:
+                    logger.debug("No category-correction examples available")
+
+            except Exception as e:
+                logger.error(f"Error adding correction examples to system prompt: {e}", exc_info=True)
+
+        # Add ignore-promotion examples (AI posted it, user moved it to ignore)
+        if (getattr(config, 'CORRECTION_EXAMPLES_ENABLED', True) and
+                self.database and
+                hasattr(self.database, 'get_ignore_promotion_examples')):
+
+            try:
+                promotions = self.database.get_ignore_promotion_examples(
+                    limit=getattr(config, 'IGNORE_PROMOTION_EXAMPLES_COUNT', 10),
+                    max_preview_length=150
+                )
+
+                if promotions:
+                    enhanced_prompt += "\n\n" + "=" * 60
+                    enhanced_prompt += "\nENTRIES MOVED TO IGNORE BY USER — the AI posted these but they should have been ignored:\n\n"
+
+                    for i, (preview, orig_cat) in enumerate(promotions, 1):
+                        clean_preview = " ".join(preview.split())
+                        enhanced_prompt += f"{i}. (AI said '{orig_cat}'): {clean_preview}\n"
+
+                    enhanced_prompt += "\n" + "=" * 60
+                    enhanced_prompt += "\nSimilar content should be categorized as 'ignore'."
+
+                    logger.debug(f"Enhanced system prompt with {len(promotions)} ignore-promotion examples")
+                else:
+                    logger.debug("No ignore-promotion examples available")
+
+            except Exception as e:
+                logger.error(f"Error adding ignore-promotion examples to system prompt: {e}", exc_info=True)
+
         # Cache the enhanced prompt
         self._enhanced_prompt_cache = enhanced_prompt
         self._cache_timestamp = current_time

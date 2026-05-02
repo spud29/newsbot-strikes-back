@@ -19,7 +19,7 @@ from discord_commands import register_commands
 class DiscordPoster:
     """Posts messages to Discord channels with context menu command support"""
 
-    def __init__(self, perplexity_client=None, database=None, removed_entries_db=None):
+    def __init__(self, perplexity_client=None, database=None, removed_entries_db=None, ollama=None):
         """
         Initialize Discord client with app commands support
 
@@ -27,6 +27,7 @@ class DiscordPoster:
             perplexity_client: Optional PerplexityClient instance for search commands
             database: Optional Database instance for entry removal
             removed_entries_db: Optional RemovedEntriesDB instance
+            ollama: Optional OllamaClient instance — cache is invalidated after re-categorization
         """
         intents = discord.Intents.default()
         intents.message_content = True
@@ -46,6 +47,7 @@ class DiscordPoster:
         self.database = database
         self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
 
+        self.ollama = ollama
         self.reprocess_callback = None  # Set by NewsAggregatorBot.start()
         self.media_handler = None       # Set by NewsAggregatorBot.start()
 
@@ -444,6 +446,8 @@ class DiscordPoster:
                             placement_reason=new_placement_reason
                         )
                         logger.info(f"Updated message mapping category for entry {entry_id}")
+                        if self.ollama:
+                            self.ollama._enhanced_prompt_cache = None
                     except Exception as e:
                         logger.error(f"Error updating database: {e}")
 
@@ -584,6 +588,8 @@ class DiscordPoster:
                         placement_reason=new_placement_reason
                     )
                     logger.info(f"Updated message mapping for entry {entry_id}")
+                    if self.ollama:
+                        self.ollama._enhanced_prompt_cache = None
                 except Exception as e:
                     logger.error(f"Error updating database: {e}")
                     # Don't fail the whole operation if database update fails

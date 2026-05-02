@@ -41,7 +41,8 @@ class NewsAggregatorBot:
         self.discord_poster = DiscordPoster(
             perplexity_client=self.perplexity,
             database=self.db,
-            removed_entries_db=self.removed_entries_db
+            removed_entries_db=self.removed_entries_db,
+            ollama=self.ollama
         )
         self.retry_queue = RetryQueue(max_retries=3, retry_delay_cycles=2)
         self.dexerto_merger = DexertoMerger(
@@ -53,6 +54,7 @@ class NewsAggregatorBot:
         self.running = False
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
         self._last_log_cleanup: float = 0.0
+        self._last_nightly_rebuild: float = 0.0
         
         # Statistics
         self.stats = {
@@ -779,6 +781,20 @@ class NewsAggregatorBot:
         if _now - self._last_log_cleanup >= _LOG_CLEANUP_INTERVAL:
             await asyncio.to_thread(cleanup_bot_log)
             self._last_log_cleanup = _now
+
+        # Nightly rebuild: at 3 AM, force-refresh the Ollama prompt cache so it picks
+        # up the full day's re-categorization corrections from the database.
+        import datetime
+        _now_local = datetime.datetime.now()
+        if _now_local.hour == 3 and (_now - self._last_nightly_rebuild) > 20 * 3600:
+            self.ollama._enhanced_prompt_cache = None
+            self._last_nightly_rebuild = _now
+            corrections = self.db.get_recategorization_examples(limit=100)
+            promotions = self.db.get_ignore_promotion_examples(limit=100)
+            logger.info(
+                f"Nightly prompt rebuild: {len(corrections)} category-correction pairs, "
+                f"{len(promotions)} ignore-promotion pairs available"
+            )
 
         # Get database stats
         db_stats = self.db.get_stats()

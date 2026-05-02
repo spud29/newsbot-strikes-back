@@ -544,6 +544,59 @@ class Database:
             results.append((preview, user_flagged))
         return results
     
+    def get_recategorization_examples(self, limit=20, max_preview_length=150):
+        """
+        Return correction pairs where the AI picked the wrong non-ignore category.
+        Used to build the 'corrections' block in the enhanced system prompt.
+
+        Returns:
+            list of (content_preview, original_category, corrected_category) tuples
+        """
+        rows = self.conn.execute(
+            """SELECT content, original_category, category
+               FROM message_mapping
+               WHERE original_category IS NOT NULL
+                 AND original_category != category
+                 AND original_category != 'ignore'
+                 AND category != 'ignore'
+                 AND content IS NOT NULL
+                 AND content != ''
+                 AND timestamp > ?
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (time.time() - 7 * 86400, limit)
+        ).fetchall()
+        return [
+            ((row['content'] or '')[:max_preview_length], row['original_category'], row['category'])
+            for row in rows
+        ]
+
+    def get_ignore_promotion_examples(self, limit=15, max_preview_length=150):
+        """
+        Return entries where the AI posted to a real channel but the user moved them to ignore.
+        Used to teach the AI what it should have ignored in the first place.
+
+        Returns:
+            list of (content_preview, original_category) tuples
+        """
+        rows = self.conn.execute(
+            """SELECT content, original_category
+               FROM message_mapping
+               WHERE original_category IS NOT NULL
+                 AND original_category != 'ignore'
+                 AND category = 'ignore'
+                 AND content IS NOT NULL
+                 AND content != ''
+                 AND timestamp > ?
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (time.time() - 7 * 86400, limit)
+        ).fetchall()
+        return [
+            ((row['content'] or '')[:max_preview_length], row['original_category'])
+            for row in rows
+        ]
+
     def update_message_mapping_fields(self, entry_id, **kwargs):
         """
         Update specific fields on a message mapping
