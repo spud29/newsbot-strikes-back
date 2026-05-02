@@ -47,6 +47,8 @@ class TelegramPoller:
             
             # Set up real-time event handlers
             await self.setup_event_handlers()
+            if not self.event_handlers_setup:
+                logger.warning("Real-time event handlers failed to initialize — bot will use polling-only mode for Telegram")
     
     async def stop(self):
         """Stop the Telegram client"""
