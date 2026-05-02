@@ -23,17 +23,7 @@ PERPLEXITY_MODEL = "sonar-reasoning-pro"  # Model with web search capability
 # Context Menu Commands (Right-click on bot messages → Apps → Command Name)
 # Note: These replaced buttons for a cleaner UI. Users right-click bot messages to access features.
 PERPLEXITY_BUTTON_ENABLED = True  # Enable/disable "Get More Info" context menu command
-# The following button appearance configs are kept for backward compatibility but are no longer used
-# (Context menu commands use simple text names)
-PERPLEXITY_BUTTON_LABEL = "Get More Info"  # Not used by context menu
-PERPLEXITY_BUTTON_EMOJI = "🔍"  # Not used by context menu
-PERPLEXITY_BUTTON_STYLE = "primary"  # Not used by context menu
-
-# Citations are now automatically included in the "Get More Info" thread response
-PERPLEXITY_CITATIONS_BUTTON_ENABLED = True  # Not used (citations always shown if available)
-PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"  # Not used by context menu
-PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"  # Not used by context menu
-PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # Not used by context menu
+# Legacy button appearance config removed — context menu commands use simple text names instead.
 
 # /news Slash Command Configuration
 NEWS_SEARCH_COMMAND_ENABLED = True
