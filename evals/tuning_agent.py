@@ -48,7 +48,7 @@ F1_IMPROVEMENT_GATE = 0.01
 F1_REGRESSION_GATE = 0.05
 MIN_SUPPORT_FOR_GATE = 5
 TUNING_BRANCH = "tuning"
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-opus-4-7"
 N_VARIANTS = 3
 
 
@@ -443,64 +443,6 @@ def importlib_reload(mod):
     importlib.reload(mod)
 
 
-# ----- optional PR creation after a tuning commit -----
-
-def push_tuning_pr(sha: str, winner_id: str, winner_report: dict, baseline: dict):
-    """Push the tuning branch to origin and open a PR targeting main."""
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-
-    # Determine remote URL — prefer token-authenticated HTTPS push.
-    if token and repo:
-        remote_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-        git("push", "-u", remote_url, TUNING_BRANCH)
-    else:
-        git("push", "-u", "origin", TUNING_BRANCH)
-
-    improvement = winner_report["macro_f1"] - baseline["macro_f1"]
-    title = f"tune: {winner_id} — macro-F1 {improvement:+.3f}"
-
-    per_cat = winner_report.get("per_category", {})
-    base_pc = baseline.get("per_category", {})
-    delta_lines = []
-    for cat in sorted(per_cat):
-        b = base_pc.get(cat, {})
-        if b.get("support", 0) == 0:
-            continue
-        bf1 = b.get("f1", 0.0)
-        vf1 = per_cat[cat].get("f1", 0.0)
-        delta_lines.append(f"| {cat} | {bf1:.3f} | {vf1:.3f} | {vf1 - bf1:+.3f} |")
-
-    body = (
-        f"## Tuning result\n\n"
-        f"| metric | value |\n|---|---|\n"
-        f"| baseline macro-F1 | {baseline['macro_f1']:.4f} |\n"
-        f"| variant macro-F1  | {winner_report['macro_f1']:.4f} |\n"
-        f"| improvement       | {improvement:+.4f} |\n"
-        f"| commit            | {sha[:10]} |\n\n"
-        f"## Per-category F1 deltas\n\n"
-        f"| category | baseline | variant | delta |\n|---|---|---|---|\n"
-        + "\n".join(delta_lines)
-        + "\n\n---\n_Proposed by local nightly tuning agent (claude-sonnet-4-6)._"
-    )
-
-    env = {**os.environ}
-    if token:
-        env["GH_TOKEN"] = token
-
-    subprocess.run(
-        ["gh", "pr", "create",
-         "--title", title,
-         "--body", body,
-         "--base", "main",
-         "--head", TUNING_BRANCH],
-        cwd=PROJECT_ROOT,
-        check=True,
-        env=env,
-    )
-    print(f"PR opened: branch='{TUNING_BRANCH}' → main")
-
-
 # ----- history -----
 
 def log_cycle(entry: dict):
@@ -518,10 +460,6 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--force-baseline", action="store_true",
                         help="Re-run baseline even if today's report exists.")
-    parser.add_argument("--create-pr", action="store_true",
-                        help="After committing the winner to the tuning branch, push "
-                             "to origin and open a pull request targeting main. "
-                             "Requires gh CLI and GH_TOKEN / GITHUB_TOKEN env var.")
     args = parser.parse_args()
 
     with TuningLock():
@@ -598,9 +536,6 @@ def main():
         cycle_log["commit_sha"] = sha
         print(f"Committed {sha} to branch '{TUNING_BRANCH}'.")
         log_cycle(cycle_log)
-
-        if args.create_pr:
-            push_tuning_pr(sha, winner_id, winner_report, baseline)
 
 
 if __name__ == "__main__":
