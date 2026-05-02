@@ -845,7 +845,8 @@ class NewsAggregatorBot:
                 try:
                     dt = parsedate_to_datetime(entry['pub_date'])
                     return dt.timestamp()
-                except:
+                except Exception as e:
+                    logger.warning(f"Failed to parse pub_date '{entry.get('pub_date')}': {e}")
                     return 0
             return 0
         
