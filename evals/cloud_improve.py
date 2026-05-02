@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 # ── paths ──────────────────────────────────────────────────────────────────────
@@ -46,7 +47,9 @@ HISTORY_PATH = EVALS_DIR / "history.jsonl"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS_PLAN = 4096
 MAX_TOKENS_IMPL = 8192
-GOLDEN_SAMPLE_SIZE = 60   # balanced cross-section; keeps prompt size manageable
+GOLDEN_SAMPLE_SIZE = 20    # small balanced cross-section to stay well under rate limits
+MAX_CHARS_PER_FILE = 8_000  # hard cap per source file (~2K tokens each)
+PHASE_DELAY_SECS = 65       # wait between phases so the 1-minute rate-limit window resets
 
 # Paths the agent must never write to (checked as prefix or exact basename)
 BLOCKED_PREFIXES = (
@@ -67,21 +70,15 @@ BLOCKED_PREFIXES = (
 )
 BLOCKED_EXTENSIONS = {".session"}
 
-# Source files included in the context pack (relative to PROJECT_ROOT)
+# Source files included in the context pack (relative to PROJECT_ROOT).
+# Keep this list short — every file is sent twice (planning + implementation)
+# and each API call must stay under the org rate limit.
 CONTEXT_FILES = [
-    "config.py",
-    "main.py",
-    "ollama_client.py",
-    "discord_commands.py",
-    "discord_messaging.py",
-    "discord_poster.py",
-    "database.py",
-    "db_connection.py",
-    "rss_poller.py",
-    "telegram_poller.py",
-    "retry_queue.py",
-    "utils.py",
-    "media_handler.py",
+    "config.py",          # SYSTEM_PROMPT, categories, all tunable thresholds
+    "ollama_client.py",   # categorisation + embedding logic
+    "main.py",            # orchestration, scheduler
+    "discord_poster.py",  # posting + formatting
+    "database.py",        # schema, queries
 ]
 
 # ── tool schema ────────────────────────────────────────────────────────────────
@@ -126,7 +123,7 @@ EDIT_TOOL = {
 
 # ── context building ───────────────────────────────────────────────────────────
 
-def _read_file(path: Path, max_chars: int = 40_000) -> str:
+def _read_file(path: Path, max_chars: int = MAX_CHARS_PER_FILE) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
         if len(text) > max_chars:
@@ -246,9 +243,24 @@ DO NOT output code in this phase. Output your analysis and numbered plan only.
 """
 
 
+def _call_with_retry(client, **kwargs):
+    """Call client.messages.create with exponential backoff on 429 errors."""
+    import anthropic
+    delays = [15, 30, 60, 120]
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as exc:
+            if attempt == len(delays):
+                raise
+            print(f"Rate limit hit (attempt {attempt}); retrying in {delay}s … ({exc})", flush=True)
+            time.sleep(delay)
+
+
 def run_planning_phase(client, context_pack: str) -> str:
     print("Phase 1: Planning improvements …", flush=True)
-    response = client.messages.create(
+    response = _call_with_retry(
+        client,
         model=MODEL,
         max_tokens=MAX_TOKENS_PLAN,
         messages=[{"role": "user", "content": _PLANNING_PROMPT.format(context_pack=context_pack)}],
@@ -292,7 +304,8 @@ Hard constraints:
 
 def run_implementation_phase(client, plan: str, context_pack: str) -> list[dict]:
     print("Phase 2: Implementing changes …", flush=True)
-    response = client.messages.create(
+    response = _call_with_retry(
+        client,
         model=MODEL,
         max_tokens=MAX_TOKENS_IMPL,
         tools=[EDIT_TOOL],
@@ -468,6 +481,9 @@ def main() -> None:
     print("\n─── PLAN ───────────────────────────────────")
     print(plan)
     print("─── END PLAN ───────────────────────────────\n")
+
+    print(f"Waiting {PHASE_DELAY_SECS}s for rate-limit window to reset …", flush=True)
+    time.sleep(PHASE_DELAY_SECS)
 
     edits = run_implementation_phase(client, plan, context_pack)
     if not edits:
