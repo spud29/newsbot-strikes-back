@@ -8,6 +8,32 @@ import re
 from utils import logger, retry_with_backoff
 import config
 
+# Known LLM abbreviations and alternate forms mapped to canonical category names.
+# Keys are lowercased; values are entries in VALID_CATEGORIES.
+# Runs AFTER exact match and BEFORE partial match inside _parse_category.
+_CATEGORY_ALIASES = {
+    "ai":                "artificial intelligence",
+    "ml":                "artificial intelligence",
+    "machine learning":  "artificial intelligence",
+    "gaming":            "video games",
+    "games":             "video games",
+    "tech":              "technology",
+    "software":          "software development",
+    "dev":               "software development",
+    "development":       "software development",
+    "news":              "general news",
+    "general":           "general news",
+    "culture":           "pop culture",
+    "entertainment":     "pop culture",
+    "celebrity":         "pop culture",
+    "finance":           "stocks",
+    "stock":             "stocks",
+    "blockchain":        "crypto",
+    "web3":              "crypto",
+    "cryptocurrency":    "crypto",
+    "cryptocurrencies":  "crypto",
+}
+
 class OllamaClient:
     """Client for interacting with local Ollama API"""
     
@@ -125,16 +151,32 @@ class OllamaClient:
                     enhanced_prompt += "\n\n" + "=" * 60
                     enhanced_prompt += "\nKNOWN CATEGORIZATION CORRECTIONS — the AI was wrong about these. Learn from them:\n\n"
 
-                    for i, (preview, orig_cat, corrected_cat) in enumerate(corrections, 1):
-                        clean_preview = " ".join(preview.split())
+                    # Group by (original, corrected) pair so repeated patterns surface as
+                    # frequency-weighted signals rather than redundant identical lines.
+                    correction_groups = {}
+                    for preview, orig_cat, corrected_cat in corrections:
+                        key = (orig_cat, corrected_cat)
+                        if key not in correction_groups:
+                            correction_groups[key] = {'count': 0, 'example': preview}
+                        correction_groups[key]['count'] += 1
+
+                    sorted_corrections = sorted(
+                        correction_groups.items(),
+                        key=lambda x: -x[1]['count']
+                    )
+
+                    for i, ((orig_cat, corrected_cat), info) in enumerate(sorted_corrections, 1):
+                        count = info['count']
+                        count_str = f"({count}×) " if count > 1 else ""
+                        clean_preview = " ".join(info['example'].split())
                         enhanced_prompt += (
-                            f"{i}. AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
+                            f"{i}. {count_str}AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
                         )
 
                     enhanced_prompt += "\n" + "=" * 60
                     enhanced_prompt += "\nWhen content resembles the examples above, choose the corrected category shown, not the AI's original guess."
 
-                    logger.debug(f"Enhanced system prompt with {len(corrections)} category-correction examples")
+                    logger.debug(f"Enhanced system prompt with {len(sorted_corrections)} correction patterns ({len(corrections)} examples)")
                 else:
                     logger.debug("No category-correction examples available")
 
@@ -321,7 +363,21 @@ class OllamaClient:
             else:
                 logger.info(f"Category '{category}' is valid but has no Discord channel, routing to '{config.DEFAULT_CATEGORY}'")
                 return config.DEFAULT_CATEGORY
-        
+
+        # Alias lookup — maps known LLM abbreviations/alternate forms to canonical names.
+        # More precise than substring partial matching below.
+        canonical = _CATEGORY_ALIASES.get(category)
+        if canonical is not None:
+            logger.info(f"Alias match: '{category}' -> '{canonical}'")
+            if canonical in config.DISCORD_CHANNELS:
+                return canonical
+            else:
+                logger.info(
+                    f"Alias '{category}' -> '{canonical}' valid but has no Discord channel, "
+                    f"routing to '{config.DEFAULT_CATEGORY}'"
+                )
+                return config.DEFAULT_CATEGORY
+
         # Only do partial matching if the string is short and non-empty
         # (avoids matching reasoning text, and prevents "" from matching everything)
         if category and len(category) < 50:
