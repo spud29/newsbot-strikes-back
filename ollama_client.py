@@ -212,6 +212,35 @@ class OllamaClient:
             except Exception as e:
                 logger.error(f"Error adding ignore-promotion examples to system prompt: {e}", exc_info=True)
 
+        # Add ignore-rescue examples (AI said ignore, user promoted to real category)
+        if (getattr(config, 'IGNORE_RESCUE_ENABLED', True) and
+                self.database and
+                hasattr(self.database, 'get_ignore_rescue_examples')):
+
+            try:
+                rescues = self.database.get_ignore_rescue_examples(
+                    limit=getattr(config, 'IGNORE_RESCUE_EXAMPLES_COUNT', 10),
+                    max_preview_length=150
+                )
+
+                if rescues:
+                    enhanced_prompt += "\n\n" + "=" * 60
+                    enhanced_prompt += "\nCONTENT INCORRECTLY IGNORED — AI said 'ignore' but users promoted these to real categories. Don't miss similar content:\n\n"
+
+                    for i, (preview, correct_cat) in enumerate(rescues, 1):
+                        clean_preview = " ".join(preview.split())
+                        enhanced_prompt += f"{i}. (should be '{correct_cat}'): {clean_preview}\n"
+
+                    enhanced_prompt += "\n" + "=" * 60
+                    enhanced_prompt += "\nWhen content resembles the examples above, assign the correct category instead of 'ignore'."
+
+                    logger.debug(f"Enhanced system prompt with {len(rescues)} ignore-rescue examples")
+                else:
+                    logger.debug("No ignore-rescue examples available")
+
+            except Exception as e:
+                logger.error(f"Error adding ignore-rescue examples to system prompt: {e}", exc_info=True)
+
         # Cache the enhanced prompt
         self._enhanced_prompt_cache = enhanced_prompt
         self._cache_timestamp = current_time
@@ -242,11 +271,20 @@ class OllamaClient:
             if exclude_categories:
                 exclusion_note = f"\n\nIMPORTANT: Do NOT categorize this content as any of the following: {', '.join(exclude_categories)}. Choose the next most appropriate category."
                 system_prompt += exclusion_note
-            
+
+            # Build list of valid category names to embed in the user prompt.
+            # Showing the exact names at inference time reduces abbreviation errors
+            # (the model has to recall them from the long system prompt otherwise).
+            valid_cats = getattr(config, 'VALID_CATEGORIES', list(config.DISCORD_CHANNELS.keys()))
+            if exclude_categories:
+                valid_cats = [c for c in valid_cats if c not in exclude_categories]
+            valid_names = ", ".join(sorted(valid_cats))
+
             # Prepare the user prompt (content + response format instruction)
             prompt = (
                 f"Content to categorize:\n{content}\n\n"
-                f"Respond with ONLY valid JSON: {{\"category\": \"<name>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
+                f"Valid categories (use the exact name): {valid_names}\n\n"
+                f"Respond with ONLY valid JSON: {{\"category\": \"<exact name from above>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
             )
 
             # Call Ollama API — use separate 'system' field so Ollama can reuse
@@ -261,7 +299,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -448,7 +487,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -538,7 +578,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 100
+                        "num_predict": 100,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -608,7 +649,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.2,
-                        "num_predict": 200
+                        "num_predict": 200,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -737,7 +779,8 @@ Respond with ONLY this JSON, no other text:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.3,  # Lower temperature for more consistent ratings
-                        "num_predict": 200   # Give model enough room for JSON response
+                        "num_predict": 200,  # Give model enough room for JSON response
+                        "think": False
                     }
                 },
                 timeout=300

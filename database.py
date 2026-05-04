@@ -597,6 +597,31 @@ class Database:
             for row in rows
         ]
 
+    def get_ignore_rescue_examples(self, limit=10, max_preview_length=150):
+        """
+        Return entries where the AI assigned 'ignore' but a user promoted them to a real
+        category. Used to teach the AI what it nearly missed.
+
+        Returns:
+            list of (content_preview, correct_category) tuples
+        """
+        rows = self.conn.execute(
+            """SELECT content, category
+               FROM message_mapping
+               WHERE original_category = 'ignore'
+                 AND category != 'ignore'
+                 AND content IS NOT NULL
+                 AND content != ''
+                 AND timestamp > ?
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (time.time() - 7 * 86400, limit)
+        ).fetchall()
+        return [
+            ((row['content'] or '')[:max_preview_length], row['category'])
+            for row in rows
+        ]
+
     def update_message_mapping_fields(self, entry_id, **kwargs):
         """
         Update specific fields on a message mapping
