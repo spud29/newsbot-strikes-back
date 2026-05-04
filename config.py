@@ -112,8 +112,8 @@ TELEGRAM_CHANNELS = [
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_CATEGORIZATION_MODEL = "qwen2.5:7b"
-OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+OLLAMA_CATEGORIZATION_MODEL = "qwen3:8b"
+OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
@@ -360,6 +360,8 @@ IGNORE_EXAMPLES_COUNT = 15  # Number of recent ignore entries to include in syst
 CORRECTION_EXAMPLES_ENABLED = True  # Enable learning from user re-categorizations
 CORRECTION_EXAMPLES_COUNT = 15      # Category-to-category corrections (AI said X, user changed to Y)
 IGNORE_PROMOTION_EXAMPLES_COUNT = 10  # Entries the user moved TO ignore (AI said X, should be ignore)
+IGNORE_RESCUE_ENABLED = True        # Learn from AI-assigned ignores that users promoted to real categories
+IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in system prompt
 
 
 # Re-categorize Context Menu Command (Right-click on bot messages → Apps → "Re-categorize")
