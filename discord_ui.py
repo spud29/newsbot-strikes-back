@@ -7,6 +7,82 @@ import config
 from utils import logger, ensure_url_on_own_line
 
 
+class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
+    """Modal that captures an optional user reason before executing a re-categorization."""
+
+    reason = discord.ui.TextInput(
+        label="Reason (helps AI learn your preferences)",
+        placeholder="e.g. 'SEC enforcement is politics, not a crypto market event'",
+        required=False,
+        max_length=300,
+        style=discord.TextStyle.paragraph,
+    )
+
+    def __init__(self, new_category, current_category, entry_id, entry_data, message, poster, source_type, is_move):
+        super().__init__()
+        self.new_category = new_category
+        self.current_category = current_category
+        self.entry_id = entry_id
+        self.entry_data = entry_data
+        self.message = message
+        self.poster = poster
+        self.source_type = source_type
+        self.is_move = is_move
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_reason = self.reason.value.strip() or None
+        await interaction.response.defer(ephemeral=True)
+
+        if self.is_move:
+            has_thread = self.message.thread is not None
+            success, new_message_id, new_channel_id, error_msg = await self.poster.recategorize_entry(
+                message_id=self.message.id,
+                channel_id=self.message.channel.id,
+                new_category=self.new_category,
+                entry_id=self.entry_id,
+                content=self.entry_data.get('content', self.message.content),
+                media_files=None,
+                video_urls=self.entry_data.get('video_urls', []),
+                source_type=self.source_type,
+                user=interaction.user,
+                user_reason=user_reason,
+            )
+            if success:
+                msg = f"✅ Re-categorized from **{self.current_category}** to **{self.new_category}**!\nNew message ID: {new_message_id}"
+                if has_thread:
+                    msg += "\n🧵 Thread with Perplexity content preserved!"
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Failed to re-categorize: {error_msg}", ephemeral=True)
+        else:
+            success, error_msg = await self.poster.update_category_tag(
+                message_id=self.message.id,
+                channel_id=self.message.channel.id,
+                new_category=self.new_category,
+                entry_id=self.entry_id,
+                content=self.entry_data.get('content', self.message.content),
+                user=interaction.user,
+                user_reason=user_reason,
+            )
+            if success:
+                await interaction.followup.send(
+                    f"✅ Updated category from **{self.current_category}** to **{self.new_category}**!",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(f"❌ Failed to update category: {error_msg}", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"ReasonModal error: {error}", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ An error occurred: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ An error occurred: {error}", ephemeral=True)
+        except Exception:
+            pass
+
+
 class RecategorizeView(discord.ui.View):
     """Ephemeral view with a Select dropdown for re-categorizing an entry"""
 
@@ -40,7 +116,12 @@ class RecategorizeView(discord.ui.View):
         self.add_item(select)
 
     async def _on_select(self, select_interaction: discord.Interaction):
-        """Handle category selection"""
+        """Handle category selection — show reason modal before acting."""
+        if getattr(self, '_submitted', False):
+            await select_interaction.response.send_message("Already submitted.", ephemeral=True)
+            return
+        self._submitted = True
+
         try:
             new_category = select_interaction.data["values"][0]
             logger.debug(f"RecategorizeView selection: '{new_category}' for entry {self.entry_id}")
@@ -49,52 +130,30 @@ class RecategorizeView(discord.ui.View):
             if new_category == "__unified__":
                 new_category = self.entry_data.get('original_category')
                 if not new_category or new_category == config.DEFAULT_CATEGORY:
-                    # Fallback: use the first non-ignore category
                     new_category = next((cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY), 'politics')
                 logger.debug(f"Resolved '__unified__' token to category: {new_category}")
 
-            # Defer immediately — recategorization can take a moment
-            await select_interaction.response.defer(ephemeral=True)
-
-            has_thread = self.message.thread is not None
             source_type = self.entry_id.split('_')[0] if self.entry_id else None
-
             logger.info(
                 f"Re-categorizing entry {self.entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
             )
 
-            success, new_message_id, new_channel_id, error_msg = await self.poster.recategorize_entry(
-                message_id=self.message.id,
-                channel_id=self.message.channel.id,
-                new_category=new_category,
-                entry_id=self.entry_id,
-                content=self.entry_data.get('content', self.message.content),
-                media_files=None,
-                video_urls=self.entry_data.get('video_urls', []),
-                source_type=source_type,
-                user=select_interaction.user
-            )
-
-            if success:
-                success_msg = f"✅ Successfully re-categorized from **{self.current_category}** to **{new_category}**!\n"
-                success_msg += f"New message ID: {new_message_id}"
-                if has_thread:
-                    success_msg += "\n🧵 Thread with Perplexity content preserved!"
-                await select_interaction.followup.send(success_msg, ephemeral=True)
-                logger.info(f"Successfully re-categorized entry {self.entry_id} to {new_category}")
-            else:
-                await select_interaction.followup.send(
-                    f"❌ Failed to re-categorize: {error_msg}",
-                    ephemeral=True
+            await select_interaction.response.send_modal(
+                ReasonModal(
+                    new_category=new_category,
+                    current_category=self.current_category,
+                    entry_id=self.entry_id,
+                    entry_data=self.entry_data,
+                    message=self.message,
+                    poster=self.poster,
+                    source_type=source_type,
+                    is_move=True,
                 )
-                logger.error(f"Failed to re-categorize entry {self.entry_id}: {error_msg}")
-
-            # Disable the select after use so it can't be clicked again
-            self.children[0].disabled = True
-            await select_interaction.edit_original_response(view=self)
+            )
 
         except Exception as e:
             logger.error(f"Error in RecategorizeView _on_select: {e}", exc_info=True)
+            self._submitted = False
             try:
                 if select_interaction.response.is_done():
                     await select_interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
@@ -273,44 +332,35 @@ class SetCategoryView(discord.ui.View):
         self.add_item(select)
 
     async def _on_select(self, select_interaction: discord.Interaction):
-        """Handle category selection for label-only update"""
+        """Handle category selection — show reason modal before acting."""
+        if getattr(self, '_submitted', False):
+            await select_interaction.response.send_message("Already submitted.", ephemeral=True)
+            return
+        self._submitted = True
+
         try:
             new_category = select_interaction.data["values"][0]
             logger.debug(f"SetCategoryView selection: '{new_category}' for entry {self.entry_id}")
-
-            # Defer immediately — update can take a moment
-            await select_interaction.response.defer(ephemeral=True)
-
             logger.info(
                 f"Updating category tag for entry {self.entry_id} from {self.current_category} to {new_category}"
             )
 
-            success, error_msg = await self.poster.update_category_tag(
-                message_id=self.message.id,
-                channel_id=self.message.channel.id,
-                new_category=new_category,
-                entry_id=self.entry_id,
-                content=self.entry_data.get('content', self.message.content),
-                user=select_interaction.user
-            )
-
-            if success:
-                success_msg = f"✅ Successfully updated category from **{self.current_category}** to **{new_category}**!"
-                await select_interaction.followup.send(success_msg, ephemeral=True)
-                logger.info(f"Successfully updated category tag for entry {self.entry_id} to {new_category}")
-            else:
-                await select_interaction.followup.send(
-                    f"❌ Failed to update category: {error_msg}",
-                    ephemeral=True
+            await select_interaction.response.send_modal(
+                ReasonModal(
+                    new_category=new_category,
+                    current_category=self.current_category,
+                    entry_id=self.entry_id,
+                    entry_data=self.entry_data,
+                    message=self.message,
+                    poster=self.poster,
+                    source_type=None,
+                    is_move=False,
                 )
-                logger.error(f"Failed to update category for entry {self.entry_id}: {error_msg}")
-
-            # Disable the select after use so it can't be clicked again
-            self.children[0].disabled = True
-            await select_interaction.edit_original_response(view=self)
+            )
 
         except Exception as e:
             logger.error(f"Error in SetCategoryView _on_select: {e}", exc_info=True)
+            self._submitted = False
             try:
                 if select_interaction.response.is_done():
                     await select_interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)

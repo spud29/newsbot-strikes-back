@@ -125,11 +125,11 @@ class OllamaClient:
                     enhanced_prompt += "\n\n" + "=" * 60
                     enhanced_prompt += "\nKNOWN CATEGORIZATION CORRECTIONS — the AI was wrong about these. Learn from them:\n\n"
 
-                    for i, (preview, orig_cat, corrected_cat) in enumerate(corrections, 1):
+                    for i, (preview, orig_cat, corrected_cat, user_reason) in enumerate(corrections, 1):
                         clean_preview = " ".join(preview.split())
-                        enhanced_prompt += (
-                            f"{i}. AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
-                        )
+                        enhanced_prompt += f"{i}. AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
+                        if user_reason:
+                            enhanced_prompt += f"   User's reason: \"{user_reason}\"\n"
 
                     enhanced_prompt += "\n" + "=" * 60
                     enhanced_prompt += "\nWhen content resembles the examples above, choose the corrected category shown, not the AI's original guess."
@@ -156,9 +156,11 @@ class OllamaClient:
                     enhanced_prompt += "\n\n" + "=" * 60
                     enhanced_prompt += "\nENTRIES MOVED TO IGNORE BY USER — the AI posted these but they should have been ignored:\n\n"
 
-                    for i, (preview, orig_cat) in enumerate(promotions, 1):
+                    for i, (preview, orig_cat, user_reason) in enumerate(promotions, 1):
                         clean_preview = " ".join(preview.split())
                         enhanced_prompt += f"{i}. (AI said '{orig_cat}'): {clean_preview}\n"
+                        if user_reason:
+                            enhanced_prompt += f"   User's reason: \"{user_reason}\"\n"
 
                     enhanced_prompt += "\n" + "=" * 60
                     enhanced_prompt += "\nSimilar content should be categorized as 'ignore'."

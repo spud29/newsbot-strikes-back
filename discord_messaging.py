@@ -373,7 +373,7 @@ class DiscordPoster:
             raise
 
     async def recategorize_entry(self, message_id, channel_id, new_category, entry_id, content,
-                                  media_files=None, video_urls=None, source_type=None, user=None):
+                                  media_files=None, video_urls=None, source_type=None, user=None, user_reason=None):
         """
         Move a Discord message to a different category channel
 
@@ -443,7 +443,8 @@ class DiscordPoster:
                         self.database.update_message_mapping_fields(
                             entry_id,
                             category=new_category,
-                            placement_reason=new_placement_reason
+                            placement_reason=new_placement_reason,
+                            user_reason=user_reason,
                         )
                         logger.info(f"Updated message mapping category for entry {entry_id}")
                         if self.ollama:
@@ -585,7 +586,8 @@ class DiscordPoster:
                         discord_message_id=new_message_id,
                         discord_channel_id=new_channel_id,
                         category=new_category,
-                        placement_reason=new_placement_reason
+                        placement_reason=new_placement_reason,
+                        user_reason=user_reason,
                     )
                     logger.info(f"Updated message mapping for entry {entry_id}")
                     if self.ollama:
@@ -601,7 +603,7 @@ class DiscordPoster:
             logger.error(f"Error in recategorize_entry: {e}", exc_info=True)
             return False, None, None, str(e)
 
-    async def update_category_tag(self, message_id, channel_id, new_category, entry_id, content, user=None):
+    async def update_category_tag(self, message_id, channel_id, new_category, entry_id, content, user=None, user_reason=None):
         """
         Update the category tag of a message in-place without moving it to a different channel.
         This only updates the **[Category]** prefix and the database category field.
@@ -676,7 +678,8 @@ class DiscordPoster:
                     self.database.update_message_mapping_fields(
                         entry_id,
                         category=new_category,
-                        placement_reason=new_placement_reason
+                        placement_reason=new_placement_reason,
+                        user_reason=user_reason,
                     )
                     logger.info(f"Updated category tag for entry {entry_id} to {new_category}")
                 except Exception as e:

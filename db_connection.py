@@ -137,6 +137,10 @@ def _run_migrations(conn):
         conn.execute("ALTER TABLE message_mapping ADD COLUMN superseded_channel_discord_message_id INTEGER DEFAULT NULL")
         conn.commit()
 
+    if 'user_reason' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN user_reason TEXT DEFAULT NULL")
+        conn.commit()
+
 
 def close_db_connection():
     """Close the shared connection (call on shutdown)."""

@@ -553,7 +553,7 @@ class Database:
             list of (content_preview, original_category, corrected_category) tuples
         """
         rows = self.conn.execute(
-            """SELECT content, original_category, category
+            """SELECT content, original_category, category, user_reason
                FROM message_mapping
                WHERE original_category IS NOT NULL
                  AND original_category != category
@@ -567,7 +567,7 @@ class Database:
             (time.time() - 7 * 86400, limit)
         ).fetchall()
         return [
-            ((row['content'] or '')[:max_preview_length], row['original_category'], row['category'])
+            ((row['content'] or '')[:max_preview_length], row['original_category'], row['category'], row['user_reason'])
             for row in rows
         ]
 
@@ -580,7 +580,7 @@ class Database:
             list of (content_preview, original_category) tuples
         """
         rows = self.conn.execute(
-            """SELECT content, original_category
+            """SELECT content, original_category, user_reason
                FROM message_mapping
                WHERE original_category IS NOT NULL
                  AND original_category != 'ignore'
@@ -593,7 +593,7 @@ class Database:
             (time.time() - 7 * 86400, limit)
         ).fetchall()
         return [
-            ((row['content'] or '')[:max_preview_length], row['original_category'])
+            ((row['content'] or '')[:max_preview_length], row['original_category'], row['user_reason'])
             for row in rows
         ]
 
