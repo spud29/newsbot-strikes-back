@@ -235,15 +235,11 @@ class OllamaClient:
             category_raw = ''
             reasoning = None
             
-            # Strategy 1: Try full JSON parse
-            try:
-                json_match = re.search(r'\{[^}]+\}', response_text)
-                if json_match:
-                    parsed = json.loads(json_match.group())
-                    category_raw = parsed.get('category', '').lower().strip()
-                    reasoning = parsed.get('reasoning', None)
-            except (json.JSONDecodeError, AttributeError):
-                pass
+            # Strategy 1: Try full JSON parse (balanced-brace extraction handles '}' inside strings)
+            parsed = self._extract_json(response_text)
+            if parsed is not None:
+                category_raw = parsed.get('category', '').lower().strip()
+                reasoning = parsed.get('reasoning', None)
             
             # Strategy 2: Extract category from truncated JSON (e.g. {"category":"politics","reasoning":"the...
             if not category_raw:
@@ -299,6 +295,64 @@ class OllamaClient:
                 return fallback, f"Error during categorization: {str(e)[:50]}"
             return config.DEFAULT_CATEGORY, f"Error during categorization: {str(e)[:50]}"
     
+    def _extract_json(self, text: str) -> "dict | None":
+        """
+        Robustly extract the first complete JSON object from a string.
+
+        Uses a two-pass approach:
+          1. Try parsing the whole stripped text as JSON directly.
+          2. Walk character-by-character with a brace counter, tracking string
+             context so that '}' inside quoted values is NOT counted as a
+             closing brace.
+
+        The old re.search(r'\\{[^}]+\\}') regex stops at the first '}' it sees,
+        which breaks when the LLM writes '}' inside a reasoning string. This
+        helper handles that case correctly.
+        """
+        text = text.strip()
+
+        # Pass 1: the entire response may already be valid JSON.
+        try:
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Pass 2: balanced-brace walk with string-context tracking.
+        start = None
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i, ch in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        # Balanced span wasn't valid JSON; reset and keep searching.
+                        start = None
+
+        return None
+
     def _parse_category(self, category_raw):
         """
         Parse and validate category from model response
@@ -562,18 +616,14 @@ class OllamaClient:
             response.raise_for_status()
             response_text = response.json().get('response', '').strip()
 
-            # Try JSON parse
-            try:
-                json_match = re.search(r'\{[^}]+\}', response_text)
-                if json_match:
-                    parsed = json.loads(json_match.group())
-                    verdict = parsed.get('verdict', '').lower().strip()
-                    reasoning = parsed.get('reasoning', '')
-                    if verdict in ('supersede', 'keep_both', 'ignore'):
-                        logger.info(f"Compare verdict: {verdict} — {reasoning}")
-                        return {'verdict': verdict, 'reasoning': reasoning}
-            except (json.JSONDecodeError, AttributeError):
-                pass
+            # Try JSON parse (balanced-brace extraction handles '}' inside strings)
+            parsed = self._extract_json(response_text)
+            if parsed is not None:
+                verdict = parsed.get('verdict', '').lower().strip()
+                reasoning = parsed.get('reasoning', '')
+                if verdict in ('supersede', 'keep_both', 'ignore'):
+                    logger.info(f"Compare verdict: {verdict} — {reasoning}")
+                    return {'verdict': verdict, 'reasoning': reasoning}
 
             # Fallback: could not parse clean JSON — default to keep_both (safe)
             logger.info("Compare verdict (fallback): keep_both — could not parse clean JSON")
@@ -695,12 +745,9 @@ Respond with ONLY this JSON, no other text:
             # Parse the JSON response
             response_text = result.get('response', '').strip()
             
-            # Try to extract JSON from response (handle potential extra text)
-            # Find JSON object in response
-            json_match = re.search(r'\{[^}]+\}', response_text)
-            if json_match:
-                rating_data = json.loads(json_match.group())
-            else:
+            # Extract JSON from response — balanced-brace walk handles '}' inside strings
+            rating_data = self._extract_json(response_text)
+            if rating_data is None:
                 raise ValueError(f"No JSON found in response: {response_text}")
             
             # Extract and validate scores
