@@ -112,8 +112,8 @@ TELEGRAM_CHANNELS = [
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_CATEGORIZATION_MODEL = "qwen2.5:7b"
-OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+OLLAMA_CATEGORIZATION_MODEL = "qwen3:8b"
+OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
@@ -352,14 +352,16 @@ FEEDBACK_EXAMPLES_COUNT = 10  # Number of removed entries to include in system p
 # Feeds entries categorized as 'ignore' (including user-recategorized ones) into the AI
 # system prompt as additional negative examples. User-flagged ignores are prioritized.
 IGNORE_EXAMPLES_ENABLED = True  # Enable learning from ignore-channel entries
-IGNORE_EXAMPLES_COUNT = 15  # Number of recent ignore entries to include in system prompt
+IGNORE_EXAMPLES_COUNT = 5  # Number of recent ignore entries to include in system prompt
 
 # Correction Learning Configuration
 # Feeds user re-categorization corrections into the AI system prompt so it learns from
 # mistakes. Covers both category-to-category corrections and entries moved TO ignore.
 CORRECTION_EXAMPLES_ENABLED = True  # Enable learning from user re-categorizations
 CORRECTION_EXAMPLES_COUNT = 15      # Category-to-category corrections (AI said X, user changed to Y)
-IGNORE_PROMOTION_EXAMPLES_COUNT = 10  # Entries the user moved TO ignore (AI said X, should be ignore)
+IGNORE_PROMOTION_EXAMPLES_COUNT = 3  # Entries the user moved TO ignore (AI said X, should be ignore)
+IGNORE_RESCUE_ENABLED = True        # Learn from AI-assigned ignores that users promoted to real categories
+IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in system prompt
 
 
 # Re-categorize Context Menu Command (Right-click on bot messages → Apps → "Re-categorize")
@@ -400,7 +402,7 @@ CAPS_FIX_ENABLED = True
 CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
 
 NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the newsworthiness filter
-NEWSWORTHINESS_THRESHOLD = 7.0  # Only post genuinely surprising or high-impact news (7+/10 "wow" tier)
+NEWSWORTHINESS_THRESHOLD = 6.0  # Post solid news; "wow tier" was too aggressive at 7.0
 NEWSWORTHINESS_WEIGHTS = {
     'surprising': 0.45,   # 45% weight - must be genuinely unexpected, not routine
     'impact': 0.35,       # 35% weight - must affect many people significantly

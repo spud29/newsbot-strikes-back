@@ -8,6 +8,32 @@ import re
 from utils import logger, retry_with_backoff
 import config
 
+# Known LLM abbreviations and alternate forms mapped to canonical category names.
+# Keys are lowercased; values are entries in VALID_CATEGORIES.
+# Runs AFTER exact match and BEFORE partial match inside _parse_category.
+_CATEGORY_ALIASES = {
+    "ai":                "artificial intelligence",
+    "ml":                "artificial intelligence",
+    "machine learning":  "artificial intelligence",
+    "gaming":            "video games",
+    "games":             "video games",
+    "tech":              "technology",
+    "software":          "software development",
+    "dev":               "software development",
+    "development":       "software development",
+    "news":              "general news",
+    "general":           "general news",
+    "culture":           "pop culture",
+    "entertainment":     "pop culture",
+    "celebrity":         "pop culture",
+    "finance":           "stocks",
+    "stock":             "stocks",
+    "blockchain":        "crypto",
+    "web3":              "crypto",
+    "cryptocurrency":    "crypto",
+    "cryptocurrencies":  "crypto",
+}
+
 class OllamaClient:
     """Client for interacting with local Ollama API"""
     
@@ -71,7 +97,7 @@ class OllamaClient:
                         enhanced_prompt += f"{i}. {clean_preview}\n"
                     
                     enhanced_prompt += "\n" + "=" * 60
-                    enhanced_prompt += "\nAvoid posting content similar to the examples above. When in doubt, use 'ignore'."
+                    enhanced_prompt += "\nNote that this list represents what was filtered — do not over-apply. Content with a clear category should still be categorized, even if modest in impact."
                     
                     logger.debug(f"Enhanced system prompt with {len(previews)} negative examples")
                 else:
@@ -125,16 +151,36 @@ class OllamaClient:
                     enhanced_prompt += "\n\n" + "=" * 60
                     enhanced_prompt += "\nKNOWN CATEGORIZATION CORRECTIONS — the AI was wrong about these. Learn from them:\n\n"
 
-                    for i, (preview, orig_cat, corrected_cat, user_reason) in enumerate(corrections, 1):
-                        clean_preview = " ".join(preview.split())
-                        enhanced_prompt += f"{i}. AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
-                        if user_reason:
-                            enhanced_prompt += f"   User's reason: \"{user_reason}\"\n"
+                    # Group by (original, corrected) pair so repeated patterns surface as
+                    # frequency-weighted signals rather than redundant identical lines.
+                    correction_groups = {}
+                    for preview, orig_cat, corrected_cat, user_reason in corrections:
+                        key = (orig_cat, corrected_cat)
+                        if key not in correction_groups:
+                            correction_groups[key] = {'count': 0, 'example': preview, 'reason': None}
+                        correction_groups[key]['count'] += 1
+                        if user_reason and not correction_groups[key]['reason']:
+                            correction_groups[key]['reason'] = user_reason
+
+                    sorted_corrections = sorted(
+                        correction_groups.items(),
+                        key=lambda x: -x[1]['count']
+                    )
+
+                    for i, ((orig_cat, corrected_cat), info) in enumerate(sorted_corrections, 1):
+                        count = info['count']
+                        count_str = f"({count}×) " if count > 1 else ""
+                        clean_preview = " ".join(info['example'].split())
+                        enhanced_prompt += (
+                            f"{i}. {count_str}AI said '{orig_cat}' → correct category is '{corrected_cat}': {clean_preview}\n"
+                        )
+                        if info['reason']:
+                            enhanced_prompt += f"   User's reason: \"{info['reason']}\"\n"
 
                     enhanced_prompt += "\n" + "=" * 60
                     enhanced_prompt += "\nWhen content resembles the examples above, choose the corrected category shown, not the AI's original guess."
 
-                    logger.debug(f"Enhanced system prompt with {len(corrections)} category-correction examples")
+                    logger.debug(f"Enhanced system prompt with {len(sorted_corrections)} correction patterns ({len(corrections)} examples)")
                 else:
                     logger.debug("No category-correction examples available")
 
@@ -163,7 +209,7 @@ class OllamaClient:
                             enhanced_prompt += f"   User's reason: \"{user_reason}\"\n"
 
                     enhanced_prompt += "\n" + "=" * 60
-                    enhanced_prompt += "\nSimilar content should be categorized as 'ignore'."
+                    enhanced_prompt += "\nThese were edge cases the user felt crossed a quality line. If content has a clear category and a real news hook, categorize it; reserve 'ignore' for structural junk."
 
                     logger.debug(f"Enhanced system prompt with {len(promotions)} ignore-promotion examples")
                 else:
@@ -171,6 +217,35 @@ class OllamaClient:
 
             except Exception as e:
                 logger.error(f"Error adding ignore-promotion examples to system prompt: {e}", exc_info=True)
+
+        # Add ignore-rescue examples (AI said ignore, user promoted to real category)
+        if (getattr(config, 'IGNORE_RESCUE_ENABLED', True) and
+                self.database and
+                hasattr(self.database, 'get_ignore_rescue_examples')):
+
+            try:
+                rescues = self.database.get_ignore_rescue_examples(
+                    limit=getattr(config, 'IGNORE_RESCUE_EXAMPLES_COUNT', 10),
+                    max_preview_length=150
+                )
+
+                if rescues:
+                    enhanced_prompt += "\n\n" + "=" * 60
+                    enhanced_prompt += "\nCONTENT INCORRECTLY IGNORED — AI said 'ignore' but users promoted these to real categories. Don't miss similar content:\n\n"
+
+                    for i, (preview, correct_cat) in enumerate(rescues, 1):
+                        clean_preview = " ".join(preview.split())
+                        enhanced_prompt += f"{i}. (should be '{correct_cat}'): {clean_preview}\n"
+
+                    enhanced_prompt += "\n" + "=" * 60
+                    enhanced_prompt += "\nWhen content resembles the examples above, assign the correct category instead of 'ignore'."
+
+                    logger.debug(f"Enhanced system prompt with {len(rescues)} ignore-rescue examples")
+                else:
+                    logger.debug("No ignore-rescue examples available")
+
+            except Exception as e:
+                logger.error(f"Error adding ignore-rescue examples to system prompt: {e}", exc_info=True)
 
         # Cache the enhanced prompt
         self._enhanced_prompt_cache = enhanced_prompt
@@ -202,11 +277,20 @@ class OllamaClient:
             if exclude_categories:
                 exclusion_note = f"\n\nIMPORTANT: Do NOT categorize this content as any of the following: {', '.join(exclude_categories)}. Choose the next most appropriate category."
                 system_prompt += exclusion_note
-            
+
+            # Build list of valid category names to embed in the user prompt.
+            # Showing the exact names at inference time reduces abbreviation errors
+            # (the model has to recall them from the long system prompt otherwise).
+            valid_cats = getattr(config, 'VALID_CATEGORIES', list(config.DISCORD_CHANNELS.keys()))
+            if exclude_categories:
+                valid_cats = [c for c in valid_cats if c not in exclude_categories]
+            valid_names = ", ".join(sorted(valid_cats))
+
             # Prepare the user prompt (content + response format instruction)
             prompt = (
                 f"Content to categorize:\n{content}\n\n"
-                f"Respond with ONLY valid JSON: {{\"category\": \"<name>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
+                f"Valid categories (use the exact name): {valid_names}\n\n"
+                f"Respond with ONLY valid JSON: {{\"category\": \"<exact name from above>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
             )
 
             # Call Ollama API — use separate 'system' field so Ollama can reuse
@@ -221,7 +305,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -377,7 +462,21 @@ class OllamaClient:
             else:
                 logger.info(f"Category '{category}' is valid but has no Discord channel, routing to '{config.DEFAULT_CATEGORY}'")
                 return config.DEFAULT_CATEGORY
-        
+
+        # Alias lookup — maps known LLM abbreviations/alternate forms to canonical names.
+        # More precise than substring partial matching below.
+        canonical = _CATEGORY_ALIASES.get(category)
+        if canonical is not None:
+            logger.info(f"Alias match: '{category}' -> '{canonical}'")
+            if canonical in config.DISCORD_CHANNELS:
+                return canonical
+            else:
+                logger.info(
+                    f"Alias '{category}' -> '{canonical}' valid but has no Discord channel, "
+                    f"routing to '{config.DEFAULT_CATEGORY}'"
+                )
+                return config.DEFAULT_CATEGORY
+
         # Only do partial matching if the string is short and non-empty
         # (avoids matching reasoning text, and prevents "" from matching everything)
         if category and len(category) < 50:
@@ -448,7 +547,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -538,7 +638,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 100
+                        "num_predict": 100,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -608,7 +709,8 @@ class OllamaClient:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.2,
-                        "num_predict": 200
+                        "num_predict": 200,
+                        "think": False
                     }
                 },
                 timeout=300
@@ -733,7 +835,8 @@ Respond with ONLY this JSON, no other text:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.3,  # Lower temperature for more consistent ratings
-                        "num_predict": 200   # Give model enough room for JSON response
+                        "num_predict": 200,  # Give model enough room for JSON response
+                        "think": False
                     }
                 },
                 timeout=300
