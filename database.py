@@ -163,6 +163,8 @@ class Database:
             stored_norm = data['norm']
             if stored_norm == 0:
                 continue
+            if len(data['embedding_np']) != len(query):
+                continue
             similarity = np.dot(query, data['embedding_np']) / (query_norm * stored_norm)
             if similarity > best_sim:
                 best_sim = similarity
@@ -194,6 +196,8 @@ class Database:
         for data in self._embeddings_cache.values():
             stored_norm = data['norm']
             if stored_norm == 0:
+                continue
+            if len(data['embedding_np']) != len(query):
                 continue
             similarity = np.dot(query, data['embedding_np']) / (query_norm * stored_norm)
             if similarity >= threshold:

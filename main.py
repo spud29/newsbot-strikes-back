@@ -7,7 +7,7 @@ import signal
 import sys
 import subprocess
 import os
-from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, cleanup_bot_log
+from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, cleanup_bot_log, shorten_dexerto_url_in_text
 import config
 from db_connection import close_db_connection
 from database import Database
@@ -296,7 +296,10 @@ class NewsAggregatorBot:
                         content = entry.get('full_text') or content
                         # Dexerto merger: append tweet 2 follow-up text (blurb + article URL)
                         if entry.get('dexerto_follow_up'):
-                            content = f"{content.rstrip()}\n{entry['dexerto_follow_up']}"
+                            follow_up = await asyncio.to_thread(
+                                shorten_dexerto_url_in_text, entry['dexerto_follow_up']
+                            )
+                            content = f"{content.rstrip()}\n{follow_up}"
                             logger.debug(f"DexertoMerger: appended follow-up text to content for {entry_id}")
                     elif source_type == 'telegram':
                         entry = await self.media_handler.download_telegram_media(entry)

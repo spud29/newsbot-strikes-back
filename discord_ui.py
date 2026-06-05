@@ -4,7 +4,8 @@ Discord UI components (modals, views) for the news aggregator bot
 import discord
 import asyncio
 import config
-from utils import logger, ensure_url_on_own_line
+import re
+from utils import logger, ensure_url_on_own_line, shorten_urls_in_text
 
 
 class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
@@ -211,6 +212,12 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
             source_type = self.entry_data.get('source_type') or (self.entry_id.split('_')[0] if self.entry_id else None)
 
             message_text = ensure_url_on_own_line(new_text)
+
+            # Shorten URLs to TinyURLs (same guard as post_message)
+            _url_count = len(re.findall(r'https?://\S+', message_text))
+            _is_dexerto = 'dexerto.com' in message_text
+            if _url_count <= 1 or _is_dexerto:
+                message_text = await asyncio.to_thread(shorten_urls_in_text, message_text)
 
             # Re-prepend category tag in unified channel mode
             category = self.entry_data.get('category')

@@ -54,7 +54,8 @@ RSS_FEEDS = {
     "quiver_quant": "https://rss.app/feeds/yiVD4vcQbQ8i2HDs.xml",
     "degenerate_news": "https://rss.app/feeds/lJkV7xfSTsJOoYoD.xml",
     "watcher_guru": "https://rss.app/feeds/jQfpcfiYsZL0NwkI.xml",
-    "newswire": "https://rss.app/feeds/DVrZpUnw9TZqLVNg.xml"
+    "newswire": "https://rss.app/feeds/DVrZpUnw9TZqLVNg.xml",
+    "polymarket": "https://rss.app/feeds/iyFNm1K9DmiIS07m.xml"
 }
 
 # Discord Channel IDs for each category
@@ -91,7 +92,7 @@ DEFAULT_CATEGORY = "ignore"
 # Pause Mode - When enabled, ALL entries are routed to the 'ignore' channel
 # regardless of their AI categorization. The original category is preserved in reasoning.
 # Useful for temporarily silencing all channels without changing any other config.
-PAUSE_MODE = False
+PAUSE_MODE = True
 
 # Unified Channel Mode - route ALL non-ignore categories to a single Discord channel.
 # Each message is prefixed with a bold [Category] tag so readers can filter by topic.
@@ -104,7 +105,6 @@ TELEGRAM_CHANNELS = [
     "Fin_Watch",
     "news_crypto",
     "drops_analytics",
-    "joescrypt",
     "unfolded",
     "unfolded_defi",
     "infinityhedge"
@@ -247,17 +247,20 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Whale wallet tracking: large buy/sell/transfer notifications without broader market context or explanation
 - Reposted old stories being recirculated without new developments
 - Audience engagement bait that ends with reader questions: "Do you agree?", "What do you think?", "Thoughts?"
+- Quality/completeness failures: bare headlines with no additional context beyond the headline text, first-report fragments that a more complete entry will supersede, entries that state a single fact with no elaboration or significance explained
+- Lesser duplicates: when a story is covered by a brief entry and a more detailed entry, the brief one should be ignored even if the topic is legitimately newsworthy — the topic matters, but this specific entry doesn't add enough
+- Minor routine announcements: small protocol updates, routine exchange token additions, minor product features from well-known companies with no broader significance (e.g. "Coinbase adds [token] to [platform]" with nothing else)
 
 ## CATEGORIZATION GUIDELINES
 
 1. **Read Carefully**: Analyze the entire content, not just keywords
 2. **Primary Topic**: Choose the category that represents the PRIMARY focus
 3. **Be Specific**: If content spans multiple categories, pick the most dominant one
-4. **Quality is Downstream**: If content is categorizable (matches a real topic), assign the correct category even if it seems routine or modest in impact. The newsworthiness filter evaluates quality AFTER categorization.
+4. **Newsworthiness is Downstream**: Once an entry has enough substance to stand alone (passes the quality check), assign the correct category even if the event seems modest. The newsworthiness filter evaluates impact AFTER categorization — don't pre-filter modest-but-real events at this stage.
 5. **Context Clues**: Consider source, tone, and depth of information
-6. **When Unclear**: Assign the closest real category. Use 'ignore' only when content matches a structural ignore reason (spam, @BTC_Tick, routine scheduled data, opinion without an event, etc.), not because it feels borderline newsworthy.
+6. **When Unclear**: If the content discusses a real topic but lacks sufficient context or detail to stand alone as a worthwhile post, 'ignore' is appropriate — it's a quality filter, not just a spam filter. Assign a real category when the entry has enough substance to stand alone.
 7. **Entertainment Context**: Theme parks, entertainment venues, and entertainment-focused technology (Disney animatronics, movie theater tech, concert staging) should be categorized as **pop culture**, NOT technology. Consider the PRIMARY CONTEXT: Is this entertainment news or tech industry news?
-8. **Structural vs. Quality**: Routine market data and scheduled metrics are 'ignore' because they're structural junk (no news event triggered them), not because of quality. A modest but real news event (e.g. "Bitcoin up 2% after Fed comment") is categorizable as 'crypto' and will go through the quality filter downstream.
+8. **Structural vs. Thin vs. Modest**: Three distinct cases — (a) structural junk (routine scheduled data, no triggering event) → always ignore; (b) thin/bare entry about a real event (single headline with no context, no elaboration) → ignore, a better entry will follow; (c) modest but real event WITH some context ("Bitcoin up 2% after Fed rate hold") → categorize as 'crypto', the newsworthiness filter handles impact downstream.
 
 ## DECISION TREE
 
@@ -265,11 +268,15 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
    → YES: Choose 'ignore'
    → NO: Continue
 
-2. Does it primarily discuss a specific topic area?
+2. Does this entry have enough substance to stand alone as a post?
+   → Too brief / bare headline with no context or elaboration: Choose 'ignore'
+   → Has meaningful detail, context, or impact beyond just the headline: Continue
+
+3. Does it primarily discuss a specific topic area?
    → YES: Match to the most relevant category
    → NO: Choose the closest category based on dominant subject matter
 
-3. If multiple categories could apply:
+4. If multiple categories could apply:
    → Choose the one that represents 60%+ of the content
    → If truly equal split, choose based on what a reader would search for
 
@@ -314,6 +321,19 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Thread: 5 reasons why [coin] is undervalued right now 🚀" → ignore (opinion thread, no news event)
 "📢 AIRDROP LIVE: Connect wallet to claim your [Project] tokens" → ignore (promotion)
 "SEC charges crypto exchange with securities fraud" → crypto (concrete news event, not a price move or opinion)
+
+Quality vs. thin coverage — same story, different substance:
+"US Treasury Secretary Bessent says the US has seized $450 million in Iranian cryptocurrency." → ignore (bare headline, no context about the operation, motive, or broader significance)
+"U.S. Treasury seizes nearly $500M in Iranian crypto as part of Operation Economic Fury, targeting sanctions evasion networks across Asia." → politics (named operation, context, significance explained)
+
+"The Fed Leaves Rates Unchanged." → ignore (single bare fact with no context, analysis, or market reaction — not enough to post)
+"Fed holds rates steady as Powell signals caution on inflation outlook despite White House pressure for cuts." → politics (substantive framing that gives the post meaning)
+
+"7.4 MAGNITUDE EARTHQUAKE HITS NORTHERN JAPAN" → ignore (bare headline with no casualties, damage, or significance — a more complete entry will likely follow)
+"7.4 earthquake strikes northern Japan; tsunami warning issued for coastal areas, 12 confirmed dead, rescue operations underway." → general news (has the context and impact needed to stand alone)
+
+"Charles Schwab begins rollout of spot Bitcoin, Ethereum trading platform" → ignore (thin single-line announcement with no details about the platform, timeline, or user impact)
+"Coinbase adds tGBP stablecoin to expand UK crypto payments" → crypto (specific product with a specific market, clear significance)
 
 ## OUTPUT FORMAT
 

@@ -69,6 +69,17 @@ def _build_entry_info_embed(entry_id, entry_data):
     return embed
 
 
+def _parse_message_id(link_or_id: str):
+    """Extract message ID from a Discord message link or bare integer string."""
+    link_or_id = link_or_id.strip()
+    if link_or_id.isdigit():
+        return int(link_or_id)
+    parts = link_or_id.rstrip('/').split('/')
+    if parts and parts[-1].isdigit():
+        return int(parts[-1])
+    return None
+
+
 def register_commands(poster):
     """
     Register all context menu commands on the poster's command tree.
@@ -675,3 +686,99 @@ def register_commands(poster):
                 pass
 
     logger.debug("Registered '/news' slash command")
+
+    # --- /move slash command ---
+    @poster.tree.command(name="move", description="Move a bot message to the unified channel by pasting its message link")
+    @app_commands.describe(
+        message_link="Discord message link or bare message ID",
+        reason="Optional reason (helps AI learn your preferences)",
+    )
+    async def move_slash(interaction: discord.Interaction, message_link: str, reason: str = None):
+        """Slash command to move a bot entry to the unified channel via message link"""
+        logger.debug(f"'/move' command triggered by user {interaction.user.id} with link: {message_link!r}")
+        try:
+            allowed_user_ids = getattr(config, 'RECATEGORIZE_ALLOWED_USER_IDS', [])
+            if interaction.user.id not in allowed_user_ids:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this command.",
+                    ephemeral=True
+                )
+                logger.warning(f"Unauthorized /move attempt by user {interaction.user.id}")
+                return
+
+            message_id = _parse_message_id(message_link)
+            if message_id is None:
+                await interaction.response.send_message(
+                    "❌ Could not parse a message ID from that input. Paste a Discord message link or a bare message ID.",
+                    ephemeral=True
+                )
+                return
+
+            if not poster.database:
+                await interaction.response.send_message("❌ Database unavailable.", ephemeral=True)
+                return
+
+            entry_id = poster.database.get_entry_id_by_discord_message(message_id)
+            if not entry_id:
+                await interaction.response.send_message(
+                    "❌ Could not find that message in the database. Make sure it's a bot message.",
+                    ephemeral=True
+                )
+                return
+
+            entry_data = poster.database.get_discord_message_info(entry_id)
+            if not entry_data:
+                await interaction.response.send_message(
+                    "❌ Database record found but entry data is missing.",
+                    ephemeral=True
+                )
+                return
+
+            current_category = entry_data.get('category', 'unknown')
+
+            # Resolve target category — same logic as RecategorizeView for "__unified__"
+            new_category = entry_data.get('original_category')
+            if not new_category or new_category == config.DEFAULT_CATEGORY:
+                new_category = next(
+                    (cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY),
+                    'general'
+                )
+
+            source_type = entry_id.split('_')[0] if entry_id else None
+            channel_id = entry_data.get('discord_channel_id')
+
+            await interaction.response.defer(ephemeral=True)
+
+            success, new_message_id, new_channel_id, error_msg = await poster.recategorize_entry(
+                message_id=message_id,
+                channel_id=channel_id,
+                new_category=new_category,
+                entry_id=entry_id,
+                content=entry_data.get('content', ''),
+                media_files=None,
+                video_urls=entry_data.get('video_urls', []),
+                source_type=source_type,
+                user=interaction.user,
+                user_reason=reason.strip() if reason else None,
+            )
+
+            if success:
+                await interaction.followup.send(
+                    f"✅ Moved from **{current_category}** → **{new_category}**. New message ID: {new_message_id}",
+                    ephemeral=True
+                )
+                logger.info(f"User {interaction.user.id} /move: entry {entry_id} → {new_category}")
+            else:
+                await interaction.followup.send(f"❌ Move failed: {error_msg}", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Error in '/move' command: {e}", exc_info=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
+            except:
+                pass
+
+    logger.debug("Registered '/move' slash command")

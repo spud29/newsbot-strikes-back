@@ -30,8 +30,15 @@ _CATEGORY_ALIASES = {
     "stock":             "stocks",
     "blockchain":        "crypto",
     "web3":              "crypto",
+    "web 3":             "crypto",
     "cryptocurrency":    "crypto",
     "cryptocurrencies":  "crypto",
+    "nft":               "crypto",
+    "defi":              "crypto",
+    "sport":             "sports",
+    "film":              "pop culture",
+    "movies":            "pop culture",
+    "television":        "pop culture",
 }
 
 class OllamaClient:
@@ -450,42 +457,46 @@ class OllamaClient:
         """
         # Clean up the response
         category = category_raw.lower().strip()
-        
+        # Normalize separators: some models write "pop-culture", "video_games", or
+        # "general_news" instead of the canonical space-separated form. Doing this once
+        # here keeps all three matching stages (exact, alias, partial) consistent.
+        category_normalized = category.replace('-', ' ').replace('_', ' ').strip()
+
         # Validate against ALL known categories (not just active Discord channels)
         # This prevents correct AI answers from being rejected when a channel is disabled
         valid_categories = getattr(config, 'VALID_CATEGORIES', list(config.DISCORD_CHANNELS.keys()))
-        
-        if category in valid_categories:
+
+        if category_normalized in valid_categories:
             # Category is valid — route to its channel if configured, otherwise default
-            if category in config.DISCORD_CHANNELS:
-                return category
+            if category_normalized in config.DISCORD_CHANNELS:
+                return category_normalized
             else:
-                logger.info(f"Category '{category}' is valid but has no Discord channel, routing to '{config.DEFAULT_CATEGORY}'")
+                logger.info(f"Category '{category_normalized}' is valid but has no Discord channel, routing to '{config.DEFAULT_CATEGORY}'")
                 return config.DEFAULT_CATEGORY
 
         # Alias lookup — maps known LLM abbreviations/alternate forms to canonical names.
         # More precise than substring partial matching below.
-        canonical = _CATEGORY_ALIASES.get(category)
+        canonical = _CATEGORY_ALIASES.get(category_normalized)
         if canonical is not None:
-            logger.info(f"Alias match: '{category}' -> '{canonical}'")
+            logger.info(f"Alias match: '{category_normalized}' -> '{canonical}'")
             if canonical in config.DISCORD_CHANNELS:
                 return canonical
             else:
                 logger.info(
-                    f"Alias '{category}' -> '{canonical}' valid but has no Discord channel, "
+                    f"Alias '{category_normalized}' -> '{canonical}' valid but has no Discord channel, "
                     f"routing to '{config.DEFAULT_CATEGORY}'"
                 )
                 return config.DEFAULT_CATEGORY
 
         # Only do partial matching if the string is short and non-empty
         # (avoids matching reasoning text, and prevents "" from matching everything)
-        if category and len(category) < 50:
+        if category_normalized and len(category_normalized) < 50:
             for valid_cat in valid_categories:
-                if valid_cat in category:
+                if valid_cat in category_normalized:
                     mapped = valid_cat if valid_cat in config.DISCORD_CHANNELS else config.DEFAULT_CATEGORY
-                    logger.debug(f"Partial match: '{category}' -> '{valid_cat}' -> channel: '{mapped}'")
+                    logger.debug(f"Partial match: '{category_normalized}' -> '{valid_cat}' -> channel: '{mapped}'")
                     return mapped
-        
+
         # Default to ignore if no match
         logger.warning(f"Unknown category '{category}', defaulting to '{config.DEFAULT_CATEGORY}'")
         return config.DEFAULT_CATEGORY

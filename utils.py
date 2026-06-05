@@ -325,6 +325,64 @@ def resolve_shortened_urls(text):
     
     return text
 
+def shorten_dexerto_url_in_text(text: str) -> str:
+    """Replace the first dexerto.com URL in text with a TinyURL. No-op on failure."""
+    import re
+    import requests
+    match = re.search(r'https?://(?:www\.)?dexerto\.com/\S+', text)
+    if not match:
+        return text
+    original_url = match.group(0).rstrip(')')
+    try:
+        resp = requests.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": original_url},
+            timeout=5,
+        )
+        if resp.status_code == 200 and resp.text.strip().startswith("https://tinyurl.com"):
+            return text.replace(original_url, resp.text.strip())
+    except Exception as e:
+        logger.warning(f"TinyURL shortening failed for {original_url}: {e}")
+    return text
+
+_tinyurl_cache: dict[str, str] = {}
+
+def shorten_urls_in_text(text: str) -> str:
+    """Replace all HTTP URLs in text with TinyURLs, skipping video.twimg.com and tinyurl.com."""
+    import re
+    import requests
+
+    urls = re.findall(r'https?://\S+', text)
+    seen: set[str] = set()
+    for raw in urls:
+        url = raw.rstrip(')')
+        if url in seen:
+            continue
+        seen.add(url)
+        if 'video.twimg.com' in url or 'tinyurl.com' in url:
+            continue
+        if url in _tinyurl_cache:
+            short = _tinyurl_cache[url]
+            if short != url:
+                text = text.replace(url, short)
+            continue
+        try:
+            resp = requests.get(
+                "https://tinyurl.com/api-create.php",
+                params={"url": url},
+                timeout=5,
+            )
+            if resp.status_code == 200 and resp.text.strip().startswith("https://tinyurl.com"):
+                short = resp.text.strip()
+                _tinyurl_cache[url] = short
+                text = text.replace(url, short)
+            else:
+                _tinyurl_cache[url] = url
+        except Exception as e:
+            logger.warning(f"TinyURL shortening failed for {url}: {e}")
+            _tinyurl_cache[url] = url
+    return text
+
 def clean_text_content(text):
     """
     Clean text content by stripping HTML and normalizing whitespace

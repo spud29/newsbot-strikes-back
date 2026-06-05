@@ -10,7 +10,7 @@ import re
 import aiohttp
 import tempfile
 import hashlib
-from utils import logger, retry_with_backoff, ensure_url_on_own_line
+from utils import logger, retry_with_backoff, ensure_url_on_own_line, shorten_urls_in_text
 import config
 from removed_entries import RemovedEntriesDB
 from discord_commands import register_commands
@@ -80,12 +80,20 @@ class DiscordPoster:
             # Sync commands with Discord
             try:
                 logger.info("Syncing application commands with Discord...")
-                # Log registered commands before sync
                 logger.debug(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
                 synced = await self.tree.sync()
-                logger.info(f"Successfully synced {len(synced)} application command(s)")
+                logger.info(f"Successfully synced {len(synced)} application command(s) globally")
                 for cmd in synced:
                     logger.debug(f"  - {cmd.name} (type: {cmd.type})")
+
+                # Also sync to each connected guild immediately (global syncs can take up to 1 hour to propagate)
+                for guild in self.client.guilds:
+                    try:
+                        self.tree.copy_global_to(guild=guild)
+                        guild_synced = await self.tree.sync(guild=guild)
+                        logger.info(f"Guild sync for '{guild.name}' ({guild.id}): {len(guild_synced)} command(s)")
+                    except Exception as guild_err:
+                        logger.warning(f"Guild sync failed for {guild.id}: {guild_err}")
             except Exception as e:
                 logger.error(f"Failed to sync commands: {e}", exc_info=True)
 
@@ -264,6 +272,14 @@ class DiscordPoster:
             # or text cleaning causes URLs to be glued to preceding text)
             message_text = ensure_url_on_own_line(message_text)
 
+            # Shorten URLs to TinyURLs, but skip if the message has multiple URLs
+            # (indicates a combined post). Dexerto entries are exempt — they legitimately
+            # carry a dexerto.com article URL alongside a Twitter video.
+            _url_count = len(re.findall(r'https?://\S+', message_text))
+            _is_dexerto = 'dexerto.com' in message_text
+            if _url_count <= 1 or _is_dexerto:
+                message_text = await asyncio.to_thread(shorten_urls_in_text, message_text)
+
             # Prepend bold category tag in unified channel mode
             tag_cat = display_category or category
             if config.UNIFIED_CHANNEL_MODE and category != config.DEFAULT_CATEGORY:
@@ -417,7 +433,12 @@ class DiscordPoster:
                 original_ai_cat = (old_info.get('original_category') if old_info else None) or new_category
                 if not original_ai_cat or original_ai_cat == config.DEFAULT_CATEGORY:
                     original_ai_cat = new_category
-                new_text = f"**[{original_ai_cat.title()}]**\n{ensure_url_on_own_line(content)}"
+                _base = ensure_url_on_own_line(content)
+                _url_count = len(re.findall(r'https?://\S+', _base))
+                _is_dexerto = 'dexerto.com' in _base
+                if _url_count <= 1 or _is_dexerto:
+                    _base = await asyncio.to_thread(shorten_urls_in_text, _base)
+                new_text = f"**[{original_ai_cat.title()}]**\n{_base}"
 
                 if original_message.embeds and not original_message.content:
                     if len(new_text) > 4093:
@@ -640,7 +661,12 @@ class DiscordPoster:
             old_category = old_info.get('category') if old_info else 'unknown'
 
             # Build new text with updated category tag
-            new_text = f"**[{new_category.title()}]**\n{ensure_url_on_own_line(content)}"
+            _base = ensure_url_on_own_line(content)
+            _url_count = len(re.findall(r'https?://\S+', _base))
+            _is_dexerto = 'dexerto.com' in _base
+            if _url_count <= 1 or _is_dexerto:
+                _base = await asyncio.to_thread(shorten_urls_in_text, _base)
+            new_text = f"**[{new_category.title()}]**\n{_base}"
 
             # Re-append hidden video URL links so the embed persists (same logic as post_message)
             suppress_embeds = True
