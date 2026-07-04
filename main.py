@@ -158,6 +158,7 @@ class NewsAggregatorBot:
                 
                 # Get initial content for duplicate check (before downloading media)
                 content = entry.get('content', '')
+                content_from_ocr = False  # True when `content` is OCR/placeholder text, not a real caption
                 
                 # Special handling for image-only Telegram entries
                 # Download media and extract OCR text BEFORE content validation
@@ -190,12 +191,14 @@ class NewsAggregatorBot:
                         # Use OCR text as the content for image-only entries
                         content = ocr_text
                         entry['content'] = content
+                        content_from_ocr = True  # OCR text drives categorization/dedup only, not display
                         logger.info(f"Using OCR text as content ({len(content)} chars)")
                     else:
                         # If OCR extraction failed or is disabled, use a placeholder
                         # This allows image-only posts to still be processed
                         content = "[Image content - no text extracted]"
                         entry['content'] = content
+                        content_from_ocr = True  # placeholder is for processing only, not display
                         logger.info(f"No OCR text available, using placeholder content for image-only entry with {len(media_files)} media file(s)")
                 
                 if not content:
@@ -338,9 +341,10 @@ class NewsAggregatorBot:
                 # NOTE: Ollama calls are wrapped in asyncio.to_thread() to prevent blocking the event loop
                 # This allows Discord interactions to be processed while Ollama is thinking
                 logger.debug("Categorizing content...")
-                category, reasoning = await asyncio.to_thread(self.ollama.categorize, combined_content)
-                logger.info(f"Category: {category}")
+                category, reasoning, secondary_category = await asyncio.to_thread(self.ollama.categorize, combined_content)
+                logger.info(f"Category: {category}" + (f" (secondary: {secondary_category})" if secondary_category else ""))
                 _ai_category = category  # Capture before any overrides
+                _ai_secondary_category = secondary_category
                 placement_reason = None  # Will be set at each override point
 
                 # If Ollama timed out or errored during categorization, the category
@@ -356,6 +360,7 @@ class NewsAggregatorBot:
                 if getattr(config, 'PAUSE_MODE', False):
                     original_category = category
                     category = 'ignore'
+                    secondary_category = None
                     reasoning = (
                         f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
                         f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
@@ -368,6 +373,7 @@ class NewsAggregatorBot:
                 if duplicate_info:
                     ai_category = category
                     category = 'ignore'
+                    secondary_category = None
                     reasoning = (
                         f"AI suggested '{ai_category}': {reasoning or 'no reasoning provided'} "
                         f"| OVERRIDDEN by duplicate detector "
@@ -497,6 +503,7 @@ class NewsAggregatorBot:
                         if not newsworthiness['passed']:
                             original_category = category
                             category = 'ignore'
+                            secondary_category = None
                             reasoning = (
                                 f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
                                 f"| OVERRIDDEN: newsworthiness filter failed "
@@ -522,6 +529,7 @@ class NewsAggregatorBot:
                         if video_duration is not None and video_duration < config.SHORT_VIDEO_THRESHOLD:
                             original_category = category
                             category = 'ignore'
+                            secondary_category = None
                             reasoning = (
                                 f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
                                 f"| OVERRIDDEN: short video ({video_duration:.0f}s < {config.SHORT_VIDEO_THRESHOLD}s threshold)"
@@ -541,6 +549,7 @@ class NewsAggregatorBot:
                         if is_audience_question(combined_content):
                             original_category = category
                             category = 'ignore'
+                            secondary_category = None
                             reasoning = (
                                 f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
                                 f"| OVERRIDDEN: audience engagement question detected"
@@ -559,6 +568,10 @@ class NewsAggregatorBot:
                 content = strip_wire_prefixes(content)
                 entry['content'] = content
 
+                # OCR / placeholder text is for categorization & dedup only — never shown to users.
+                # Image-only entries (e.g. forwarded screenshots) post the media with no body text.
+                display_content = '' if content_from_ocr else content
+
                 # Post to Discord
                 media_files = entry.get('media_files', [])
                 video_urls = entry.get('video_urls', [])
@@ -567,24 +580,42 @@ class NewsAggregatorBot:
                 
                 success, discord_message_id, discord_channel_id = await self.discord_poster.post_message(
                     category=category,
-                    content=content,
+                    content=display_content,
                     media_files=media_files,
                     video_urls=video_urls,
                     source_type=source_type,
-                    entry_id=entry_id
+                    entry_id=entry_id,
+                    secondary_category=secondary_category
                 )
                 
                 if success:
                     # Mark as processed and store embedding
                     self.db.mark_processed(entry_id)
-                    if (ocr_text or audio_transcript) and combined_content != content:
-                        # OCR or transcript added new text — regenerate embedding with full context
-                        # for better future duplicate detection.
-                        # (Skips the extra Ollama call when content IS the OCR text, e.g. image-only entries)
-                        combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
-                        self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
-                    else:
-                        self.db.add_embedding(content, embedding, entry_id=entry_id)
+                    # Embedding storage is best-effort: a transient Ollama failure here must NOT
+                    # prevent store_message_mapping() below. Otherwise the message we just posted
+                    # to Discord becomes permanently orphaned (posted + marked processed, but with
+                    # no DB record), so "Entry Info"/re-categorize report "No database record found".
+                    try:
+                        if (ocr_text or audio_transcript) and combined_content != content:
+                            # OCR or transcript added new text — regenerate embedding with full context
+                            # for better future duplicate detection.
+                            # (Skips the extra Ollama call when content IS the OCR text, e.g. image-only entries)
+                            combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
+                            self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
+                        else:
+                            self.db.add_embedding(content, embedding, entry_id=entry_id)
+                    except Exception as embed_error:
+                        # Fall back to the dedup-check embedding already computed earlier this cycle.
+                        logger.error(
+                            f"Embedding store failed for {entry_id}; falling back to dedup embedding: {embed_error}"
+                        )
+                        try:
+                            self.db.add_embedding(content, embedding, entry_id=entry_id)
+                        except Exception as fallback_error:
+                            logger.error(
+                                f"Fallback embedding also failed for {entry_id}; "
+                                f"storing mapping without embedding: {fallback_error}"
+                            )
                     
                     # Store message mapping with source URL for all entries
                     if discord_message_id and discord_channel_id:
@@ -608,14 +639,16 @@ class NewsAggregatorBot:
                             telegram_message_id=entry.get('message_id', 0),
                             discord_channel_id=discord_channel_id,
                             discord_message_id=discord_message_id,
-                            content=content,
+                            content=display_content,
                             source_url=source_url,
                             video_urls=entry.get('video_urls', []),
                             category=category,
                             source_type=source_type,
                             reasoning=reasoning,
                             original_category=_ai_category,
-                            placement_reason=placement_reason
+                            placement_reason=placement_reason,
+                            secondary_category=secondary_category,
+                            original_secondary_category=_ai_secondary_category
                         )
                     
                     # Update last message ID for Telegram entries
@@ -1001,7 +1034,8 @@ class NewsAggregatorBot:
                 message_id=discord_message_id,
                 content=new_content,
                 source_type='telegram',
-                category=mapping_info.get('category')
+                category=mapping_info.get('category'),
+                secondary_category=mapping_info.get('secondary_category')
             )
             
             if success:

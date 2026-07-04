@@ -8,6 +8,9 @@ import re
 from utils import logger, ensure_url_on_own_line, shorten_urls_in_text
 
 
+_UNCHANGED = object()
+
+
 class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
     """Modal that captures an optional user reason before executing a re-categorization."""
 
@@ -19,7 +22,7 @@ class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
         style=discord.TextStyle.paragraph,
     )
 
-    def __init__(self, new_category, current_category, entry_id, entry_data, message, poster, source_type, is_move):
+    def __init__(self, new_category, current_category, entry_id, entry_data, message, poster, source_type, is_move, new_secondary=_UNCHANGED):
         super().__init__()
         self.new_category = new_category
         self.current_category = current_category
@@ -29,10 +32,17 @@ class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
         self.poster = poster
         self.source_type = source_type
         self.is_move = is_move
+        self.new_secondary = new_secondary
 
     async def on_submit(self, interaction: discord.Interaction):
         user_reason = self.reason.value.strip() or None
         await interaction.response.defer(ephemeral=True)
+
+        # Apply pending secondary category change before primary (so tag rebuild picks it up)
+        if self.new_secondary is not _UNCHANGED and self.poster.database:
+            self.poster.database.update_message_mapping_fields(
+                self.entry_id, secondary_category=self.new_secondary
+            )
 
         if self.is_move:
             has_thread = self.message.thread is not None
@@ -48,12 +58,7 @@ class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
                 user=interaction.user,
                 user_reason=user_reason,
             )
-            if success:
-                msg = f"✅ Re-categorized from **{self.current_category}** to **{self.new_category}**!\nNew message ID: {new_message_id}"
-                if has_thread:
-                    msg += "\n🧵 Thread with Perplexity content preserved!"
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
+            if not success:
                 await interaction.followup.send(f"❌ Failed to re-categorize: {error_msg}", ephemeral=True)
         else:
             success, error_msg = await self.poster.update_category_tag(
@@ -65,12 +70,7 @@ class ReasonModal(discord.ui.Modal, title="Why this change? (optional)"):
                 user=interaction.user,
                 user_reason=user_reason,
             )
-            if success:
-                await interaction.followup.send(
-                    f"✅ Updated category from **{self.current_category}** to **{self.new_category}**!",
-                    ephemeral=True,
-                )
-            else:
+            if not success:
                 await interaction.followup.send(f"❌ Failed to update category: {error_msg}", ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -139,18 +139,36 @@ class RecategorizeView(discord.ui.View):
                 f"Re-categorizing entry {self.entry_id} from {self.current_category} to {new_category} (source_type: {source_type})"
             )
 
-            await select_interaction.response.send_modal(
-                ReasonModal(
-                    new_category=new_category,
-                    current_category=self.current_category,
-                    entry_id=self.entry_id,
-                    entry_data=self.entry_data,
-                    message=self.message,
-                    poster=self.poster,
-                    source_type=source_type,
-                    is_move=True,
+            if config.REASON_MODAL_ENABLED:
+                await select_interaction.response.send_modal(
+                    ReasonModal(
+                        new_category=new_category,
+                        current_category=self.current_category,
+                        entry_id=self.entry_id,
+                        entry_data=self.entry_data,
+                        message=self.message,
+                        poster=self.poster,
+                        source_type=source_type,
+                        is_move=True,
+                    )
                 )
-            )
+            else:
+                await select_interaction.response.defer(ephemeral=True)
+                has_thread = self.message.thread is not None
+                success, new_message_id, new_channel_id, error_msg = await self.poster.recategorize_entry(
+                    message_id=self.message.id,
+                    channel_id=self.message.channel.id,
+                    new_category=new_category,
+                    entry_id=self.entry_id,
+                    content=self.entry_data.get('content', self.message.content),
+                    media_files=None,
+                    video_urls=self.entry_data.get('video_urls', []),
+                    source_type=source_type,
+                    user=select_interaction.user,
+                    user_reason=None,
+                )
+                if not success:
+                    await select_interaction.followup.send(f"❌ Failed to re-categorize: {error_msg}", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Error in RecategorizeView _on_select: {e}", exc_info=True)
@@ -222,7 +240,10 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
             # Re-prepend category tag in unified channel mode
             category = self.entry_data.get('category')
             if config.UNIFIED_CHANNEL_MODE and category and category != config.DEFAULT_CATEGORY:
-                message_text = f"**[{category.title()}]**\n{message_text}"
+                from discord_messaging import _format_category_tag
+                secondary_cat = self.entry_data.get('secondary_category')
+                tag = _format_category_tag(category, secondary_cat)
+                message_text = f"{tag}\n{message_text}"
 
             suppress_embeds = True
 
@@ -272,10 +293,14 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
                 )
                 return
 
-            await modal_interaction.followup.send(
+            confirmation = await modal_interaction.followup.send(
                 "✅ Entry text updated successfully.",
                 ephemeral=True
             )
+            try:
+                await confirmation.delete()
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"Error in EditTextModal on_submit: {e}", exc_info=True)
@@ -312,71 +337,195 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
 
 
 class SetCategoryView(discord.ui.View):
-    """Ephemeral view with a Select dropdown for re-categorizing entry category tags"""
+    """Ephemeral view with Select dropdowns for primary and secondary category tags.
+
+    Both selects store pending values; the Confirm button applies them together.
+    """
 
     def __init__(self, current_cat, available_categories, entry_id, entry_data, message, poster):
         super().__init__(timeout=60)
         self.current_category = current_cat
+        self.current_secondary = entry_data.get('secondary_category') if entry_data else None
         self.entry_id = entry_id
         self.entry_data = entry_data
         self.message = message
         self.poster = poster
+        self._pending_primary = None
+        self._pending_secondary = _UNCHANGED
+        self._confirmed = False
 
-        # Build select options — all categories (current category included so the user
-        # can re-apply it to fix a display/DB mismatch without needing an intermediate step)
-        options = [
+        # Primary category dropdown (row 0)
+        primary_options = [
             discord.SelectOption(label=cat.title(), value=cat)
             for cat in sorted(available_categories)
         ]
-
-        select = discord.ui.Select(
-            placeholder=f"Currently: {current_cat} — pick a new category",
-            options=options,
+        primary_select = discord.ui.Select(
+            placeholder=f"Primary: {current_cat} — pick a new category",
+            options=primary_options,
             min_values=1,
             max_values=1,
+            row=0,
         )
-        select.callback = self._on_select
-        self.add_item(select)
+        primary_select.callback = self._on_primary_select
+        self.add_item(primary_select)
 
-    async def _on_select(self, select_interaction: discord.Interaction):
-        """Handle category selection — show reason modal before acting."""
-        if getattr(self, '_submitted', False):
-            await select_interaction.response.send_message("Already submitted.", ephemeral=True)
+        # Secondary category dropdown (row 1)
+        secondary_options = [discord.SelectOption(label="None (clear)", value="__none__")]
+        for cat in sorted(available_categories):
+            if cat != config.DEFAULT_CATEGORY and cat != current_cat:
+                is_current = (cat == self.current_secondary)
+                secondary_options.append(discord.SelectOption(
+                    label=cat.title(), value=cat, default=is_current
+                ))
+        sec_label = self.current_secondary or "none"
+        secondary_select = discord.ui.Select(
+            placeholder=f"Secondary: {sec_label} — pick or clear",
+            options=secondary_options,
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+        secondary_select.callback = self._on_secondary_select
+        self.add_item(secondary_select)
+
+        # Confirm button (row 2)
+        confirm_btn = discord.ui.Button(
+            label="Confirm", style=discord.ButtonStyle.primary, row=2
+        )
+        confirm_btn.callback = self._on_confirm
+        self.add_item(confirm_btn)
+
+    async def _on_primary_select(self, interaction: discord.Interaction):
+        self._pending_primary = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def _on_secondary_select(self, interaction: discord.Interaction):
+        selected = interaction.data["values"][0]
+        self._pending_secondary = None if selected == "__none__" else selected
+        await interaction.response.defer()
+
+    async def _on_confirm(self, interaction: discord.Interaction):
+        if self._confirmed:
+            await interaction.response.send_message("Already confirmed.", ephemeral=True)
             return
-        self._submitted = True
+
+        primary_changed = (
+            self._pending_primary is not None
+            and self._pending_primary != self.current_category
+        )
+        secondary_changed = (
+            self._pending_secondary is not _UNCHANGED
+            and self._pending_secondary != self.current_secondary
+        )
+
+        if not primary_changed and not secondary_changed:
+            await interaction.response.send_message(
+                "No changes selected — pick from the dropdowns above first.",
+                ephemeral=True,
+            )
+            return
+
+        self._confirmed = True
 
         try:
-            new_category = select_interaction.data["values"][0]
-            logger.debug(f"SetCategoryView selection: '{new_category}' for entry {self.entry_id}")
-            logger.info(
-                f"Updating category tag for entry {self.entry_id} from {self.current_category} to {new_category}"
-            )
-
-            await select_interaction.response.send_modal(
-                ReasonModal(
-                    new_category=new_category,
-                    current_category=self.current_category,
-                    entry_id=self.entry_id,
-                    entry_data=self.entry_data,
-                    message=self.message,
-                    poster=self.poster,
-                    source_type=None,
-                    is_move=False,
+            if primary_changed:
+                new_cat = self._pending_primary
+                logger.info(
+                    f"Updating category tag for {self.entry_id}: "
+                    f"{self.current_category} -> {new_cat}"
+                    + (f", secondary -> {self._pending_secondary}" if secondary_changed else "")
                 )
-            )
+                if config.REASON_MODAL_ENABLED:
+                    await interaction.response.send_modal(
+                        ReasonModal(
+                            new_category=new_cat,
+                            current_category=self.current_category,
+                            entry_id=self.entry_id,
+                            entry_data=self.entry_data,
+                            message=self.message,
+                            poster=self.poster,
+                            source_type=None,
+                            is_move=False,
+                            new_secondary=self._pending_secondary if secondary_changed else _UNCHANGED,
+                        )
+                    )
+                else:
+                    await interaction.response.defer(ephemeral=True)
+                    if secondary_changed and self.poster.database:
+                        self.poster.database.update_message_mapping_fields(
+                            self.entry_id, secondary_category=self._pending_secondary
+                        )
+                    success, error_msg = await self.poster.update_category_tag(
+                        message_id=self.message.id,
+                        channel_id=self.message.channel.id,
+                        new_category=new_cat,
+                        entry_id=self.entry_id,
+                        content=self.entry_data.get('content', self.message.content),
+                        user=interaction.user,
+                        user_reason=None,
+                    )
+                    if success:
+                        await interaction.delete_original_response()
+                    else:
+                        await interaction.followup.send(f"❌ Failed to update category: {error_msg}", ephemeral=True)
+            else:
+                # Only secondary changed — apply directly, no reason modal needed
+                await interaction.response.defer(ephemeral=True)
+                new_secondary = self._pending_secondary
+
+                if self.poster.database:
+                    self.poster.database.update_message_mapping_fields(
+                        self.entry_id, secondary_category=new_secondary
+                    )
+
+                from discord_messaging import _format_category_tag
+                category = self.entry_data.get('category') or self.current_category
+                content = self.entry_data.get('content', self.message.content) or ''
+
+                _base = ensure_url_on_own_line(content)
+                _url_count = len(re.findall(r'https?://\S+', _base))
+                _is_dexerto = 'dexerto.com' in _base
+                if _url_count <= 1 or _is_dexerto:
+                    _base = await asyncio.to_thread(shorten_urls_in_text, _base)
+
+                new_text = f"{_format_category_tag(category, new_secondary)}\n{_base}"
+
+                video_urls = self.entry_data.get('video_urls', [])
+                source_type = self.entry_data.get('source_type')
+                suppress_embeds = True
+                if source_type == 'twitter' and video_urls:
+                    suppress_embeds = False
+                    for video_url in video_urls:
+                        if video_url.startswith('http'):
+                            new_text += f" [.]({video_url})"
+
+                if self.message.embeds and not self.message.content:
+                    if len(new_text) > 4093:
+                        new_text = new_text[:4093] + "..."
+                    updated_embed = discord.Embed(description=new_text, color=discord.Color.dark_grey())
+                    await self.message.edit(embed=updated_embed)
+                else:
+                    if len(new_text) > 2000:
+                        new_text = new_text[:1997] + "..."
+                    await self.message.edit(content=new_text, suppress=suppress_embeds)
+
+                logger.info(f"Set secondary category for {self.entry_id} to {new_secondary}")
+                await interaction.delete_original_response()
 
         except Exception as e:
-            logger.error(f"Error in SetCategoryView _on_select: {e}", exc_info=True)
-            self._submitted = False
+            logger.error(f"Error in SetCategoryView _on_confirm: {e}", exc_info=True)
+            self._confirmed = False
             try:
-                if select_interaction.response.is_done():
-                    await select_interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
                 else:
-                    await select_interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
+                    await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
             except Exception as followup_error:
                 logger.error(f"Failed to send error followup: {followup_error}")
 
     async def on_timeout(self):
-        """Disable the select when the view times out"""
-        self.children[0].disabled = True
+        for child in self.children:
+            child.disabled = True
+
+
 

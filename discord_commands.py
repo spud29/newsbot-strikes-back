@@ -8,7 +8,7 @@ import json
 import time
 import config
 from utils import logger
-from discord_ui import RecategorizeView, SetCategoryView, EditTextModal
+from discord_ui import RecategorizeView, SetCategoryView, EditTextModal, ReasonModal
 
 
 
@@ -31,8 +31,12 @@ def _build_entry_info_embed(entry_id, entry_data):
         color=discord.Color.orange() if recategorized else discord.Color.blurple()
     )
 
+    secondary_cat = entry_data.get('secondary_category')
+
     embed.add_field(name="Entry ID", value=f"`{entry_id}`", inline=False)
     embed.add_field(name="Current Category", value=category, inline=True)
+    if secondary_cat:
+        embed.add_field(name="Secondary Category", value=secondary_cat, inline=True)
     if recategorized:
         embed.add_field(name="Original Category", value=original_category, inline=True)
     embed.add_field(name="Source Type", value=source_type, inline=True)
@@ -189,21 +193,54 @@ def register_commands(poster):
                 )
                 return
 
+            # Auto-toggle between ignore and unified — no dropdown needed
+            if current_category == config.DEFAULT_CATEGORY:
+                new_category = entry_data.get('original_category')
+                if not new_category or new_category == config.DEFAULT_CATEGORY:
+                    new_category = next((cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY), 'politics')
+                direction_label = f"ignore → **{new_category}**"
+            else:
+                new_category = config.DEFAULT_CATEGORY
+                direction_label = f"**{current_category}** → ignore"
+
             logger.info(
-                f"Re-categorize command from user {interaction.user.id}: "
-                f"Entry {entry_id} currently in {current_category}"
+                f"Move to Channel command from user {interaction.user.id}: "
+                f"Entry {entry_id} {direction_label}"
             )
 
-            # Get available categories (only ignore and unified channel for simplified routing)
-            available_categories = [config.DEFAULT_CATEGORY, "__unified__"]
+            source_type = entry_id.split('_')[0] if entry_id else None
 
-            # Show an ephemeral dropdown so the user can pick a channel
-            view = RecategorizeView(current_category, available_categories, entry_id, entry_data, message, poster)
-            await interaction.response.send_message(
-                f"Route this entry (currently **{current_category}**):",
-                view=view,
-                ephemeral=True
-            )
+            if config.REASON_MODAL_ENABLED:
+                await interaction.response.send_modal(
+                    ReasonModal(
+                        new_category=new_category,
+                        current_category=current_category,
+                        entry_id=entry_id,
+                        entry_data=entry_data,
+                        message=message,
+                        poster=poster,
+                        source_type=source_type,
+                        is_move=True,
+                    )
+                )
+            else:
+                await interaction.response.defer(ephemeral=True)
+                success, new_message_id, new_channel_id, error_msg = await poster.recategorize_entry(
+                    message_id=message.id,
+                    channel_id=message.channel.id,
+                    new_category=new_category,
+                    entry_id=entry_id,
+                    content=entry_data.get('content', message.content),
+                    media_files=None,
+                    video_urls=entry_data.get('video_urls', []),
+                    source_type=source_type,
+                    user=interaction.user,
+                    user_reason=None,
+                )
+                if success:
+                    await interaction.delete_original_response()
+                else:
+                    await interaction.followup.send(f"❌ Failed to move: {error_msg}", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Error in 'Re-categorize' command: {e}", exc_info=True)
@@ -292,7 +329,7 @@ def register_commands(poster):
             # Show an ephemeral dropdown so the user can pick a category
             view = SetCategoryView(current_category, available_categories, entry_id, entry_data, message, poster)
             await interaction.response.send_message(
-                f"Select a new category for this entry (currently **{current_category}**):",
+                f"Re-categorize this entry (currently **{current_category}**).\nYou can also set a secondary category below:",
                 view=view,
                 ephemeral=True
             )

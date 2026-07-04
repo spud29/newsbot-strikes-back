@@ -6,7 +6,7 @@ from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 import asyncio
 import json
 import os
-from utils import logger, retry_with_backoff, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, strip_wire_prefixes, remove_telegram_formatting
+from utils import logger, retry_with_backoff, clean_text_content, resolve_shortened_urls, strip_wire_prefixes, remove_telegram_formatting
 from db_connection import get_db_connection
 import config
 
@@ -386,8 +386,6 @@ class TelegramPoller:
             content = message.text or message.message or ''
             content = clean_text_content(content)
             content = resolve_shortened_urls(content)
-            content = remove_emojis(content)
-            content = remove_corrupted_emoji_marks(content)
             content = strip_wire_prefixes(content)
             content = remove_telegram_formatting(content, channel_name)
 
@@ -494,8 +492,6 @@ class TelegramPoller:
             combined_content = ' '.join([e.get('content', '') for e in group_entries if e.get('content')])
             combined_content = clean_text_content(combined_content)
             combined_content = resolve_shortened_urls(combined_content)
-            combined_content = remove_emojis(combined_content)
-            combined_content = remove_corrupted_emoji_marks(combined_content)
             combined_content = strip_wire_prefixes(combined_content)
             combined_content = remove_telegram_formatting(combined_content, base_entry.get('source'))
             base_entry['content'] = combined_content

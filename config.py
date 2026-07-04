@@ -40,6 +40,10 @@ NEWS_SEARCH_COMMAND_ENABLED = True
 NEWS_SEARCH_MODEL = "sonar-reasoning-pro"  # Model for news topic searches
 NEWS_SEARCH_COOLDOWN_SECONDS = 30  # Per-user cooldown to prevent API abuse
 
+# gallery-dl config path (explicit so it works under NSSM/LocalSystem,
+# where ~ resolves to the system profile instead of the user's home)
+GALLERY_DL_CONFIG = r"C:\Users\spud9\AppData\Roaming\gallery-dl\config.json"
+
 # Dexerto tweet pair merger
 # Dexerto posts stories as two tweets: tweet 1 = headline, tweet 2 = blurb + article URL.
 # Tweet 1 is held in the dexerto_pending SQLite table until tweet 2 arrives (survives restarts).
@@ -100,6 +104,11 @@ PAUSE_MODE = True
 UNIFIED_CHANNEL_MODE = True
 UNIFIED_CHANNEL_ID = 1379921787629867138  # The single channel to post everything to
 
+# URL shortening - don't shorten URLs already this short or shorter. A TinyURL is
+# ~28 chars, so converting anything shorter just makes it LONGER and wastes an API
+# call (which also burns through the free rate limit faster).
+URL_SHORTEN_MIN_LENGTH = 30
+
 # Telegram channels to monitor
 TELEGRAM_CHANNELS = [
     "Fin_Watch",
@@ -114,6 +123,13 @@ TELEGRAM_CHANNELS = [
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_CATEGORIZATION_MODEL = "qwen3:8b"
 OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+# Context window for embedding requests. Kept small because embeddings run over short
+# news text — at the 8192 default this model occupies ~2.9 GB of VRAM, but at 512 it
+# needs only ~1.0 GB, letting it stay GPU-resident alongside the 8B categorizer when
+# OLLAMA_MAX_LOADED_MODELS=2. This avoids the model load/unload thrash that fragmented
+# VRAM and stalled all processing for ~6.5 hours on 2026-06-28. Raise only if you also
+# free VRAM elsewhere (e.g. a smaller categorizer or lower categorizer context).
+OLLAMA_EMBEDDING_NUM_CTX = 512
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
@@ -255,7 +271,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 
 1. **Read Carefully**: Analyze the entire content, not just keywords
 2. **Primary Topic**: Choose the category that represents the PRIMARY focus
-3. **Be Specific**: If content spans multiple categories, pick the most dominant one
+3. **Be Specific**: If content spans multiple categories, pick the most dominant one. If the content genuinely has strong relevance to a second category (e.g., a crypto regulation story is both 'crypto' and 'politics'), include a secondary_category. Most entries should NOT have one — only assign it when a reader in the second category would genuinely want to see this entry. Never set secondary_category to 'ignore' or to the same value as category.
 4. **Newsworthiness is Downstream**: Once an entry has enough substance to stand alone (passes the quality check), assign the correct category even if the event seems modest. The newsworthiness filter evaluates impact AFTER categorization — don't pre-filter modest-but-real events at this stage.
 5. **Context Clues**: Consider source, tone, and depth of information
 6. **When Unclear**: If the content discusses a real topic but lacks sufficient context or detail to stand alone as a worthwhile post, 'ignore' is appropriate — it's a quality filter, not just a spam filter. Assign a real category when the entry has enough substance to stand alone.
@@ -338,7 +354,9 @@ Quality vs. thin coverage — same story, different substance:
 ## OUTPUT FORMAT
 
 Respond with ONLY valid JSON matching this format exactly:
-{"category": "<category name>", "reasoning": "<1-2 sentence explanation of why this category was chosen over others>"}
+{"category": "<category name>", "reasoning": "<1-2 sentence explanation of why this category was chosen over others>", "secondary_category": "<category name or null>"}
+
+secondary_category is optional. Set it to a second category name ONLY when the content genuinely spans two categories with roughly equal relevance. Set to null when the entry fits cleanly in one category (which is most of the time).
 
 Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, software development, fitness, general news, ignore"""
 
@@ -365,22 +383,22 @@ OCR_LANGUAGE = 'eng'  # Language for OCR (default: English)
 DISCORD_FILE_SIZE_LIMIT_MB = 25
 
 # Feedback Learning Configuration
-FEEDBACK_LEARNING_ENABLED = True  # Enable learning from user feedback (removed entries)
+FEEDBACK_LEARNING_ENABLED = False  # Enable learning from user feedback (removed entries)
 FEEDBACK_EXAMPLES_COUNT = 10  # Number of removed entries to include in system prompt
 
 # Ignore-entry Learning Configuration
 # Feeds entries categorized as 'ignore' (including user-recategorized ones) into the AI
 # system prompt as additional negative examples. User-flagged ignores are prioritized.
-IGNORE_EXAMPLES_ENABLED = True  # Enable learning from ignore-channel entries
+IGNORE_EXAMPLES_ENABLED = False  # Enable learning from ignore-channel entries
 IGNORE_EXAMPLES_COUNT = 5  # Number of recent ignore entries to include in system prompt
 
 # Correction Learning Configuration
 # Feeds user re-categorization corrections into the AI system prompt so it learns from
 # mistakes. Covers both category-to-category corrections and entries moved TO ignore.
-CORRECTION_EXAMPLES_ENABLED = True  # Enable learning from user re-categorizations
+CORRECTION_EXAMPLES_ENABLED = False  # Enable learning from user re-categorizations
 CORRECTION_EXAMPLES_COUNT = 15      # Category-to-category corrections (AI said X, user changed to Y)
 IGNORE_PROMOTION_EXAMPLES_COUNT = 3  # Entries the user moved TO ignore (AI said X, should be ignore)
-IGNORE_RESCUE_ENABLED = True        # Learn from AI-assigned ignores that users promoted to real categories
+IGNORE_RESCUE_ENABLED = False        # Learn from AI-assigned ignores that users promoted to real categories
 IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in system prompt
 
 
@@ -388,6 +406,7 @@ IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in s
 # Note: This is a restricted command that only specific users can access
 RECATEGORIZE_COMMAND_ENABLED = True  # Enable/disable "Re-categorize" context menu command
 RECATEGORIZE_ALLOWED_USER_IDS = [144983485268885504]  # Discord user IDs allowed to re-categorize entries
+REASON_MODAL_ENABLED = False  # Show the "Why this change?" modal; set False to skip it
 
 # Source Context Menu Command (Right-click on bot messages → Apps → "Source")
 # Shows the original Telegram/Twitter source URL to the user who triggered it
@@ -432,7 +451,7 @@ NEWSWORTHINESS_WEIGHTS = {
 # Entry Superseding Configuration
 # When a new entry about the same story arrives, compare quality and replace
 # the old Discord message if the new one is clearly better
-SUPERSEDE_ENABLED = True
+SUPERSEDE_ENABLED = False
 SUPERSEDE_MAX_AGE_HOURS = 24  # Don't supersede entries older than this
 SUPERSEDED_CHANNEL_ID = 1344412433552248973  # Channel to archive superseded entries
 SUPERSEDE_SIMILARITY_THRESHOLD = 0.85  # Min similarity to even attempt supersede (above SIMILARITY_THRESHOLD)

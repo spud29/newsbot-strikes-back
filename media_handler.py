@@ -7,7 +7,7 @@ import json
 import subprocess
 import asyncio
 from pathlib import Path
-from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, resolve_shortened_urls, remove_emojis, remove_corrupted_emoji_marks, strip_wire_prefixes, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls
+from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, normalize_crypto_tickers, resolve_shortened_urls, strip_wire_prefixes, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls
 import config
 from ocr_handler import OCRHandler
 from transcription_handler import TranscriptionHandler
@@ -62,6 +62,7 @@ class MediaHandler:
             logger.debug(f"Extracting tweet text using gallery-dl from: {link}")
             text_cmd = [
                 sys.executable, '-m', 'gallery_dl',
+                '--config', config.GALLERY_DL_CONFIG,
                 '--dump-json',
                 '--range', '1',
                 '--no-download',
@@ -116,8 +117,6 @@ class MediaHandler:
                 if full_text:
                     full_text = clean_text_content(full_text)
                     full_text = resolve_shortened_urls(full_text)
-                    full_text = remove_emojis(full_text)
-                    full_text = remove_corrupted_emoji_marks(full_text)
                     full_text = strip_wire_prefixes(full_text)
                     full_text = remove_xcom_urls(full_text)
                     full_text = remove_twitter_attribution(full_text)
@@ -130,6 +129,7 @@ class MediaHandler:
             video_urls = []
             video_url_cmd = [
                 sys.executable, '-m', 'gallery_dl',
+                '--config', config.GALLERY_DL_CONFIG,
                 '--range', '1',
                 '-g',
                 link
@@ -158,6 +158,7 @@ class MediaHandler:
             if video_urls:
                 duration_cmd = [
                     sys.executable, '-m', 'gallery_dl',
+                    '--config', config.GALLERY_DL_CONFIG,
                     '--print', '{duration}',
                     '--range', '1',
                     '--no-download',
@@ -184,6 +185,7 @@ class MediaHandler:
             # Videos are handled via video_urls to avoid Discord file size limits
             media_cmd = [
                 sys.executable, '-m', 'gallery_dl',
+                '--config', config.GALLERY_DL_CONFIG,
                 '--dest', download_dir,
                 '--filename', '{num:>03}.{extension}',
                 '--no-mtime',
@@ -219,11 +221,10 @@ class MediaHandler:
                     if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
                         media_files.append(file_path)
             
-            # Clean the full text: remove empty lines, resolve shortened URLs, remove emojis, remove x.com URLs, and remove Twitter attribution
+            # Clean the full text: remove empty lines, resolve shortened URLs, remove x.com URLs, and remove Twitter attribution
             full_text = clean_text_content(full_text)
+            full_text = normalize_crypto_tickers(full_text)
             full_text = resolve_shortened_urls(full_text)
-            full_text = remove_emojis(full_text)
-            full_text = remove_corrupted_emoji_marks(full_text)
             full_text = strip_wire_prefixes(full_text)
             full_text = remove_xcom_urls(full_text)
             full_text = format_quote_tweets(full_text)

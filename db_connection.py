@@ -141,6 +141,14 @@ def _run_migrations(conn):
         conn.execute("ALTER TABLE message_mapping ADD COLUMN user_reason TEXT DEFAULT NULL")
         conn.commit()
 
+    if 'secondary_category' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN secondary_category TEXT DEFAULT NULL")
+        conn.commit()
+
+    if 'original_secondary_category' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN original_secondary_category TEXT DEFAULT NULL")
+        conn.commit()
+
 
 def close_db_connection():
     """Close the shared connection (call on shutdown)."""

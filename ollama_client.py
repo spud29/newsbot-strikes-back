@@ -55,6 +55,7 @@ class OllamaClient:
         self.base_url = config.OLLAMA_BASE_URL
         self.categorization_model = config.OLLAMA_CATEGORIZATION_MODEL
         self.embedding_model = config.OLLAMA_EMBEDDING_MODEL
+        self.embedding_num_ctx = config.OLLAMA_EMBEDDING_NUM_CTX
         self.removed_entries_db = removed_entries_db
         self.database = database
 
@@ -297,7 +298,7 @@ class OllamaClient:
             prompt = (
                 f"Content to categorize:\n{content}\n\n"
                 f"Valid categories (use the exact name): {valid_names}\n\n"
-                f"Respond with ONLY valid JSON: {{\"category\": \"<exact name from above>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\"}}"
+                f"Respond with ONLY valid JSON: {{\"category\": \"<exact name from above>\", \"reasoning\": \"<1-2 sentence explanation of why this category was chosen over others>\", \"secondary_category\": \"<exact name from above, or null if not applicable>\"}}"
             )
 
             # Call Ollama API — use separate 'system' field so Ollama can reuse
@@ -352,13 +353,22 @@ class OllamaClient:
                     logger.warning(f"JSON parse failed, using first line as category: '{category_raw}'")
             
             category = self._parse_category(category_raw)
-            
+
+            # Extract optional secondary category
+            secondary_category = None
+            if parsed is not None:
+                secondary_raw = parsed.get('secondary_category')
+                if secondary_raw and str(secondary_raw).lower().strip() not in ('null', 'none', ''):
+                    secondary_category = self._parse_category(str(secondary_raw).lower().strip())
+                    if secondary_category == category or secondary_category == config.DEFAULT_CATEGORY:
+                        secondary_category = None
+
             # If the returned category is in the exclusion list, force to a different default
             if exclude_categories and category in exclude_categories:
                 logger.warning(f"AI returned excluded category '{category}', forcing to alternative")
                 reasoning = f"AI suggested '{category}' but it was excluded"
                 # Try to find a suitable fallback category
-                valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys() 
+                valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys()
                                    if cat not in exclude_categories]
                 # Use DEFAULT_CATEGORY if it's not excluded, otherwise use first valid category
                 if config.DEFAULT_CATEGORY not in exclude_categories:
@@ -373,19 +383,20 @@ class OllamaClient:
                 else:
                     logger.error("All categories excluded! Using DEFAULT_CATEGORY anyway")
                     category = config.DEFAULT_CATEGORY
-            
-            logger.info(f"Categorized as: {category} (raw: {category_raw}, reasoning: {reasoning})")
-            return category, reasoning
-            
+                secondary_category = None
+
+            logger.info(f"Categorized as: {category} (raw: {category_raw}, secondary: {secondary_category}, reasoning: {reasoning})")
+            return category, reasoning, secondary_category
+
         except Exception as e:
             logger.error(f"Error categorizing content: {e}")
             # Make sure we don't return an excluded category even on error
             if exclude_categories and config.DEFAULT_CATEGORY in exclude_categories:
-                valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys() 
+                valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys()
                                    if cat not in exclude_categories]
                 fallback = valid_categories[0] if valid_categories else config.DEFAULT_CATEGORY
-                return fallback, f"Error during categorization: {str(e)[:50]}"
-            return config.DEFAULT_CATEGORY, f"Error during categorization: {str(e)[:50]}"
+                return fallback, f"Error during categorization: {str(e)[:50]}", None
+            return config.DEFAULT_CATEGORY, f"Error during categorization: {str(e)[:50]}", None
     
     def _extract_json(self, text: str) -> "dict | None":
         """
@@ -765,7 +776,11 @@ class OllamaClient:
                 json={
                     "model": self.embedding_model,
                     "prompt": content,
-                    "keep_alive": "30m"
+                    "keep_alive": "30m",
+                    # Cap context so the embedder loads small (~1 GB vs ~2.9 GB at the 8192
+                    # default) and can stay GPU-resident next to the categorizer — see
+                    # OLLAMA_EMBEDDING_NUM_CTX in config.py.
+                    "options": {"num_ctx": self.embedding_num_ctx}
                 },
                 timeout=120
             )

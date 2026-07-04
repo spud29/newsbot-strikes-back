@@ -11,6 +11,8 @@ import inspect
 from functools import wraps
 from pathlib import Path
 
+import config
+
 # Set up logging
 def setup_logging():
     """Configure logging with debug level for comprehensive diagnostics"""
@@ -325,32 +327,73 @@ def resolve_shortened_urls(text):
     
     return text
 
+# Module-level state shared by the shorten_* helpers.
+_tinyurl_cache: dict[str, str] = {}
+_shorten_cooldown_until: float = 0.0  # epoch seconds; while now < this, skip the API
+
+
+def _shorten_url(url: str) -> str | None:
+    """Shorten one URL via TinyURL.
+
+    Returns the short URL, or None to leave the original untouched — when the URL is
+    already short enough to not benefit, when we're backing off after a rate-limit,
+    or when the request fails / TinyURL rejects the URL. The shortening provider lives
+    here only, so a future is.gd fallback would slot in at this single spot.
+    """
+    global _shorten_cooldown_until
+    import requests
+
+    # Already short enough that a ~28-char TinyURL wouldn't help (and would waste a call).
+    if len(url) <= config.URL_SHORTEN_MIN_LENGTH:
+        return None
+
+    if url in _tinyurl_cache:
+        return _tinyurl_cache[url]
+
+    # Backing off after a recent rate-limit / server error — don't hammer the API.
+    if time.time() < _shorten_cooldown_until:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": url},
+            timeout=5,
+        )
+        if resp.status_code == 200 and resp.text.strip().startswith("https://tinyurl.com"):
+            short = resp.text.strip()
+            _tinyurl_cache[url] = short
+            return short
+        # Infra-level failure (rate limit / outage) -> back off so we stop hammering.
+        # A 200 with an "Error" body (TinyURL rejecting one specific URL) is NOT this;
+        # that's a per-URL miss handled by falling through to `return None`.
+        if resp.status_code == 429 or resp.status_code >= 500:
+            _shorten_cooldown_until = time.time() + 60
+            logger.warning(
+                f"TinyURL returned {resp.status_code}; backing off shortening for 60s"
+            )
+    except Exception as e:
+        logger.warning(f"TinyURL shortening failed for {url}: {e}")
+    return None
+
+
 def shorten_dexerto_url_in_text(text: str) -> str:
     """Replace the first dexerto.com URL in text with a TinyURL. No-op on failure."""
     import re
-    import requests
     match = re.search(r'https?://(?:www\.)?dexerto\.com/\S+', text)
     if not match:
         return text
     original_url = match.group(0).rstrip(')')
-    try:
-        resp = requests.get(
-            "https://tinyurl.com/api-create.php",
-            params={"url": original_url},
-            timeout=5,
-        )
-        if resp.status_code == 200 and resp.text.strip().startswith("https://tinyurl.com"):
-            return text.replace(original_url, resp.text.strip())
-    except Exception as e:
-        logger.warning(f"TinyURL shortening failed for {original_url}: {e}")
+    short = _shorten_url(original_url)
+    if short:
+        return text.replace(original_url, short)
     return text
 
-_tinyurl_cache: dict[str, str] = {}
 
 def shorten_urls_in_text(text: str) -> str:
-    """Replace all HTTP URLs in text with TinyURLs, skipping video.twimg.com and tinyurl.com."""
+    """Replace HTTP URLs in text with TinyURLs. Skips video.twimg.com, tinyurl.com,
+    t.co, and URLs already short enough not to benefit (see config.URL_SHORTEN_MIN_LENGTH)."""
     import re
-    import requests
 
     urls = re.findall(r'https?://\S+', text)
     seen: set[str] = set()
@@ -359,28 +402,11 @@ def shorten_urls_in_text(text: str) -> str:
         if url in seen:
             continue
         seen.add(url)
-        if 'video.twimg.com' in url or 'tinyurl.com' in url:
+        if 'video.twimg.com' in url or 'tinyurl.com' in url or 't.co/' in url:
             continue
-        if url in _tinyurl_cache:
-            short = _tinyurl_cache[url]
-            if short != url:
-                text = text.replace(url, short)
-            continue
-        try:
-            resp = requests.get(
-                "https://tinyurl.com/api-create.php",
-                params={"url": url},
-                timeout=5,
-            )
-            if resp.status_code == 200 and resp.text.strip().startswith("https://tinyurl.com"):
-                short = resp.text.strip()
-                _tinyurl_cache[url] = short
-                text = text.replace(url, short)
-            else:
-                _tinyurl_cache[url] = url
-        except Exception as e:
-            logger.warning(f"TinyURL shortening failed for {url}: {e}")
-            _tinyurl_cache[url] = url
+        short = _shorten_url(url)
+        if short and short != url:
+            text = text.replace(url, short)
     return text
 
 def clean_text_content(text):
@@ -549,16 +575,18 @@ def strip_wire_prefixes(text):
 
     import re
 
-    # Strip leading emojis/symbols before checking for prefixes
-    # Handles cases like "🚨JUST IN:" or "🚨 BREAKING:"
-    text = re.sub(r'^[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u26A0\u203C\u2757\u2755\u274C\u274E\u2705\u267B\uFE0F]+\s*', '', text)
-
-    # Match common wire-service prefixes at the start of text
-    # Handles optional space before colon: "JUST IN:" and "JUST IN :"
-    # Case-insensitive to catch "New:", "Breaking:", etc.
+    # Strip wire-service prefix labels (JUST IN:, BREAKING:, ICYMI:, etc.), but
+    # preserve any leading emoji run by capturing and re-emitting it, so only the
+    # label is removed:
+    #   "🚨BREAKING: Bitcoin" -> "🚨 Bitcoin";  "BREAKING: Bitcoin" -> "Bitcoin"
+    #   "🔥 Bitcoin up"        -> "🔥 Bitcoin up"  (no label, emoji kept)
+    # Matches an ASCII or fullwidth ("：", common in CJK/Korea-sourced posts) colon
+    # with optional surrounding spaces; case-insensitive.
+    emoji_lead = r'[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u26A0\u203C\u2757\u2755\u274C\u274E\u2705\u267B\uFE0F]'
     text = re.sub(
-        r'^(JUST IN|BREAKING|NEW|DEVELOPING|EXCLUSIVE|ALERT|FLASH|URGENT|UPDATE|REPORT|WATCH|LIVE|SCOOP|HAPPENING NOW)\s*:\s*',
-        '',
+        rf'^(?P<emoji>{emoji_lead}+)?\s*'
+        r'(?:JUST IN|BREAKING|NEW|DEVELOPING|EXCLUSIVE|ALERT|FLASH|URGENT|UPDATE|REPORT|WATCH|LIVE|SCOOP|HAPPENING NOW|ICYMI)\s*[:：]\s*',
+        lambda m: (m.group('emoji') + ' ') if m.group('emoji') else '',
         text,
         flags=re.IGNORECASE
     )
@@ -566,6 +594,79 @@ def strip_wire_prefixes(text):
     text = text.strip()
 
     return text
+
+
+# Canonical X cashtag codes -> ticker symbol. When a poster uses X's cashtag
+# picker, X stores the linked cashtag in the tweet's raw text as a "<chain>:<id>"
+# code (e.g. "$BTC" -> "bitcoin:native", "$SOL" -> the native SOL mint). The
+# human-readable "$TICKER" is rendered client-side by X from metadata that
+# gallery-dl discards, so we map the codes back here. Extend by adding a line;
+# verify the exact left-side code against bot.log when a new coin first appears
+# (X's chain-prefix naming isn't documented). Unknown codes are left unchanged.
+CRYPTO_TICKER_CODES = {
+    # confirmed from bot.log
+    "bitcoin:native": "BTC",
+    "ethereum:native": "ETH",
+    "solana:So11111111111111111111111111111111111111112": "SOL",  # native/wrapped SOL
+    # other major native coins (best-guess prefixes; no-op until they appear)
+    "solana:native": "SOL",
+    "dogecoin:native": "DOGE",
+    "litecoin:native": "LTC",
+    "ripple:native": "XRP",
+    "xrp:native": "XRP",
+    "cardano:native": "ADA",
+    "avalanche:native": "AVAX",
+    "polkadot:native": "DOT",
+    "tron:native": "TRX",
+    # common Solana stablecoin mints
+    "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "solana:Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+}
+
+
+def normalize_crypto_tickers(text):
+    """
+    Rewrite X's canonical cashtag codes back to readable $TICKER symbols.
+
+    X stores cashtags added via its picker as a "<chain>:<id>" code in the
+    tweet's raw text, e.g.:
+        "$BTC" -> "bitcoin:native"
+        "$ETH" -> "ethereum:native"
+        "$SOL" -> "solana:So11111111111111111111111111111111111111112"
+    The display "$TICKER" is rendered client-side and never reaches us, so we
+    translate the known codes via CRYPTO_TICKER_CODES. Unknown codes (e.g. an
+    obscure SPL token address) are left unchanged.
+
+    Examples:
+        "bitcoin:native hits $65K"   -> "$BTC hits $65K"
+        "...solana:So111...112 $70"  -> "...$SOL $70"
+
+    Args:
+        text: Tweet text possibly containing canonical cashtag codes
+
+    Returns:
+        str: Text with known codes replaced by $TICKER
+    """
+    if not text:
+        return text
+
+    import re
+
+    # Case-insensitive lookup; base58 mints don't collide case-insensitively.
+    lookup = {code.lower(): ticker for code, ticker in CRYPTO_TICKER_CODES.items()}
+
+    # Alternation of the known codes, longest-first so the most specific match
+    # (e.g. a full mint address) wins. Word boundaries avoid touching substrings.
+    pattern = r'\b(?:' + '|'.join(
+        re.escape(code) for code in sorted(CRYPTO_TICKER_CODES, key=len, reverse=True)
+    ) + r')\b'
+
+    return re.sub(
+        pattern,
+        lambda m: '$' + lookup[m.group(0).lower()],
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def is_audience_question(content: str) -> bool:
@@ -703,7 +804,10 @@ def remove_twitter_attribution(text):
         
         "Text content NewsWire (@NewsWire_US) Oct 31, 2025"
         -> "Text content"
-    
+
+        "Text content\n— @Polymarket Jun 10, 2026"
+        -> "Text content"
+
     Args:
         text: Tweet text potentially containing attribution
     
@@ -727,7 +831,16 @@ def remove_twitter_attribution(text):
         # Remove the matched attribution
         cleaned_text = text[:match.start()].rstrip()
         return cleaned_text
-    
+
+    # Strategy 1b: Match bare @handle (no parentheses) with date at the end
+    # Matches: "— @handle Month Day, Year" — format from rss.app feeds
+    bare_handle_pattern = r'\n?[—\-]\s*@\w+\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\s*$'
+    bare_match = re.search(bare_handle_pattern, text)
+
+    if bare_match:
+        cleaned_text = text[:bare_match.start()].rstrip()
+        return cleaned_text
+
     # Strategy 2: Look for a dash before the handle (original logic)
     # Find all Twitter handles in the format (@username)
     handle_pattern = r'\(@\w+\)'

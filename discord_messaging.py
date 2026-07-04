@@ -16,6 +16,14 @@ from removed_entries import RemovedEntriesDB
 from discord_commands import register_commands
 
 
+def _format_category_tag(primary, secondary=None):
+    """Format the bold category tag(s) for unified channel mode."""
+    tag = f"**[{primary.title()}]**"
+    if secondary and secondary != primary:
+        tag += f" **[{secondary.title()}]**"
+    return tag
+
+
 class DiscordPoster:
     """Posts messages to Discord channels with context menu command support"""
 
@@ -219,7 +227,7 @@ class DiscordPoster:
 
     @retry_with_backoff(max_retries=3, initial_delay=2)
     async def post_message(self, category, content, media_files=None, video_urls=None, source_type=None,
-                          entry_id=None, display_category=None):
+                          entry_id=None, display_category=None, secondary_category=None):
         """
         Post a message to Discord channel (context menu commands only — no buttons)
 
@@ -283,7 +291,8 @@ class DiscordPoster:
             # Prepend bold category tag in unified channel mode
             tag_cat = display_category or category
             if config.UNIFIED_CHANNEL_MODE and category != config.DEFAULT_CATEGORY:
-                message_text = f"**[{tag_cat.title()}]**\n{message_text}"
+                tag = _format_category_tag(tag_cat, secondary_category)
+                message_text = f"{tag}\n{message_text}"
 
             # Determine whether to suppress embeds using Discord's native API
             suppress_embeds = True  # Default: suppress all embeds
@@ -433,12 +442,13 @@ class DiscordPoster:
                 original_ai_cat = (old_info.get('original_category') if old_info else None) or new_category
                 if not original_ai_cat or original_ai_cat == config.DEFAULT_CATEGORY:
                     original_ai_cat = new_category
+                secondary_cat = old_info.get('secondary_category') if old_info else None
                 _base = ensure_url_on_own_line(content)
                 _url_count = len(re.findall(r'https?://\S+', _base))
                 _is_dexerto = 'dexerto.com' in _base
                 if _url_count <= 1 or _is_dexerto:
                     _base = await asyncio.to_thread(shorten_urls_in_text, _base)
-                new_text = f"**[{original_ai_cat.title()}]**\n{_base}"
+                new_text = f"{_format_category_tag(original_ai_cat, secondary_cat)}\n{_base}"
 
                 if original_message.embeds and not original_message.content:
                     if len(new_text) > 4093:
@@ -531,6 +541,7 @@ class DiscordPoster:
             original_ai_cat = (cross_info.get('original_category') if cross_info else None) or new_category
             if not original_ai_cat or original_ai_cat == config.DEFAULT_CATEGORY:
                 original_ai_cat = new_category
+            secondary_cat = cross_info.get('secondary_category') if cross_info else None
 
             # Post to new channel
             success, new_message_id, new_channel_id = await self.post_message(
@@ -541,6 +552,7 @@ class DiscordPoster:
                 source_type=source_type,
                 entry_id=None,  # no nonce — avoids 5-min deduplication collision with the just-deleted original
                 display_category=original_ai_cat,
+                secondary_category=secondary_cat,
             )
 
             # Clean up downloaded temporary files
@@ -659,6 +671,7 @@ class DiscordPoster:
             # Get the old category from database for logging
             old_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
             old_category = old_info.get('category') if old_info else 'unknown'
+            secondary_cat = old_info.get('secondary_category') if old_info else None
 
             # Build new text with updated category tag
             _base = ensure_url_on_own_line(content)
@@ -666,7 +679,7 @@ class DiscordPoster:
             _is_dexerto = 'dexerto.com' in _base
             if _url_count <= 1 or _is_dexerto:
                 _base = await asyncio.to_thread(shorten_urls_in_text, _base)
-            new_text = f"**[{new_category.title()}]**\n{_base}"
+            new_text = f"{_format_category_tag(new_category, secondary_cat)}\n{_base}"
 
             # Re-append hidden video URL links so the embed persists (same logic as post_message)
             suppress_embeds = True
@@ -720,7 +733,7 @@ class DiscordPoster:
             return False, str(e)
 
     @retry_with_backoff(max_retries=3, initial_delay=2)
-    async def edit_message(self, channel_id, message_id, content, source_type=None, category=None):
+    async def edit_message(self, channel_id, message_id, content, source_type=None, category=None, secondary_category=None):
         """
         Edit an existing Discord message
 
@@ -762,7 +775,8 @@ class DiscordPoster:
 
             # Re-prepend category tag in unified channel mode
             if config.UNIFIED_CHANNEL_MODE and category and category != config.DEFAULT_CATEGORY:
-                message_text = f"**[{category.title()}]**\n{message_text}"
+                tag = _format_category_tag(category, secondary_category)
+                message_text = f"{tag}\n{message_text}"
 
             # For edits, always suppress embeds by default
             # (edit_message doesn't receive video_urls parameter, so we keep it simple)

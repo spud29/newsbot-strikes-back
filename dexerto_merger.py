@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 
+import config
 from db_connection import get_db_connection
 from utils import logger
 
@@ -57,7 +58,7 @@ class DexertoMerger:
     that have been waiting too long with no follow-up.
     """
 
-    def __init__(self, db, process_entry_fn, max_pending_hours: float = 4.0):
+    def __init__(self, db, process_entry_fn, max_pending_hours: float = 1.0):
         """
         Args:
             db: Database instance (for mark_processed)
@@ -224,10 +225,12 @@ class DexertoMerger:
         """
         link = entry.get('link')
         if not link:
+            logger.debug(f"DexertoMerger: no link in entry {entry.get('id')} — skipping conversation fetch")
             return None, None
 
         cmd = [
             sys.executable, '-m', 'gallery_dl',
+            '--config', config.GALLERY_DL_CONFIG,
             '--dump-json',
             '--no-download',
             '--option', 'extractor.twitter.conversations=true',
@@ -276,6 +279,10 @@ class DexertoMerger:
                 )
                 return follow_up, tweet2_entry_id
 
+        logger.debug(
+            f"DexertoMerger: conversation fetch got {len(items)} items for "
+            f"{entry.get('id')} but none matched tweet2 criteria"
+        )
         return None, None
 
     # ------------------------------------------------------------------
