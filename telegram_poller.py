@@ -6,8 +6,8 @@ from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 import asyncio
 import json
 import os
-from utils import logger, retry_with_backoff, clean_text_content, resolve_shortened_urls, strip_wire_prefixes, remove_telegram_formatting
-from db_connection import get_db_connection
+from utils import logger, retry_with_backoff, clean_text_content, resolve_shortened_urls, strip_wire_prefixes, remove_telegram_formatting, clean_dropstab_content
+from db_connection import get_db_connection, get_db_lock
 import config
 
 class TelegramPoller:
@@ -24,6 +24,7 @@ class TelegramPoller:
         self.message_queue = asyncio.Queue()  # Queue for real-time messages
         self.edit_queue = asyncio.Queue()  # Queue for edited messages
         self.event_handlers_setup = False
+        self._channel_id_to_name = {}  # entity.id -> channel_name, built in setup_event_handlers
         
         # Buffer for grouping album messages in real-time
         self.album_buffer = {}  # grouped_id -> list of parsed entries
@@ -66,6 +67,7 @@ class TelegramPoller:
                 try:
                     entity = await self.client.get_entity(channel_name)
                     channel_entities.append(entity)
+                    self._channel_id_to_name[entity.id] = channel_name
                     logger.debug(f"Registered event handler for channel: {channel_name}")
                 except Exception as e:
                     logger.error(f"Failed to get entity for {channel_name}: {e}")
@@ -95,22 +97,14 @@ class TelegramPoller:
         """
         try:
             message = event.message
-            
-            # Get channel name from the chat
-            channel_name = None
-            for ch_name in self.channels:
-                try:
-                    entity = await self.client.get_entity(ch_name)
-                    if entity.id == message.peer_id.channel_id:
-                        channel_name = ch_name
-                        break
-                except:
-                    continue
-            
+
+            # Look up channel name from the prebuilt id->name map (O(1), no API calls)
+            channel_name = self._channel_id_to_name.get(message.peer_id.channel_id)
+
             if not channel_name:
                 logger.warning(f"Received message from unknown channel: {message.peer_id}")
                 return
-            
+
             logger.info(f"Real-time message received from {channel_name}: ID {message.id}")
             
             # Parse the message
@@ -140,22 +134,14 @@ class TelegramPoller:
         """
         try:
             message = event.message
-            
-            # Get channel name from the chat
-            channel_name = None
-            for ch_name in self.channels:
-                try:
-                    entity = await self.client.get_entity(ch_name)
-                    if entity.id == message.peer_id.channel_id:
-                        channel_name = ch_name
-                        break
-                except:
-                    continue
-            
+
+            # Look up channel name from the prebuilt id->name map (O(1), no API calls)
+            channel_name = self._channel_id_to_name.get(message.peer_id.channel_id)
+
             if not channel_name:
                 logger.warning(f"Received edited message from unknown channel: {message.peer_id}")
                 return
-            
+
             logger.info(f"Message edited in {channel_name}: ID {message.id}")
             
             # Parse the edited message
@@ -258,7 +244,7 @@ class TelegramPoller:
         logger.info(f"Flushing album with {len(entries)} messages (grouped_id: {grouped_id})")
         
         # Group the album messages using the same logic as batch polling
-        grouped_entries = self._group_albums(entries)
+        grouped_entries = await self._group_albums(entries)
         
         # Add grouped entry to queue
         for entry in grouped_entries:
@@ -268,28 +254,30 @@ class TelegramPoller:
     def _load_last_message_ids(self):
         """
         Load last message IDs from SQLite
-        
+
         Returns:
             dict: Channel name to last message ID mapping
         """
         try:
-            rows = self.conn.execute("SELECT channel_name, message_id FROM last_message_ids").fetchall()
-            data = {row['channel_name']: row['message_id'] for row in rows}
+            with get_db_lock():
+                rows = self.conn.execute("SELECT channel_name, message_id FROM last_message_ids").fetchall()
+                data = {row['channel_name']: row['message_id'] for row in rows}
             logger.debug(f"Loaded last message IDs: {data}")
             return data
         except Exception as e:
             logger.error(f"Error loading last message IDs: {e}")
-        
+
         return {}
-    
+
     def _save_last_message_id(self, channel_name, message_id):
         """Save a single last message ID to SQLite"""
         try:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO last_message_ids (channel_name, message_id) VALUES (?, ?)",
-                (channel_name, message_id)
-            )
-            self.conn.commit()
+            with get_db_lock():
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO last_message_ids (channel_name, message_id) VALUES (?, ?)",
+                    (channel_name, message_id)
+                )
+                self.conn.commit()
             logger.debug(f"Saved last message ID for {channel_name}: {message_id}")
         except Exception as e:
             logger.error(f"Error saving last message ID: {e}")
@@ -385,9 +373,12 @@ class TelegramPoller:
             # Get message text and clean it
             content = message.text or message.message or ''
             content = clean_text_content(content)
-            content = resolve_shortened_urls(content)
+            content = await asyncio.to_thread(resolve_shortened_urls, content)
             content = strip_wire_prefixes(content)
             content = remove_telegram_formatting(content, channel_name)
+            # Strip boilerplate referral/footer noise from dropstab analytics posts
+            if channel_name == 'drops_analytics':
+                content = clean_dropstab_content(content)
 
             # Get timestamp
             timestamp = message.date.timestamp() if message.date else None
@@ -452,18 +443,18 @@ class TelegramPoller:
                 continue
         
         # Group messages by grouped_id to handle albums
-        all_entries = self._group_albums(all_entries)
+        all_entries = await self._group_albums(all_entries)
         
         logger.info(f"Total Telegram messages collected: {len(all_entries)}")
         return all_entries
     
-    def _group_albums(self, entries):
+    async def _group_albums(self, entries):
         """
         Group messages that are part of media albums
-        
+
         Args:
             entries: List of message entries
-        
+
         Returns:
             list: Entries with albums grouped together
         """
@@ -491,9 +482,11 @@ class TelegramPoller:
             # Combine content from all messages in album and clean it
             combined_content = ' '.join([e.get('content', '') for e in group_entries if e.get('content')])
             combined_content = clean_text_content(combined_content)
-            combined_content = resolve_shortened_urls(combined_content)
+            combined_content = await asyncio.to_thread(resolve_shortened_urls, combined_content)
             combined_content = strip_wire_prefixes(combined_content)
             combined_content = remove_telegram_formatting(combined_content, base_entry.get('source'))
+            if base_entry.get('source') == 'drops_analytics':
+                combined_content = clean_dropstab_content(combined_content)
             base_entry['content'] = combined_content
             result.append(base_entry)
         

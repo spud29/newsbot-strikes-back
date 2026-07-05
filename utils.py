@@ -978,6 +978,52 @@ def is_all_caps(text, threshold=0.65):
     return ratio >= threshold
 
 
+def clean_dropstab_content(text):
+    """
+    Remove boilerplate/referral noise from drops_analytics Telegram messages.
+
+    Strips:
+    - "👀Add Notifications" CTA
+    - "➕  [Ticker](t.me/Drops…)" and similar referral link lines
+    - "💧 [Token Unlocks and Vesting Schedules](…)" footer
+    - "💧 [DropsTab](…)" footer
+
+    The useful market/event data in-between is preserved.
+
+    Args:
+        text: Raw dropstab analytics text (may contain Markdown-style links)
+
+    Returns:
+        str: Cleaned text with noise lines removed and whitespace normalized
+    """
+    if not text:
+        return text
+
+    import re
+
+    lines = text.split('\n')
+    kept = []
+
+    for line in lines:
+        stripped = line.strip()
+        # Remove bare CTA lines
+        if stripped == '👀Add Notifications':
+            continue
+        # Remove referral link lines:  ➕  [ticker](t.me/Drops...)
+        if re.match(r'➕\s+\[.*?\]\(https?://t\.me/Drops', stripped):
+            continue
+        # Remove source footer:  💧 [Token Unlocks and Vesting Schedules](...)
+        if re.match(r'💧\s+\[.*?\]\(https?://dropstab\.com/insights/', stripped):
+            continue
+        # Remove source footer:  💧 [DropsTab](...)
+        if re.match(r'💧\s+\[.*?\]\(https?://dropstab\.com/tab/', stripped):
+            continue
+        kept.append(line)
+
+    text = '\n'.join(kept).strip()
+    return text
+
+
 def remove_telegram_formatting(text, channel_name=None):
     """
     Remove Telegram formatting markup and channel usernames
