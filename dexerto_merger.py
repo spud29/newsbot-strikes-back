@@ -21,7 +21,7 @@ import sys
 import time
 
 import config
-from db_connection import get_db_connection
+from db_connection import get_db_connection, get_db_lock
 from utils import logger
 
 DEXERTO_URL_PATTERN = re.compile(r'https?://(?:(?:www\.)?dexerto\.com|t\.co)/\S+')
@@ -100,10 +100,11 @@ class DexertoMerger:
         """
         conn = get_db_connection()
         cutoff = time.time() - self._max_age
-        rows = conn.execute(
-            "SELECT entry_id, entry_json, buffered_at FROM dexerto_pending WHERE buffered_at < ?",
-            (cutoff,)
-        ).fetchall()
+        with get_db_lock():
+            rows = conn.execute(
+                "SELECT entry_id, entry_json, buffered_at FROM dexerto_pending WHERE buffered_at < ?",
+                (cutoff,)
+            ).fetchall()
 
         for entry_id, entry_json, buffered_at in rows:
             age_hours = (time.time() - buffered_at) / 3600
@@ -139,8 +140,9 @@ class DexertoMerger:
                 success = False
 
             if success or self._db.is_processed(entry_id):
-                conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
-                conn.commit()
+                with get_db_lock():
+                    conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
+                    conn.commit()
             else:
                 logger.warning(
                     f"DexertoMerger: stale flush of {entry_id} did not complete — "
@@ -152,15 +154,36 @@ class DexertoMerger:
     # ------------------------------------------------------------------
 
     async def _handle_headline_tweet(self, entry: dict) -> bool:
-        """Store tweet 1 (headline) in the pending table."""
+        """Store tweet 1 (headline) in the pending table.
+
+        If the entry is already pending (re-encountered on a later poll cycle),
+        update the JSON but preserve the original buffered_at so the staleness
+        timer isn't perpetually reset.
+        """
         entry_id = entry['id']
         conn = get_db_connection()
-        conn.execute(
-            "INSERT OR REPLACE INTO dexerto_pending (entry_id, entry_json, buffered_at) VALUES (?, ?, ?)",
-            (entry_id, json.dumps(entry), time.time())
-        )
-        conn.commit()
-        logger.info(f"DexertoMerger: buffered headline {entry_id} (waiting for follow-up tweet)")
+        with get_db_lock():
+            existing = conn.execute(
+                "SELECT buffered_at FROM dexerto_pending WHERE entry_id = ?",
+                (entry_id,)
+            ).fetchone()
+            if existing:
+                # Already pending — refresh entry_json but keep original buffered_at
+                conn.execute(
+                    "UPDATE dexerto_pending SET entry_json = ? WHERE entry_id = ?",
+                    (json.dumps(entry), entry_id)
+                )
+                logger.debug(
+                    f"DexertoMerger: refreshed pending headline {entry_id} "
+                    f"(buffered {time.time() - existing[0]:.0f}s ago, waiting for follow-up)"
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO dexerto_pending (entry_id, entry_json, buffered_at) VALUES (?, ?, ?)",
+                    (entry_id, json.dumps(entry), time.time())
+                )
+                logger.info(f"DexertoMerger: buffered headline {entry_id} (waiting for follow-up tweet)")
+            conn.commit()
         return True  # consumed — do NOT call process_entry for this entry yet
 
     async def _handle_follow_up_tweet(self, entry: dict) -> bool:
@@ -169,9 +192,10 @@ class DexertoMerger:
         follow_up_content = re.sub(r'\n{2,}', '\n', entry.get('content', '').strip())
 
         conn = get_db_connection()
-        row = conn.execute(
-            "SELECT entry_id, entry_json FROM dexerto_pending ORDER BY buffered_at DESC LIMIT 1"
-        ).fetchone()
+        with get_db_lock():
+            row = conn.execute(
+                "SELECT entry_id, entry_json FROM dexerto_pending ORDER BY buffered_at DESC LIMIT 1"
+            ).fetchone()
 
         if not row:
             # No pending headline. This means tweet 1 was already processed on a
@@ -186,8 +210,9 @@ class DexertoMerger:
         headline_entry_id, entry_json = row
 
         # Remove matched headline from pending table
-        conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (headline_entry_id,))
-        conn.commit()
+        with get_db_lock():
+            conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (headline_entry_id,))
+            conn.commit()
 
         headline_entry = json.loads(entry_json)
 
@@ -292,11 +317,12 @@ class DexertoMerger:
     def _ensure_table(self):
         """Create the dexerto_pending table if it doesn't exist."""
         conn = get_db_connection()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dexerto_pending (
-                entry_id   TEXT PRIMARY KEY,
-                entry_json TEXT NOT NULL,
-                buffered_at REAL NOT NULL
-            )
-        """)
-        conn.commit()
+        with get_db_lock():
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dexerto_pending (
+                    entry_id   TEXT PRIMARY KEY,
+                    entry_json TEXT NOT NULL,
+                    buffered_at REAL NOT NULL
+                )
+            """)
+            conn.commit()

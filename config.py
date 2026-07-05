@@ -48,7 +48,7 @@ GALLERY_DL_CONFIG = r"C:\Users\spud9\AppData\Roaming\gallery-dl\config.json"
 # Dexerto posts stories as two tweets: tweet 1 = headline, tweet 2 = blurb + article URL.
 # Tweet 1 is held in the dexerto_pending SQLite table until tweet 2 arrives (survives restarts).
 # If no follow-up arrives within this window, tweet 1 is posted alone during the cleanup cycle.
-DEXERTO_PENDING_MAX_AGE_HOURS = 4.0
+DEXERTO_PENDING_MAX_AGE_HOURS = 1.0
 
 # RSS Feed URLs
 RSS_FEEDS = {
@@ -92,6 +92,10 @@ VALID_CATEGORIES = [
 
 # Default category for uncertain/unmatched content
 DEFAULT_CATEGORY = "ignore"
+
+# Fallback category when AI says 'ignore' and user un-ignores an entry via
+# "Move to Channel" or /move. Must be a valid non-ignore category.
+FALLBACK_CATEGORY = "general news"
 
 # Pause Mode - When enabled, ALL entries are routed to the 'ignore' channel
 # regardless of their AI categorization. The original category is preserved in reasoning.
