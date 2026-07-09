@@ -502,8 +502,12 @@ class OllamaClient:
         # Only do partial matching if the string is short and non-empty
         # (avoids matching reasoning text, and prevents "" from matching everything)
         if category_normalized and len(category_normalized) < 50:
-            for valid_cat in valid_categories:
-                if valid_cat in category_normalized:
+            # Sort longest-first so more specific categories match before shorter ones
+            # (e.g. "artificial intelligence" matches before "technology" when both could apply)
+            for valid_cat in sorted(valid_categories, key=len, reverse=True):
+                # Use word-boundary matching to prevent "crypto" from matching "cryptocurrency"
+                pattern = r'\b' + re.escape(valid_cat) + r'\b'
+                if re.search(pattern, category_normalized):
                     mapped = valid_cat if valid_cat in config.DISCORD_CHANNELS else config.DEFAULT_CATEGORY
                     logger.debug(f"Partial match: '{category_normalized}' -> '{valid_cat}' -> channel: '{mapped}'")
                     return mapped

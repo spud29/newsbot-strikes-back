@@ -4,8 +4,22 @@ All database classes use get_db_connection() to obtain a single shared connectio
 """
 import sqlite3
 import os
+import threading
 
 _connection = None
+_db_lock = threading.Lock()
+
+
+def get_db_lock():
+    """Return the lock guarding the shared connection.
+
+    SQLite connections are not safe for concurrent use from multiple
+    threads/coroutines even with check_same_thread=False. Every DB op
+    must hold this lock, and methods that mutate the in-memory embeddings
+    cache must hold it across both the DB op and the cache mutation so
+    the cache can't desync from the table.
+    """
+    return _db_lock
 
 
 def get_db_connection(db_path=None):

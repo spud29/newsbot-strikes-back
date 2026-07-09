@@ -6,7 +6,7 @@ import time
 import hashlib
 import numpy as np
 from utils import logger
-from db_connection import get_db_connection
+from db_connection import get_db_connection, get_db_lock
 
 
 class Database:
@@ -32,24 +32,25 @@ class Database:
         """Load all embeddings from SQLite into memory for fast similarity search.
         Pre-converts to numpy arrays and pre-computes L2 norms to avoid
         repeated conversion and norm calculation during find_best_match()."""
-        rows = self.conn.execute(
-            "SELECT content_hash, embedding, timestamp, preview, content, entry_id FROM embeddings"
-        ).fetchall()
+        with get_db_lock():
+            rows = self.conn.execute(
+                "SELECT content_hash, embedding, timestamp, preview, content, entry_id FROM embeddings"
+            ).fetchall()
 
-        self._embeddings_cache = {}
-        for row in rows:
-            embedding_list = json.loads(row['embedding'])
-            embedding_np = np.array(embedding_list)
-            norm = np.linalg.norm(embedding_np)
-            self._embeddings_cache[row['content_hash']] = {
-                'embedding': embedding_list,
-                'embedding_np': embedding_np,
-                'norm': norm,
-                'timestamp': row['timestamp'],
-                'preview': row['preview'],
-                'content': row['content'],
-                'entry_id': row['entry_id']
-            }
+            self._embeddings_cache = {}
+            for row in rows:
+                embedding_list = json.loads(row['embedding'])
+                embedding_np = np.array(embedding_list)
+                norm = np.linalg.norm(embedding_np)
+                self._embeddings_cache[row['content_hash']] = {
+                    'embedding': embedding_list,
+                    'embedding_np': embedding_np,
+                    'norm': norm,
+                    'timestamp': row['timestamp'],
+                    'preview': row['preview'],
+                    'content': row['content'],
+                    'entry_id': row['entry_id']
+                }
     
     def is_processed(self, entry_id):
         """
@@ -61,10 +62,11 @@ class Database:
         Returns:
             bool: True if already processed
         """
-        row = self.conn.execute(
-            "SELECT 1 FROM processed_ids WHERE entry_id = ?", (entry_id,)
-        ).fetchone()
-        return row is not None
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT 1 FROM processed_ids WHERE entry_id = ?", (entry_id,)
+            ).fetchone()
+            return row is not None
     
     def mark_processed(self, entry_id):
         """
@@ -73,11 +75,12 @@ class Database:
         Args:
             entry_id: Unique identifier to mark as processed
         """
-        self.conn.execute(
-            "INSERT OR REPLACE INTO processed_ids (entry_id, timestamp) VALUES (?, ?)",
-            (entry_id, time.time())
-        )
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute(
+                "INSERT OR REPLACE INTO processed_ids (entry_id, timestamp) VALUES (?, ?)",
+                (entry_id, time.time())
+            )
+            self.conn.commit()
         logger.debug(f"Marked as processed: {entry_id}")
     
     def add_embedding(self, content, embedding, entry_id=None):
@@ -96,44 +99,31 @@ class Database:
         embedding_list = embedding if isinstance(embedding, list) else embedding.tolist()
         now = time.time()
         preview = content[:100]
-        
-        self.conn.execute(
-            """INSERT OR REPLACE INTO embeddings 
-               (content_hash, embedding, timestamp, preview, content, entry_id) 
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (content_hash, json.dumps(embedding_list), now, preview, content, entry_id)
-        )
-        self.conn.commit()
-        
-        # Keep in-memory cache in sync (pre-compute numpy array and norm)
-        embedding_np = np.array(embedding_list)
-        norm = np.linalg.norm(embedding_np)
-        self._embeddings_cache[content_hash] = {
-            'embedding': embedding_list,
-            'embedding_np': embedding_np,
-            'norm': norm,
-            'timestamp': now,
-            'preview': preview,
-            'content': content,
-            'entry_id': entry_id
-        }
+
+        with get_db_lock():
+            self.conn.execute(
+                """INSERT OR REPLACE INTO embeddings
+                   (content_hash, embedding, timestamp, preview, content, entry_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (content_hash, json.dumps(embedding_list), now, preview, content, entry_id)
+            )
+            self.conn.commit()
+
+            # Keep in-memory cache in sync (pre-compute numpy array and norm)
+            embedding_np = np.array(embedding_list)
+            norm = np.linalg.norm(embedding_np)
+            self._embeddings_cache[content_hash] = {
+                'embedding': embedding_list,
+                'embedding_np': embedding_np,
+                'norm': norm,
+                'timestamp': now,
+                'preview': preview,
+                'content': content,
+                'entry_id': entry_id
+            }
         
         logger.debug(f"Stored embedding for: {content[:50]}...")
         return content_hash
-
-    def delete_embedding_by_entry_id(self, entry_id):
-        """Remove an embedding by its entry_id from both DB and in-memory cache."""
-        # Remove from DB
-        self.conn.execute("DELETE FROM embeddings WHERE entry_id = ?", (entry_id,))
-        self.conn.commit()
-
-        # Remove from in-memory cache
-        to_remove = [k for k, v in self._embeddings_cache.items() if v.get('entry_id') == entry_id]
-        for key in to_remove:
-            del self._embeddings_cache[key]
-
-        if to_remove:
-            logger.info(f"Deleted embedding for superseded entry: {entry_id}")
 
     def find_best_match(self, embedding):
         """
@@ -239,30 +229,36 @@ class Database:
         import config
         current_time = time.time()
         cutoff_time = current_time - (config.DB_RETENTION_HOURS * 3600)
-        
-        # Clean processed IDs
-        cursor = self.conn.execute(
-            "DELETE FROM processed_ids WHERE timestamp < ?", (cutoff_time,)
-        )
-        deleted_ids = cursor.rowcount
-        
+
+        with get_db_lock():
+            # Clean processed IDs
+            cursor = self.conn.execute(
+                "DELETE FROM processed_ids WHERE timestamp < ?", (cutoff_time,)
+            )
+            deleted_ids = cursor.rowcount
+
+            # Clean embeddings: capture content_hashes before DELETE so we can
+            # drop them from the in-memory cache without a full reload.
+            stale_hashes = [
+                row['content_hash'] for row in
+                self.conn.execute(
+                    "SELECT content_hash FROM embeddings WHERE timestamp < ?", (cutoff_time,)
+                ).fetchall()
+            ]
+            cursor = self.conn.execute(
+                "DELETE FROM embeddings WHERE timestamp < ?", (cutoff_time,)
+            )
+            deleted_embeddings = cursor.rowcount
+
+            for ch in stale_hashes:
+                self._embeddings_cache.pop(ch, None)
+
+            self.conn.commit()
+
         if deleted_ids:
             logger.info(f"Cleaned up {deleted_ids} old processed IDs")
-        
-        # Clean embeddings
-        cursor = self.conn.execute(
-            "DELETE FROM embeddings WHERE timestamp < ?", (cutoff_time,)
-        )
-        deleted_embeddings = cursor.rowcount
-        
         if deleted_embeddings:
             logger.info(f"Cleaned up {deleted_embeddings} old embeddings")
-        
-        self.conn.commit()
-        
-        # Refresh in-memory cache if embeddings were removed
-        if deleted_embeddings:
-            self._load_embeddings_cache()
     
     def get_stats(self):
         """
@@ -271,10 +267,11 @@ class Database:
         Returns:
             dict: Statistics about the database
         """
-        processed_count = self.conn.execute("SELECT COUNT(*) FROM processed_ids").fetchone()[0]
-        embeddings_count = len(self._embeddings_cache)
-        mapping_count = self.conn.execute("SELECT COUNT(*) FROM message_mapping").fetchone()[0]
-        
+        with get_db_lock():
+            processed_count = self.conn.execute("SELECT COUNT(*) FROM processed_ids").fetchone()[0]
+            embeddings_count = len(self._embeddings_cache)
+            mapping_count = self.conn.execute("SELECT COUNT(*) FROM message_mapping").fetchone()[0]
+
         return {
             'processed_ids': processed_count,
             'embeddings': embeddings_count,
@@ -301,31 +298,32 @@ class Database:
             secondary_category: Optional second category for cross-topic entries
             original_secondary_category: AI's initial secondary category before user changes
         """
-        self.conn.execute(
-            """INSERT OR REPLACE INTO message_mapping
-               (entry_id, telegram_message_id, discord_channel_id, discord_message_id,
-                content, source_url, video_urls, category, source_type, reasoning, timestamp,
-                original_category, placement_reason, secondary_category, original_secondary_category)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                telegram_entry_id,
-                telegram_message_id,
-                discord_channel_id,
-                discord_message_id,
-                content,
-                source_url,
-                json.dumps(video_urls) if video_urls else '[]',
-                category,
-                source_type,
-                reasoning,
-                time.time(),
-                original_category if original_category is not None else category,
-                placement_reason,
-                secondary_category,
-                original_secondary_category if original_secondary_category is not None else secondary_category
+        with get_db_lock():
+            self.conn.execute(
+                """INSERT OR REPLACE INTO message_mapping
+                   (entry_id, telegram_message_id, discord_channel_id, discord_message_id,
+                    content, source_url, video_urls, category, source_type, reasoning, timestamp,
+                    original_category, placement_reason, secondary_category, original_secondary_category)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    telegram_entry_id,
+                    telegram_message_id,
+                    discord_channel_id,
+                    discord_message_id,
+                    content,
+                    source_url,
+                    json.dumps(video_urls) if video_urls else '[]',
+                    category,
+                    source_type,
+                    reasoning,
+                    time.time(),
+                    original_category if original_category is not None else category,
+                    placement_reason,
+                    secondary_category,
+                    original_secondary_category if original_secondary_category is not None else secondary_category
+                )
             )
-        )
-        self.conn.commit()
+            self.conn.commit()
 
         logger.debug(f"Stored message mapping: {telegram_entry_id} -> Discord {discord_message_id} (category: {category}, source_type: {source_type})")
     
@@ -339,31 +337,32 @@ class Database:
         Returns:
             dict: Discord message info or None if not found
         """
-        row = self.conn.execute(
-            "SELECT * FROM message_mapping WHERE entry_id = ?", (telegram_entry_id,)
-        ).fetchone()
-        
-        if row is None:
-            return None
-        
-        keys = row.keys()
-        return {
-            'telegram_message_id': row['telegram_message_id'],
-            'discord_channel_id': row['discord_channel_id'],
-            'discord_message_id': row['discord_message_id'],
-            'content': row['content'],
-            'source_url': row['source_url'],
-            'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
-            'category': row['category'],
-            'source_type': row['source_type'],
-            'reasoning': row['reasoning'],
-            'timestamp': row['timestamp'],
-            'user_edited': row['user_edited'] if 'user_edited' in keys else 0,
-            'original_category': row['original_category'] if 'original_category' in keys else row['category'],
-            'placement_reason': row['placement_reason'] if 'placement_reason' in keys else None,
-            'secondary_category': row['secondary_category'] if 'secondary_category' in keys else None,
-            'original_secondary_category': row['original_secondary_category'] if 'original_secondary_category' in keys else None
-        }
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT * FROM message_mapping WHERE entry_id = ?", (telegram_entry_id,)
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            keys = row.keys()
+            return {
+                'telegram_message_id': row['telegram_message_id'],
+                'discord_channel_id': row['discord_channel_id'],
+                'discord_message_id': row['discord_message_id'],
+                'content': row['content'],
+                'source_url': row['source_url'],
+                'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+                'category': row['category'],
+                'source_type': row['source_type'],
+                'reasoning': row['reasoning'],
+                'timestamp': row['timestamp'],
+                'user_edited': row['user_edited'] if 'user_edited' in keys else 0,
+                'original_category': row['original_category'] if 'original_category' in keys else row['category'],
+                'placement_reason': row['placement_reason'] if 'placement_reason' in keys else None,
+                'secondary_category': row['secondary_category'] if 'secondary_category' in keys else None,
+                'original_secondary_category': row['original_secondary_category'] if 'original_secondary_category' in keys else None
+            }
     
     def get_entry_id_by_discord_message(self, discord_message_id):
         """
@@ -377,12 +376,13 @@ class Database:
         Returns:
             str: Entry ID or None if not found
         """
-        row = self.conn.execute(
-            "SELECT entry_id FROM message_mapping WHERE discord_message_id = ?",
-            (discord_message_id,)
-        ).fetchone()
-        
-        return row['entry_id'] if row else None
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT entry_id FROM message_mapping WHERE discord_message_id = ?",
+                (discord_message_id,)
+            ).fetchone()
+
+            return row['entry_id'] if row else None
     
     def delete_message_mapping(self, entry_id):
         """
@@ -391,8 +391,9 @@ class Database:
         Args:
             entry_id: Entry ID to delete
         """
-        self.conn.execute("DELETE FROM message_mapping WHERE entry_id = ?", (entry_id,))
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute("DELETE FROM message_mapping WHERE entry_id = ?", (entry_id,))
+            self.conn.commit()
         logger.debug(f"Deleted message mapping: {entry_id}")
 
     def mark_as_superseded(self, entry_id, superseded_by_entry_id):
@@ -403,11 +404,12 @@ class Database:
             entry_id: The entry that was superseded
             superseded_by_entry_id: The new entry that superseded it
         """
-        self.conn.execute(
-            "UPDATE message_mapping SET superseded_by = ? WHERE entry_id = ?",
-            (superseded_by_entry_id, entry_id)
-        )
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute(
+                "UPDATE message_mapping SET superseded_by = ? WHERE entry_id = ?",
+                (superseded_by_entry_id, entry_id)
+            )
+            self.conn.commit()
         logger.debug(f"Marked {entry_id} as superseded by {superseded_by_entry_id}")
 
     def get_entry_superseded_by(self, superseder_entry_id):
@@ -420,84 +422,91 @@ class Database:
         Returns:
             dict of the original entry's columns, or None if not found
         """
-        row = self.conn.execute(
-            "SELECT * FROM message_mapping WHERE superseded_by = ?",
-            (superseder_entry_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        keys = row.keys()
-        return {k: row[k] for k in keys}
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT * FROM message_mapping WHERE superseded_by = ?",
+                (superseder_entry_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            keys = row.keys()
+            return {k: row[k] for k in keys}
 
     def update_superseded_channel_message_id(self, entry_id, channel_msg_id):
         """Store the Discord message ID of the archived copy in the superseded channel."""
-        self.conn.execute(
-            "UPDATE message_mapping SET superseded_channel_discord_message_id = ? WHERE entry_id = ?",
-            (channel_msg_id, entry_id)
-        )
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute(
+                "UPDATE message_mapping SET superseded_channel_discord_message_id = ? WHERE entry_id = ?",
+                (channel_msg_id, entry_id)
+            )
+            self.conn.commit()
         logger.debug(f"Stored superseded-channel message ID {channel_msg_id} for {entry_id}")
 
     def get_entry_by_superseded_channel_message(self, channel_msg_id):
         """Look up the original entry by its archived-copy message ID in the superseded channel."""
-        row = self.conn.execute(
-            "SELECT * FROM message_mapping WHERE superseded_channel_discord_message_id = ?",
-            (channel_msg_id,)
-        ).fetchone()
-        return {k: row[k] for k in row.keys()} if row else None
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT * FROM message_mapping WHERE superseded_channel_discord_message_id = ?",
+                (channel_msg_id,)
+            ).fetchone()
+            return {k: row[k] for k in row.keys()} if row else None
 
     # ------------------------------------------------------------------
     # Reaction tracking
     # ------------------------------------------------------------------
 
     def upsert_reaction(self, entry_id: str, emoji: str, user_ids: list) -> None:
-        self.conn.execute(
-            """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
-               ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
-            (entry_id, emoji, json.dumps(user_ids))
-        )
-        self.conn.commit()
-
-    def remove_reaction_user(self, entry_id: str, emoji: str, user_id: str) -> None:
-        row = self.conn.execute(
-            "SELECT user_ids FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
-            (entry_id, emoji)
-        ).fetchone()
-        if row is None:
-            return
-        users = json.loads(row['user_ids'])
-        users = [u for u in users if u != user_id]
-        if users:
-            self.conn.execute(
-                "UPDATE entry_reactions SET user_ids = ? WHERE entry_id = ? AND emoji = ?",
-                (json.dumps(users), entry_id, emoji)
-            )
-        else:
-            self.conn.execute(
-                "DELETE FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
-                (entry_id, emoji)
-            )
-        self.conn.commit()
-
-    def get_reactions(self, entry_id: str) -> dict:
-        rows = self.conn.execute(
-            "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
-            (entry_id,)
-        ).fetchall()
-        return {row['emoji']: json.loads(row['user_ids']) for row in rows}
-
-    def copy_reactions(self, src_entry_id: str, dst_entry_id: str) -> None:
-        rows = self.conn.execute(
-            "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
-            (src_entry_id,)
-        ).fetchall()
-        for row in rows:
+        with get_db_lock():
             self.conn.execute(
                 """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
                    ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
-                (dst_entry_id, row['emoji'], row['user_ids'])
+                (entry_id, emoji, json.dumps(user_ids))
             )
-        self.conn.commit()
+            self.conn.commit()
+
+    def remove_reaction_user(self, entry_id: str, emoji: str, user_id: str) -> None:
+        with get_db_lock():
+            row = self.conn.execute(
+                "SELECT user_ids FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
+                (entry_id, emoji)
+            ).fetchone()
+            if row is None:
+                return
+            users = json.loads(row['user_ids'])
+            users = [u for u in users if u != user_id]
+            if users:
+                self.conn.execute(
+                    "UPDATE entry_reactions SET user_ids = ? WHERE entry_id = ? AND emoji = ?",
+                    (json.dumps(users), entry_id, emoji)
+                )
+            else:
+                self.conn.execute(
+                    "DELETE FROM entry_reactions WHERE entry_id = ? AND emoji = ?",
+                    (entry_id, emoji)
+                )
+            self.conn.commit()
+
+    def get_reactions(self, entry_id: str) -> dict:
+        with get_db_lock():
+            rows = self.conn.execute(
+                "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
+                (entry_id,)
+            ).fetchall()
+            return {row['emoji']: json.loads(row['user_ids']) for row in rows}
+
+    def copy_reactions(self, src_entry_id: str, dst_entry_id: str) -> None:
+        with get_db_lock():
+            rows = self.conn.execute(
+                "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
+                (src_entry_id,)
+            ).fetchall()
+            for row in rows:
+                self.conn.execute(
+                    """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
+                       ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
+                    (dst_entry_id, row['emoji'], row['user_ids'])
+                )
+            self.conn.commit()
         logger.debug(f"Copied {len(rows)} reaction(s) from {src_entry_id} to {dst_entry_id}")
 
     # ------------------------------------------------------------------
@@ -511,13 +520,14 @@ class Database:
             new_discord_message_id: ID of the freshly re-posted Discord message
             new_discord_channel_id: Channel ID of the freshly re-posted message
         """
-        self.conn.execute(
-            """UPDATE message_mapping
-               SET superseded_by = NULL, discord_message_id = ?, discord_channel_id = ?
-               WHERE entry_id = ?""",
-            (new_discord_message_id, new_discord_channel_id, original_entry_id)
-        )
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute(
+                """UPDATE message_mapping
+                   SET superseded_by = NULL, discord_message_id = ?, discord_channel_id = ?
+                   WHERE entry_id = ?""",
+                (new_discord_message_id, new_discord_channel_id, original_entry_id)
+            )
+            self.conn.commit()
         logger.debug(f"Restored {original_entry_id} with new Discord message {new_discord_message_id}")
 
     def get_ignore_entry_previews(self, limit=30, max_preview_length=150):
@@ -533,27 +543,28 @@ class Database:
         Returns:
             list of (preview_str, user_flagged_bool) tuples
         """
-        rows = self.conn.execute(
-            """SELECT content, original_category
-               FROM message_mapping
-               WHERE category = 'ignore'
-                 AND content IS NOT NULL
-                 AND content != ''
-               ORDER BY
-                   CASE WHEN original_category IS NOT NULL AND original_category != 'ignore' THEN 0 ELSE 1 END,
-                   timestamp DESC
-               LIMIT ?""",
-            (limit,)
-        ).fetchall()
-        results = []
-        for row in rows:
-            preview = (row['content'] or '')[:max_preview_length]
-            user_flagged = (
-                row['original_category'] is not None and
-                row['original_category'] != 'ignore'
-            )
-            results.append((preview, user_flagged))
-        return results
+        with get_db_lock():
+            rows = self.conn.execute(
+                """SELECT content, original_category
+                   FROM message_mapping
+                   WHERE category = 'ignore'
+                     AND content IS NOT NULL
+                     AND content != ''
+                   ORDER BY
+                       CASE WHEN original_category IS NOT NULL AND original_category != 'ignore' THEN 0 ELSE 1 END,
+                       timestamp DESC
+                   LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            results = []
+            for row in rows:
+                preview = (row['content'] or '')[:max_preview_length]
+                user_flagged = (
+                    row['original_category'] is not None and
+                    row['original_category'] != 'ignore'
+                )
+                results.append((preview, user_flagged))
+            return results
     
     def get_recategorization_examples(self, limit=20, max_preview_length=150):
         """
@@ -563,24 +574,25 @@ class Database:
         Returns:
             list of (content_preview, original_category, corrected_category) tuples
         """
-        rows = self.conn.execute(
-            """SELECT content, original_category, category, user_reason
-               FROM message_mapping
-               WHERE original_category IS NOT NULL
-                 AND original_category != category
-                 AND original_category != 'ignore'
-                 AND category != 'ignore'
-                 AND content IS NOT NULL
-                 AND content != ''
-                 AND timestamp > ?
-               ORDER BY timestamp DESC
-               LIMIT ?""",
-            (time.time() - 7 * 86400, limit)
-        ).fetchall()
-        return [
-            ((row['content'] or '')[:max_preview_length], row['original_category'], row['category'], row['user_reason'])
-            for row in rows
-        ]
+        with get_db_lock():
+            rows = self.conn.execute(
+                """SELECT content, original_category, category, user_reason
+                   FROM message_mapping
+                   WHERE original_category IS NOT NULL
+                     AND original_category != category
+                     AND original_category != 'ignore'
+                     AND category != 'ignore'
+                     AND content IS NOT NULL
+                     AND content != ''
+                     AND timestamp > ?
+                   ORDER BY timestamp DESC
+                   LIMIT ?""",
+                (time.time() - 7 * 86400, limit)
+            ).fetchall()
+            return [
+                ((row['content'] or '')[:max_preview_length], row['original_category'], row['category'], row['user_reason'])
+                for row in rows
+            ]
 
     def get_ignore_promotion_examples(self, limit=15, max_preview_length=150):
         """
@@ -590,23 +602,24 @@ class Database:
         Returns:
             list of (content_preview, original_category) tuples
         """
-        rows = self.conn.execute(
-            """SELECT content, original_category, user_reason
-               FROM message_mapping
-               WHERE original_category IS NOT NULL
-                 AND original_category != 'ignore'
-                 AND category = 'ignore'
-                 AND content IS NOT NULL
-                 AND content != ''
-                 AND timestamp > ?
-               ORDER BY timestamp DESC
-               LIMIT ?""",
-            (time.time() - 7 * 86400, limit)
-        ).fetchall()
-        return [
-            ((row['content'] or '')[:max_preview_length], row['original_category'], row['user_reason'])
-            for row in rows
-        ]
+        with get_db_lock():
+            rows = self.conn.execute(
+                """SELECT content, original_category, user_reason
+                   FROM message_mapping
+                   WHERE original_category IS NOT NULL
+                     AND original_category != 'ignore'
+                     AND category = 'ignore'
+                     AND content IS NOT NULL
+                     AND content != ''
+                     AND timestamp > ?
+                   ORDER BY timestamp DESC
+                   LIMIT ?""",
+                (time.time() - 7 * 86400, limit)
+            ).fetchall()
+            return [
+                ((row['content'] or '')[:max_preview_length], row['original_category'], row['user_reason'])
+                for row in rows
+            ]
 
     def get_ignore_rescue_examples(self, limit=10, max_preview_length=150):
         """
@@ -616,22 +629,23 @@ class Database:
         Returns:
             list of (content_preview, correct_category) tuples
         """
-        rows = self.conn.execute(
-            """SELECT content, category
-               FROM message_mapping
-               WHERE original_category = 'ignore'
-                 AND category != 'ignore'
-                 AND content IS NOT NULL
-                 AND content != ''
-                 AND timestamp > ?
-               ORDER BY timestamp DESC
-               LIMIT ?""",
-            (time.time() - 7 * 86400, limit)
-        ).fetchall()
-        return [
-            ((row['content'] or '')[:max_preview_length], row['category'])
-            for row in rows
-        ]
+        with get_db_lock():
+            rows = self.conn.execute(
+                """SELECT content, category
+                   FROM message_mapping
+                   WHERE original_category = 'ignore'
+                     AND category != 'ignore'
+                     AND content IS NOT NULL
+                     AND content != ''
+                     AND timestamp > ?
+                   ORDER BY timestamp DESC
+                   LIMIT ?""",
+                (time.time() - 7 * 86400, limit)
+            ).fetchall()
+            return [
+                ((row['content'] or '')[:max_preview_length], row['category'])
+                for row in rows
+            ]
 
     def update_message_mapping_fields(self, entry_id, **kwargs):
         """
@@ -650,12 +664,13 @@ class Database:
         
         set_clause = ", ".join(f"{key} = ?" for key in kwargs)
         values = list(kwargs.values()) + [entry_id]
-        
-        self.conn.execute(
-            f"UPDATE message_mapping SET {set_clause} WHERE entry_id = ?",
-            values
-        )
-        self.conn.commit()
+
+        with get_db_lock():
+            self.conn.execute(
+                f"UPDATE message_mapping SET {set_clause} WHERE entry_id = ?",
+                values
+            )
+            self.conn.commit()
         logger.debug(f"Updated message mapping for {entry_id}: {list(kwargs.keys())}")
     
     def delete_processed(self, entry_id):
@@ -665,8 +680,9 @@ class Database:
         Args:
             entry_id: Entry ID to remove
         """
-        self.conn.execute("DELETE FROM processed_ids WHERE entry_id = ?", (entry_id,))
-        self.conn.commit()
+        with get_db_lock():
+            self.conn.execute("DELETE FROM processed_ids WHERE entry_id = ?", (entry_id,))
+            self.conn.commit()
         logger.debug(f"Removed from processed IDs: {entry_id}")
     
     def delete_embedding_by_entry_id(self, entry_id):
@@ -681,13 +697,14 @@ class Database:
         Args:
             entry_id: The entry ID whose embeddings should be removed
         """
-        rows = self.conn.execute(
-            "SELECT content_hash FROM embeddings WHERE entry_id = ?", (entry_id,)
-        ).fetchall()
-        for row in rows:
-            self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (row['content_hash'],))
-            self._embeddings_cache.pop(row['content_hash'], None)
-        self.conn.commit()
+        with get_db_lock():
+            rows = self.conn.execute(
+                "SELECT content_hash FROM embeddings WHERE entry_id = ?", (entry_id,)
+            ).fetchall()
+            for row in rows:
+                self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (row['content_hash'],))
+                self._embeddings_cache.pop(row['content_hash'], None)
+            self.conn.commit()
         logger.debug(f"Deleted {len(rows)} embedding(s) for entry_id: {entry_id}")
 
     def delete_embedding_by_content(self, content):
@@ -699,12 +716,13 @@ class Database:
         """
         import hashlib
         content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-        
-        self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (content_hash,))
-        self.conn.commit()
-        
-        # Keep in-memory cache in sync
-        self._embeddings_cache.pop(content_hash, None)
+
+        with get_db_lock():
+            self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (content_hash,))
+            self.conn.commit()
+
+            # Keep in-memory cache in sync
+            self._embeddings_cache.pop(content_hash, None)
         logger.debug(f"Deleted embedding for content hash: {content_hash}")
     
     def get_all_message_mappings(self):
@@ -714,22 +732,23 @@ class Database:
         Returns:
             dict: All mappings keyed by entry_id
         """
-        rows = self.conn.execute("SELECT * FROM message_mapping").fetchall()
-        result = {}
-        for row in rows:
-            result[row['entry_id']] = {
-                'telegram_message_id': row['telegram_message_id'],
-                'discord_channel_id': row['discord_channel_id'],
-                'discord_message_id': row['discord_message_id'],
-                'content': row['content'],
-                'source_url': row['source_url'],
-                'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
-                'category': row['category'],
-                'source_type': row['source_type'],
-                'reasoning': row['reasoning'],
-                'timestamp': row['timestamp']
-            }
-        return result
+        with get_db_lock():
+            rows = self.conn.execute("SELECT * FROM message_mapping").fetchall()
+            result = {}
+            for row in rows:
+                result[row['entry_id']] = {
+                    'telegram_message_id': row['telegram_message_id'],
+                    'discord_channel_id': row['discord_channel_id'],
+                    'discord_message_id': row['discord_message_id'],
+                    'content': row['content'],
+                    'source_url': row['source_url'],
+                    'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+                    'category': row['category'],
+                    'source_type': row['source_type'],
+                    'reasoning': row['reasoning'],
+                    'timestamp': row['timestamp']
+                }
+            return result
     
     def search_message_mappings(self, query):
         """
@@ -741,22 +760,23 @@ class Database:
         Returns:
             dict: Matching mappings keyed by entry_id
         """
-        rows = self.conn.execute(
-            "SELECT * FROM message_mapping WHERE entry_id LIKE ? OR content LIKE ?",
-            (f"%{query}%", f"%{query}%")
-        ).fetchall()
-        result = {}
-        for row in rows:
-            result[row['entry_id']] = {
-                'telegram_message_id': row['telegram_message_id'],
-                'discord_channel_id': row['discord_channel_id'],
-                'discord_message_id': row['discord_message_id'],
-                'content': row['content'],
-                'source_url': row['source_url'],
-                'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
-                'category': row['category'],
-                'source_type': row['source_type'],
-                'reasoning': row['reasoning'],
-                'timestamp': row['timestamp']
-            }
-        return result
+        with get_db_lock():
+            rows = self.conn.execute(
+                "SELECT * FROM message_mapping WHERE entry_id LIKE ? OR content LIKE ?",
+                (f"%{query}%", f"%{query}%")
+            ).fetchall()
+            result = {}
+            for row in rows:
+                result[row['entry_id']] = {
+                    'telegram_message_id': row['telegram_message_id'],
+                    'discord_channel_id': row['discord_channel_id'],
+                    'discord_message_id': row['discord_message_id'],
+                    'content': row['content'],
+                    'source_url': row['source_url'],
+                    'video_urls': json.loads(row['video_urls']) if row['video_urls'] else [],
+                    'category': row['category'],
+                    'source_type': row['source_type'],
+                    'reasoning': row['reasoning'],
+                    'timestamp': row['timestamp']
+                }
+            return result

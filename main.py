@@ -462,9 +462,9 @@ class NewsAggregatorBot:
                                         old_mapping, content[:200]
                                     )
                                     if archived and archived_msg_id:
-                                        self.db.update_superseded_channel_message_id(match_entry_id, archived_msg_id)
-                                    self.db.delete_embedding_by_entry_id(match_entry_id)
-                                    self.db.mark_as_superseded(match_entry_id, entry_id)
+                                        await asyncio.to_thread(self.db.update_superseded_channel_message_id, match_entry_id, archived_msg_id)
+                                    await asyncio.to_thread(self.db.delete_embedding_by_entry_id, match_entry_id)
+                                    await asyncio.to_thread(self.db.mark_as_superseded, match_entry_id, entry_id)
                                     superseded = True
                                     placement_reason = (
                                         f"AI categorized as '{category}'. "
@@ -489,8 +489,8 @@ class NewsAggregatorBot:
                             f"matches: {similarity_info['match_preview'][:100]})"
                         )
                         self.stats['duplicates'] += 1
-                        self.db.mark_processed(entry_id)
-                        self.db.add_embedding(content, embedding, entry_id=entry_id)
+                        await asyncio.to_thread(self.db.mark_processed, entry_id)
+                        await asyncio.to_thread(self.db.add_embedding, content, embedding, entry_id=entry_id)
                         self.media_handler.cleanup_entry_media(entry)
                         return True
                 
@@ -590,7 +590,7 @@ class NewsAggregatorBot:
                 
                 if success:
                     # Mark as processed and store embedding
-                    self.db.mark_processed(entry_id)
+                    await asyncio.to_thread(self.db.mark_processed, entry_id)
                     # Embedding storage is best-effort: a transient Ollama failure here must NOT
                     # prevent store_message_mapping() below. Otherwise the message we just posted
                     # to Discord becomes permanently orphaned (posted + marked processed, but with
@@ -601,16 +601,16 @@ class NewsAggregatorBot:
                             # for better future duplicate detection.
                             # (Skips the extra Ollama call when content IS the OCR text, e.g. image-only entries)
                             combined_embedding = await asyncio.to_thread(self.ollama.generate_embedding, combined_content)
-                            self.db.add_embedding(combined_content, combined_embedding, entry_id=entry_id)
+                            await asyncio.to_thread(self.db.add_embedding, combined_content, combined_embedding, entry_id=entry_id)
                         else:
-                            self.db.add_embedding(content, embedding, entry_id=entry_id)
+                            await asyncio.to_thread(self.db.add_embedding, content, embedding, entry_id=entry_id)
                     except Exception as embed_error:
                         # Fall back to the dedup-check embedding already computed earlier this cycle.
                         logger.error(
                             f"Embedding store failed for {entry_id}; falling back to dedup embedding: {embed_error}"
                         )
                         try:
-                            self.db.add_embedding(content, embedding, entry_id=entry_id)
+                            await asyncio.to_thread(self.db.add_embedding, content, embedding, entry_id=entry_id)
                         except Exception as fallback_error:
                             logger.error(
                                 f"Fallback embedding also failed for {entry_id}; "
@@ -634,7 +634,8 @@ class NewsAggregatorBot:
                         if placement_reason is None:
                             placement_reason = f"AI categorized as '{category}'. Reasoning: {reasoning or 'no reasoning provided'}"
 
-                        self.db.store_message_mapping(
+                        await asyncio.to_thread(
+                            self.db.store_message_mapping,
                             telegram_entry_id=entry_id,
                             telegram_message_id=entry.get('message_id', 0),
                             discord_channel_id=discord_channel_id,
@@ -684,7 +685,7 @@ class NewsAggregatorBot:
             # Clean up on error
             try:
                 self.media_handler.cleanup_entry_media(entry)
-            except:
+            except Exception:
                 pass
             
             return False
@@ -696,7 +697,7 @@ class NewsAggregatorBot:
             # Clean up on error
             try:
                 self.media_handler.cleanup_entry_media(entry)
-            except:
+            except Exception:
                 pass
             
             return False
@@ -723,11 +724,11 @@ class NewsAggregatorBot:
             logger.info(f"Reprocess requested for entry: {entry_id}")
 
             # Clear processed state so process_entry won't skip it
-            self.db.delete_processed(entry_id)
+            await asyncio.to_thread(self.db.delete_processed, entry_id)
             logger.info(f"Cleared processed_ids for: {entry_id}")
 
             # Clear embedding so it won't self-detect as a duplicate
-            self.db.delete_embedding_by_entry_id(entry_id)
+            await asyncio.to_thread(self.db.delete_embedding_by_entry_id, entry_id)
             logger.info(f"Cleared embedding for: {entry_id}")
 
             # Reconstruct entry dict from stored mapping data
@@ -799,7 +800,7 @@ class NewsAggregatorBot:
         
         # Clean up old database entries
         logger.info("Cleaning up old database entries...")
-        self.db.cleanup_old_entries()
+        await asyncio.to_thread(self.db.cleanup_old_entries)
 
         # Flush Dexerto headlines that have been waiting too long with no follow-up tweet
         await self.dexerto_merger.flush_stale()
@@ -825,15 +826,15 @@ class NewsAggregatorBot:
         if _now_local.hour == 3 and (_now - self._last_nightly_rebuild) > 20 * 3600:
             self.ollama._enhanced_prompt_cache = None
             self._last_nightly_rebuild = _now
-            corrections = self.db.get_recategorization_examples(limit=100)
-            promotions = self.db.get_ignore_promotion_examples(limit=100)
+            corrections = await asyncio.to_thread(self.db.get_recategorization_examples, limit=100)
+            promotions = await asyncio.to_thread(self.db.get_ignore_promotion_examples, limit=100)
             logger.info(
                 f"Nightly prompt rebuild: {len(corrections)} category-correction pairs, "
                 f"{len(promotions)} ignore-promotion pairs available"
             )
 
         # Get database stats
-        db_stats = self.db.get_stats()
+        db_stats = await asyncio.to_thread(self.db.get_stats)
         retry_stats = self.retry_queue.get_stats()
         logger.info(f"Database: {db_stats['processed_ids']} IDs, {db_stats['embeddings']} embeddings")
         if retry_stats['total_entries'] > 0:
@@ -881,7 +882,7 @@ class NewsAggregatorBot:
                 try:
                     dt = parsedate_to_datetime(entry['pub_date'])
                     return dt.timestamp()
-                except:
+                except Exception:
                     return 0
             return 0
         
@@ -993,6 +994,13 @@ class NewsAggregatorBot:
                     f"No Discord mapping found for edited Telegram message: {entry_id} "
                     f"- processing as new entry (NewMessage event was likely missed)"
                 )
+                # If this is part of a multi-image album, route it through the same
+                # buffer/flush logic as real-time messages instead of posting it
+                # immediately - otherwise each image in the album ends up as its
+                # own separate Discord post.
+                buffered = await self.telegram_poller.handle_missed_new_message(edited_entry)
+                if buffered:
+                    return True
                 return await self.process_entry(edited_entry)
             
             discord_channel_id = mapping_info['discord_channel_id']
@@ -1014,6 +1022,11 @@ class NewsAggregatorBot:
                 if is_all_caps(new_content, threshold=getattr(config, 'CAPS_FIX_THRESHOLD', 0.65)):
                     logger.info(f"ALL CAPS detected in edited Telegram message, running text cleanup...")
                     new_content = await asyncio.to_thread(self.ollama.format_text, new_content)
+
+            # Apply the same final wire-prefix cleanup used for initial posts.
+            # This prevents Telegram edit events from re-adding prefixes like
+            # "JUST IN:" or "BREAKING:" after the first Discord post was cleaned.
+            new_content = strip_wire_prefixes(new_content)
 
             if not new_content:
                 logger.warning(f"No content in edited message: {entry_id}")
@@ -1040,7 +1053,8 @@ class NewsAggregatorBot:
             
             if success:
                 # Update the stored content in the mapping (preserve source_url, category, and source_type)
-                self.db.store_message_mapping(
+                await asyncio.to_thread(
+                    self.db.store_message_mapping,
                     telegram_entry_id=entry_id,
                     telegram_message_id=mapping_info['telegram_message_id'],
                     discord_channel_id=discord_channel_id,

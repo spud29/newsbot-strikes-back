@@ -197,7 +197,7 @@ def register_commands(poster):
             if current_category == config.DEFAULT_CATEGORY:
                 new_category = entry_data.get('original_category')
                 if not new_category or new_category == config.DEFAULT_CATEGORY:
-                    new_category = next((cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY), 'politics')
+                    new_category = config.FALLBACK_CATEGORY
                 direction_label = f"ignore → **{new_category}**"
             else:
                 new_category = config.DEFAULT_CATEGORY
@@ -776,10 +776,7 @@ def register_commands(poster):
             # Resolve target category — same logic as RecategorizeView for "__unified__"
             new_category = entry_data.get('original_category')
             if not new_category or new_category == config.DEFAULT_CATEGORY:
-                new_category = next(
-                    (cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY),
-                    'general'
-                )
+                new_category = config.FALLBACK_CATEGORY
 
             source_type = entry_id.split('_')[0] if entry_id else None
             channel_id = entry_data.get('discord_channel_id')

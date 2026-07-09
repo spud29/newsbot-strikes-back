@@ -179,6 +179,39 @@ class TelegramPoller:
         except asyncio.TimeoutError:
             return None
     
+    async def handle_missed_new_message(self, parsed_entry):
+        """
+        Handle a parsed entry that arrived via a MessageEdited event with no prior
+        Discord mapping. This happens when Telethon swallows the original NewMessage
+        event (e.g. during GetDifference catch-up), so the caller falls back to
+        treating the edit as a brand new entry.
+
+        If the entry is part of a multi-image album, route it through the same
+        buffer/flush logic used for real-time messages so all images in the album
+        still get merged into a single Discord post instead of each one being
+        posted separately.
+
+        Args:
+            parsed_entry: Parsed message entry dict
+
+        Returns:
+            bool: True if the entry was buffered (caller should not process it
+                  further - it will be flushed to the message queue once the album
+                  is complete). False if it's a standalone message and the caller
+                  should process it immediately as before.
+        """
+        grouped_id = parsed_entry.get('grouped_id')
+
+        if grouped_id:
+            logger.info(
+                f"Missed NewMessage for album member {parsed_entry['id']} (grouped_id {grouped_id}) "
+                f"- buffering instead of posting immediately"
+            )
+            await self._buffer_album_message(grouped_id, parsed_entry)
+            return True
+
+        return False
+
     async def _buffer_album_message(self, grouped_id, parsed_entry):
         """
         Buffer an album message and set a timer to flush the album
@@ -188,11 +221,22 @@ class TelegramPoller:
             parsed_entry: The parsed message entry
         """
         logger.debug(f"Buffering album message with grouped_id {grouped_id}")
-        
+
         # Add to buffer
         if grouped_id not in self.album_buffer:
             self.album_buffer[grouped_id] = []
-        
+
+        # Avoid buffering the same message twice (e.g. a repeated MessageEdited
+        # event for a message that's already buffered but hasn't been flushed
+        # and posted yet, so no Discord mapping exists for it).
+        existing_ids = {e['message_id'] for e in self.album_buffer[grouped_id]}
+        if parsed_entry['message_id'] in existing_ids:
+            logger.debug(
+                f"Message {parsed_entry['message_id']} already buffered for album "
+                f"{grouped_id}, skipping duplicate"
+            )
+            return
+
         self.album_buffer[grouped_id].append(parsed_entry)
         
         # Cancel existing timer if any
