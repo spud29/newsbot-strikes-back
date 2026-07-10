@@ -55,6 +55,9 @@ class NewsAggregatorBot:
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
         self._last_log_cleanup: float = 0.0
         self._last_nightly_rebuild: float = 0.0
+        # Persisted across restarts so a weekly report isn't re-posted every restart
+        self._accuracy_report_state_file = os.path.join("data", "accuracy_report_state.txt")
+        self._last_accuracy_report: float = self._read_accuracy_report_state()
         
         # Statistics
         self.stats = {
@@ -65,7 +68,21 @@ class NewsAggregatorBot:
         }
         
         logger.info("All components initialized")
-    
+
+    def _read_accuracy_report_state(self) -> float:
+        try:
+            with open(self._accuracy_report_state_file) as f:
+                return float(f.read().strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def _write_accuracy_report_state(self, ts: float):
+        try:
+            with open(self._accuracy_report_state_file, "w") as f:
+                f.write(str(ts))
+        except OSError as e:
+            logger.warning(f"Could not persist accuracy report state: {e}")
+
     async def start(self):
         """Start the bot"""
         logger.info("Starting bot...")
@@ -832,6 +849,26 @@ class NewsAggregatorBot:
                 f"Nightly prompt rebuild: {len(corrections)} category-correction pairs, "
                 f"{len(promotions)} ignore-promotion pairs available"
             )
+
+        # Periodic accuracy report: post categorization accuracy to Discord so
+        # graduation decisions (PLAN.md) don't depend on running the script manually.
+        if getattr(config, 'ACCURACY_REPORT_ENABLED', False):
+            report_hour = getattr(config, 'ACCURACY_REPORT_HOUR', 9)
+            interval_days = getattr(config, 'ACCURACY_REPORT_INTERVAL_DAYS', 7)
+            # 4h slack so the posting hour doesn't drift later each interval
+            min_gap = interval_days * 86400 - 4 * 3600
+            if _now_local.hour == report_hour and (_now - self._last_accuracy_report) > min_gap:
+                # Mark before attempting so a persistent failure can't spam every cycle
+                self._last_accuracy_report = _now
+                self._write_accuracy_report_state(_now)
+                try:
+                    from accuracy_report import build_report
+                    report = await asyncio.to_thread(
+                        build_report, days=interval_days, db_path=config.DB_PATH
+                    )
+                    await self.discord_poster.post_accuracy_report(report)
+                except Exception as e:
+                    logger.error(f"Accuracy report failed: {e}")
 
         # Get database stats
         db_stats = await asyncio.to_thread(self.db.get_stats)

@@ -906,6 +906,43 @@ class DiscordPoster:
             logger.warning(f"post_superseded_entry error (non-fatal): {e}")
             return False, None
 
+    async def post_accuracy_report(self, report_text):
+        """
+        Post the periodic categorization accuracy report to the configured channel.
+
+        Splits the report into code-block chunks under Discord's 2000-char
+        message limit.
+
+        Returns:
+            bool: True if posted, False on error (non-fatal)
+        """
+        channel_id = getattr(config, 'ACCURACY_REPORT_CHANNEL_ID', None)
+        if not channel_id:
+            return False
+        channel = self.client.get_channel(channel_id)
+        if not channel:
+            logger.warning(f"post_accuracy_report: could not find channel {channel_id}")
+            return False
+        try:
+            chunks = []
+            current_lines = []
+            current_len = 0
+            for line in report_text.splitlines():
+                if current_len + len(line) + 1 > 1900 and current_lines:
+                    chunks.append('\n'.join(current_lines))
+                    current_lines, current_len = [], 0
+                current_lines.append(line)
+                current_len += len(line) + 1
+            if current_lines:
+                chunks.append('\n'.join(current_lines))
+            for chunk in chunks:
+                await channel.send(f"```text\n{chunk}\n```")
+            logger.info(f"Posted accuracy report ({len(chunks)} messages) to channel {channel_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"post_accuracy_report error (non-fatal): {e}")
+            return False
+
     async def _verify_channel_access(self):
         """
         Verify that the bot can access all configured channels

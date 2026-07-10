@@ -100,7 +100,7 @@ The bot categorizes content into 11 categories:
 5. video games
 6. sports
 7. food
-8. technology
+8. science & technology
 9. music
 10. fashion
 11. ignore (default/fallback)

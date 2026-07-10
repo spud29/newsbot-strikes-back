@@ -42,10 +42,10 @@ Successfully implemented a feature to view entry details and re-categorize entri
 {
   "success": true,
   "old_category": "ignore",
-  "new_category": "technology",
+  "new_category": "science & technology",
   "discord_message_id": 123456789,
   "discord_channel_id": 987654321,
-  "message": "Successfully re-categorized from ignore to technology"
+  "message": "Successfully re-categorized from ignore to science & technology"
 }
 ```
 
@@ -86,7 +86,7 @@ Successfully implemented a feature to view entry details and re-categorize entri
 2. Hover over "Apps" in the context menu
 3. Click "Re-categorize"
 4. A modal will appear asking for the new category
-5. Enter the category name (e.g., "crypto", "stocks", "technology")
+5. Enter the category name (e.g., "crypto", "stocks", "science & technology")
 6. Click "Submit"
 7. The message will be deleted and reposted in the new category
 8. **Note**: Only authorized users (listed in `RECATEGORIZE_ALLOWED_USER_IDS`) can use this command

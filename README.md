@@ -91,7 +91,7 @@ All settings live in `config.py`. Key options:
 
 Content is categorized into one of:
 
-`crypto` · `politics` · `stocks` · `artificial intelligence` · `video games` · `sports` · `food` · `technology` · `music` · `fashion` · `pop culture` · `ignore`
+`crypto` · `politics` · `stocks` · `artificial intelligence` · `video games` · `sports` · `food` · `science & technology` · `music` · `fashion` · `pop culture` · `software development` · `fitness` · `general news` · `ignore`
 
 Each category maps to a Discord channel ID in `config.DISCORD_CHANNELS`.
 

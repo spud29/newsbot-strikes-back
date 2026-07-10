@@ -74,7 +74,7 @@ After inviting the bot, you need to update `config.py` with your actual channel 
        "video games": YOUR_GAMES_CHANNEL_ID,
        "sports": YOUR_SPORTS_CHANNEL_ID,
        "food": YOUR_FOOD_CHANNEL_ID,
-       "technology": YOUR_TECH_CHANNEL_ID,
+       "science & technology": YOUR_TECH_CHANNEL_ID,
        "music": YOUR_MUSIC_CHANNEL_ID,
        "fashion": YOUR_FASHION_CHANNEL_ID,
        "ignore": YOUR_IGNORE_CHANNEL_ID

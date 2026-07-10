@@ -42,7 +42,7 @@ The bot has been successfully upgraded from button-based UI to Discord context m
 2. Hover over "Apps" in the context menu
 3. Click "Re-categorize"
 4. A modal will appear with a text input for the new category
-5. Enter the category name (e.g., "crypto", "stocks", "technology")
+5. Enter the category name (e.g., "crypto", "stocks", "science & technology")
 6. Click "Submit"
 7. You'll receive an ephemeral confirmation (only you can see)
 8. The message will be deleted from the old channel and reposted in the new one

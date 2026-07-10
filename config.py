@@ -72,7 +72,7 @@ DISCORD_CHANNELS = {
     "video games": 1317592652044046347,
     "sports": 845809605934317639,
     "food": 852256197494046731,
-    "technology": 928462998228598794,
+    "science & technology": 928462998228598794,
     "music": 1300884069583687800,
     "fashion": 867223341626294282,
     "pop culture": 1432086691862024403,
@@ -86,7 +86,7 @@ DISCORD_CHANNELS = {
 # aren't rejected just because a channel is disabled
 VALID_CATEGORIES = [
     "crypto", "politics", "stocks", "artificial intelligence",
-    "video games", "sports", "food", "technology",
+    "video games", "sports", "food", "science & technology",
     "music", "fashion", "pop culture", "software development", "fitness", "general news", "ignore"
 ]
 
@@ -158,9 +158,8 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 
 ### general news
 - Natural disasters, extreme weather events, and accidents
-- Crime, law enforcement, and court cases without a political angle
-- Public health and medical news (outbreaks, drug approvals, hospital incidents)
-- Science and nature (non-AI): discoveries, space exploration, climate data
+- Crime, law enforcement, and court cases without a political angle (including recreational drug busts, trafficking, and other drug-related crime)
+- Public health and medical news: outbreaks, hospital incidents, drug-use statistics and societal trends — NOT pharma R&D, clinical trials, or FDA drug approvals (see 'science & technology')
 - Human interest and society: local events, viral real-world stories
 - Consumer and economic news affecting everyday people (inflation, housing, jobs) without a direct government policy angle
 
@@ -212,14 +211,16 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Fitness influencers, apps, and equipment
 - Health-focused fitness topics (weight loss, muscle gain, rehabilitation)
 
-### technology
+### science & technology
 - General tech products and gadgets
 - Software updates and releases
 - Tech company news (that isn't AI/crypto specific)
 - Internet services and platforms
 - Cybersecurity and privacy
 - Hardware, electronics, consumer tech
-- Space technology and exploration
+- Space exploration and space technology: missions, launches, astronomy, and discoveries
+- Scientific discoveries and research (non-AI): physics, biology, chemistry, archaeology, climate data
+- Pharmaceutical and medical research: drug development, clinical trials, and FDA drug approvals — NOT recreational drug crime, drug policy, or drug-use statistics (see 'general news'/'politics')
 
 ### software development
 - Programming languages, frameworks, and libraries
@@ -279,8 +280,9 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 4. **Newsworthiness is Downstream**: Once an entry has enough substance to stand alone (passes the quality check), assign the correct category even if the event seems modest. The newsworthiness filter evaluates impact AFTER categorization — don't pre-filter modest-but-real events at this stage.
 5. **Context Clues**: Consider source, tone, and depth of information
 6. **When Unclear**: If the content discusses a real topic but lacks sufficient context or detail to stand alone as a worthwhile post, 'ignore' is appropriate — it's a quality filter, not just a spam filter. Assign a real category when the entry has enough substance to stand alone.
-7. **Entertainment Context**: Theme parks, entertainment venues, and entertainment-focused technology (Disney animatronics, movie theater tech, concert staging) should be categorized as **pop culture**, NOT technology. Consider the PRIMARY CONTEXT: Is this entertainment news or tech industry news?
-8. **Structural vs. Thin vs. Modest**: Three distinct cases — (a) structural junk (routine scheduled data, no triggering event) → always ignore; (b) thin/bare entry about a real event (single headline with no context, no elaboration) → ignore, a better entry will follow; (c) modest but real event WITH some context ("Bitcoin up 2% after Fed rate hold") → categorize as 'crypto', the newsworthiness filter handles impact downstream.
+7. **Entertainment Context**: Theme parks, entertainment venues, and entertainment-focused technology (Disney animatronics, movie theater tech, concert staging) should be categorized as **pop culture**, NOT science & technology. Consider the PRIMARY CONTEXT: Is this entertainment news or tech industry news?
+8. **Drug & Pharma Boundary**: Pharmaceutical R&D, clinical trial results, and FDA drug approvals/regulatory actions belong in **science & technology** — medical research is science. Recreational drug crime (busts, trafficking, smuggling), drug policy/legislation/court rulings, and drug-use statistics or societal trends stay in **general news** or **politics** per their normal rules; do NOT move them just because the word "drug" appears. If the story is primarily framed as a stock-price reaction to trial results, prefer **stocks** over science & technology.
+9. **Structural vs. Thin vs. Modest**: Three distinct cases — (a) structural junk (routine scheduled data, no triggering event) → always ignore; (b) thin/bare entry about a real event (single headline with no context, no elaboration) → ignore, a better entry will follow; (c) modest but real event WITH some context ("Bitcoin up 2% after Fed rate hold") → categorize as 'crypto', the newsworthiness filter handles impact downstream.
 
 ## DECISION TREE
 
@@ -305,14 +307,14 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Tesla stock drops 5% after earnings report" → stocks
 "Elon Musk tweets about Dogecoin" → crypto
 "OpenAI releases GPT-5 with improved reasoning" → artificial intelligence
-"New MacBook Pro features M4 chip" → technology
+"New MacBook Pro features M4 chip" → science & technology
 "Bitcoin reaches new all-time high" → crypto
 "Bitcoin jumps 3% as traders respond to Fed rate decision" → crypto (categorizable event, even if modest)
 "Fed raises interest rates by 0.25%" → politics
 "7.8 magnitude earthquake strikes Turkey, rescue operations underway" → general news
 "CDC confirms new measles outbreak across 4 states" → general news
 "Man arrested after largest bank heist in US history" → general news
-"NASA's James Webb captures image of earliest known galaxy" → general news
+"NASA's James Webb captures image of earliest known galaxy" → science & technology
 "UK Parliament debates new immigration policy" → politics
 "Iran estimates $270 billion in war damage" → politics
 "US airstrikes target Houthi positions in Yemen" → politics
@@ -322,7 +324,7 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Netflix cancels popular series after two seasons" → pop culture
 "Disney reveals new Olaf animatronic for theme park" → pop culture
 "Universal Studios adds holographic effects to attraction" → pop culture
-"Robotics lab develops new AI-powered humanoid robot" → technology
+"Robotics lab develops new AI-powered humanoid robot" → science & technology
 "Engineers create breakthrough in autonomous navigation" → artificial intelligence
 "Coinbase reports record Q3 revenue of $2.3B" → stocks (corporate earnings — concrete news event)
 "Top 100 24h Gainers: INJ $3.84 +13.12%, MORPHO $1.62 +7.00%... Top 100 24h Losers: NIGHT $0.0582 -4.26%..." → ignore (routine market data, no event)
@@ -355,6 +357,15 @@ Quality vs. thin coverage — same story, different substance:
 "Charles Schwab begins rollout of spot Bitcoin, Ethereum trading platform" → ignore (thin single-line announcement with no details about the platform, timeline, or user impact)
 "Coinbase adds tGBP stablecoin to expand UK crypto payments" → crypto (specific product with a specific market, clear significance)
 
+Drug & pharma boundary — same topic, different category depending on framing:
+"Eli Lilly says its experimental obesity drug cut sleep apnea severity by 60.6% in a Phase 3 trial." → science & technology (pharma R&D / clinical trial result)
+"FDA unveils Operation TrialBlazer, a new effort to speed up U.S. drug development." → science & technology (FDA regulatory/approval process, not law enforcement)
+"AstraZeneca and Daiichi are reportedly nearing a UK pricing deal for breast cancer drug Enhertu." → science & technology (drug development/commercialization, not a stock-price move)
+"Alibaba agrees to pay $600 million to resolve U.S. allegations over illegal drug sales." → politics (legal enforcement action, not medical research)
+"Supreme Court rules drug users & addicts cannot automatically be barred from owning firearms." → politics (legal ruling, not medical research)
+"UN warns of an unprecedented spike in synthetic drugs as cocaine and meth surge worldwide." → general news (drug-use statistics/societal trend, not pharma R&D)
+"Psychedelic drugmaker Definium surges +53% after late-stage data showed strong results for its depression treatment." → stocks (stock-price-move framing wins over the drug-trial content)
+
 ## OUTPUT FORMAT
 
 Respond with ONLY valid JSON matching this format exactly:
@@ -362,7 +373,7 @@ Respond with ONLY valid JSON matching this format exactly:
 
 secondary_category is optional. Set it to a second category name ONLY when the content genuinely spans two categories with roughly equal relevance. Set to null when the entry fits cleanly in one category (which is most of the time).
 
-Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, technology, music, fashion, pop culture, software development, fitness, general news, ignore"""
+Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, science & technology, music, fashion, pop culture, software development, fitness, general news, ignore"""
 
 # Duplicate detection thresholds (cosine similarity)
 DUPLICATE_THRESHOLD = 0.95  # Exact duplicates only (>0.95 similarity)
@@ -387,23 +398,32 @@ OCR_LANGUAGE = 'eng'  # Language for OCR (default: English)
 DISCORD_FILE_SIZE_LIMIT_MB = 25
 
 # Feedback Learning Configuration
-FEEDBACK_LEARNING_ENABLED = False  # Enable learning from user feedback (removed entries)
+FEEDBACK_LEARNING_ENABLED = True  # Enable learning from user feedback (removed entries)
 FEEDBACK_EXAMPLES_COUNT = 10  # Number of removed entries to include in system prompt
 
 # Ignore-entry Learning Configuration
 # Feeds entries categorized as 'ignore' (including user-recategorized ones) into the AI
 # system prompt as additional negative examples. User-flagged ignores are prioritized.
-IGNORE_EXAMPLES_ENABLED = False  # Enable learning from ignore-channel entries
+IGNORE_EXAMPLES_ENABLED = True  # Enable learning from ignore-channel entries
 IGNORE_EXAMPLES_COUNT = 5  # Number of recent ignore entries to include in system prompt
 
 # Correction Learning Configuration
 # Feeds user re-categorization corrections into the AI system prompt so it learns from
 # mistakes. Covers both category-to-category corrections and entries moved TO ignore.
-CORRECTION_EXAMPLES_ENABLED = False  # Enable learning from user re-categorizations
+CORRECTION_EXAMPLES_ENABLED = True  # Enable learning from user re-categorizations
 CORRECTION_EXAMPLES_COUNT = 15      # Category-to-category corrections (AI said X, user changed to Y)
 IGNORE_PROMOTION_EXAMPLES_COUNT = 3  # Entries the user moved TO ignore (AI said X, should be ignore)
-IGNORE_RESCUE_ENABLED = False        # Learn from AI-assigned ignores that users promoted to real categories
+IGNORE_RESCUE_ENABLED = True         # Learn from AI-assigned ignores that users promoted to real categories
 IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in system prompt
+
+# Automated Accuracy Report
+# The bot posts the categorization accuracy report (accuracy_report.py) to Discord
+# on a schedule, so graduation decisions (see PLAN.md) don't depend on remembering
+# to run the script manually.
+ACCURACY_REPORT_ENABLED = True
+ACCURACY_REPORT_INTERVAL_DAYS = 7   # How often to post; also the report's look-back window
+ACCURACY_REPORT_HOUR = 9            # Local hour of day to post (0-23)
+ACCURACY_REPORT_CHANNEL_ID = DISCORD_CHANNELS["ignore"]  # Where to post the report
 
 
 # Re-categorize Context Menu Command (Right-click on bot messages → Apps → "Re-categorize")

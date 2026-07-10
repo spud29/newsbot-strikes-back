@@ -17,7 +17,14 @@ _CATEGORY_ALIASES = {
     "machine learning":  "artificial intelligence",
     "gaming":            "video games",
     "games":             "video games",
-    "tech":              "technology",
+    "tech":                   "science & technology",
+    "technology":             "science & technology",
+    "science":                "science & technology",
+    "sci tech":               "science & technology",
+    "science technology":     "science & technology",
+    "science&technology":     "science & technology",
+    "science and technology": "science & technology",
+    "sciencetechnology":      "science & technology",
     "software":          "software development",
     "dev":               "software development",
     "development":       "software development",
@@ -503,7 +510,7 @@ class OllamaClient:
         # (avoids matching reasoning text, and prevents "" from matching everything)
         if category_normalized and len(category_normalized) < 50:
             # Sort longest-first so more specific categories match before shorter ones
-            # (e.g. "artificial intelligence" matches before "technology" when both could apply)
+            # (e.g. "artificial intelligence" matches before "science & technology" when both could apply)
             for valid_cat in sorted(valid_categories, key=len, reverse=True):
                 # Use word-boundary matching to prevent "crypto" from matching "cryptocurrency"
                 pattern = r'\b' + re.escape(valid_cat) + r'\b'
