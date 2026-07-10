@@ -318,10 +318,12 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
+                    # NOTE: "think" is a top-level API parameter — inside "options" it is
+                    # silently ignored and qwen3 burns the whole num_predict budget thinking.
+                    "think": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500,
-                        "think": False
+                        "num_predict": 500
                     }
                 },
                 timeout=300
@@ -578,10 +580,10 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
+                    "think": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500,
-                        "think": False
+                        "num_predict": 500
                     }
                 },
                 timeout=300
@@ -669,10 +671,10 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
+                    "think": False,
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 100,
-                        "think": False
+                        "num_predict": 100
                     }
                 },
                 timeout=300
@@ -740,10 +742,10 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
+                    "think": False,
                     "options": {
                         "temperature": 0.2,
-                        "num_predict": 200,
-                        "think": False
+                        "num_predict": 200
                     }
                 },
                 timeout=300
@@ -812,26 +814,28 @@ class OllamaClient:
             raise
     
     @retry_with_backoff(max_retries=3, initial_delay=2)
-    def rate_newsworthiness(self, content, category):
+    def rate_newsworthiness(self, content, category, threshold=None):
         """
-        Rate content newsworthiness on surprise, impact, and actionability.
-        
+        Rate how reaction-worthy content is: surprise, impact, and talkability.
+
         Args:
             content: Text content to rate
             category: The category this content was assigned to (for context)
-        
+            threshold: Pass/fail cutoff; defaults to the category's threshold from
+                NEWSWORTHINESS_THRESHOLD_BY_CATEGORY, else NEWSWORTHINESS_THRESHOLD
+
         Returns:
             dict: {
                 'score': float (weighted average 1-10),
                 'surprising': int (1-10),
                 'impact': int (1-10),
-                'actionable': int (1-10),
+                'talkability': int (1-10),
                 'reasoning': str (brief explanation),
                 'passed': bool (whether score >= threshold)
             }
         """
-        logger.debug(f"Rating newsworthiness for: {content[:100]}...")
-        
+        logger.debug(f"Rating reaction-worthiness for: {content[:100]}...")
+
         # Check if filter is enabled
         if not getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
             logger.debug("Newsworthiness filter disabled, returning max score")
@@ -839,28 +843,45 @@ class OllamaClient:
                 'score': 10.0,
                 'surprising': 10,
                 'impact': 10,
-                'actionable': 10,
+                'talkability': 10,
                 'reasoning': 'Filter disabled',
                 'passed': True
             }
-        
+
         try:
             # Build the rating prompt — kept concise so the model reliably returns JSON
-            prompt = f"""Rate this news content's newsworthiness from 1-10 on three criteria.
+            prompt = f"""You rate news items for a Discord news channel whose readers want stories that get a REACTION — a reply, a share, a "whoa". Rate this item 1-10 on three criteria:
 
-Score 1-3 for routine/mundane news (polls, surveys, scheduled events, minor updates, ads, promotions, daily stats, ongoing stories without new developments).
-Score 4-6 for moderately notable news (industry-relevant, limited broader impact).
-Score 7-10 for genuinely surprising, high-impact, or urgent news that would make someone say "wow".
+- surprising: Would a reader stop scrolling? Firsts, records, reversals, weird discoveries, dramatic numbers, things that break a pattern.
+- impact: Real stakes. Does it change what things cost, what people can do, who holds power, or move serious money? Statements by heads of state and top-tier public figures (presidents, prime ministers, Elon Musk-level figures) score at least 6 here — their words move markets and policy. Routine commentary from lesser officials does not.
+- talkability: Would someone tag a friend, argue about it, or react with an emoji? Outrage, humor, spectacle, controversy, "can you believe this" energy all count. Prediction-market odds on dramatic questions count too.
 
-IMPORTANT CALIBRATION RULES:
-- Public statements, posts, or rants by major world leaders, heads of state, or highly influential public figures (e.g. presidents, prime ministers, billionaires with large public platforms) score at least 6 on impact regardless of tone — their words carry inherent news value even if the content is opinion or commentary.
-- Entertainment value and humor are valid reasons to score higher on "surprising".
+CALIBRATION — score 1-2 on ALL THREE, no matter how big the numbers look:
+- Routine scheduled data: price tickers, gainers/losers lists, fear & greed index, TVL/dominance stats, market overviews
+- Whale-wallet transfer alerts, stablecoin mint/burn notices
+- Promotions, airdrops, referral content, token launch hype
+- Fan memes and reaction content without a real event
+- Incremental follow-ups that add nothing new to an already-known story
+
+Score 3-5 for real but ordinary news: routine official commentary ("inflation still too high"), minor product updates, industry housekeeping, scheduled events going as planned.
+
+Score 6-8 for stories with a genuine hook: consumer price hikes, unusual scientific finds, provocative quotes from major figures, surprising study results, big-money surprises, David-vs-Goliath conflicts.
+
+Score 9-10 for jaw-droppers: major breaking events, historic firsts, huge reversals, scandals with names attached.
+
+EXAMPLES:
+- "Microsoft raises Xbox prices: Series X now $799.99" -> surprising 7, impact 7, talkability 8 (hits wallets, provokes outrage)
+- "Archaeologists find 5,000-year-old prototype of Stonehenge nearby" -> surprising 8, impact 4, talkability 7 (wow factor)
+- "Trump reported more crypto income than any US digital-asset company earned" -> surprising 8, impact 6, talkability 8
+- "Fed official: core inflation still too high, trending wrong way" -> surprising 2, impact 4, talkability 2 (routine commentary, no event)
+- "Top 100 24h Gainers: M +73%, UNI +15%..." -> surprising 1, impact 1, talkability 1 (scheduled data dump)
+- "Whale Alert: 50,000 ETH moved to Binance" -> surprising 1, impact 1, talkability 1 (wallet tracking noise)
 
 Category: {category}
 Content: {content[:1000]}
 
-Respond with ONLY this JSON, no other text:
-{{"surprising": 5, "impact": 5, "actionable": 5, "reasoning": "brief explanation"}}"""
+Respond with ONLY valid JSON in this exact format (replace each <> with your rating):
+{{"surprising": <1-10>, "impact": <1-10>, "talkability": <1-10>, "reasoning": "<one sentence>"}}"""
 
             # Call Ollama API
             response = requests.post(
@@ -870,10 +891,10 @@ Respond with ONLY this JSON, no other text:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
+                    "think": False,
                     "options": {
-                        "temperature": 0.3,  # Lower temperature for more consistent ratings
-                        "num_predict": 200,  # Give model enough room for JSON response
-                        "think": False
+                        "temperature": 0.1,  # Low temperature for consistent, comparable ratings
+                        "num_predict": 200   # Give model enough room for JSON response
                     }
                 },
                 timeout=300
@@ -893,42 +914,44 @@ Respond with ONLY this JSON, no other text:
             # Extract and validate scores
             surprising = max(1, min(10, int(rating_data.get('surprising', 5))))
             impact = max(1, min(10, int(rating_data.get('impact', 5))))
-            actionable = max(1, min(10, int(rating_data.get('actionable', 5))))
+            talkability = max(1, min(10, int(rating_data.get('talkability', 5))))
             reasoning = str(rating_data.get('reasoning', 'No reasoning provided'))
-            
+
             # Calculate weighted score
             weights = getattr(config, 'NEWSWORTHINESS_WEIGHTS', {
                 'surprising': 0.4,
-                'impact': 0.35,
-                'actionable': 0.25
+                'impact': 0.3,
+                'talkability': 0.3
             })
-            
+
             weighted_score = (
                 surprising * weights.get('surprising', 0.4) +
-                impact * weights.get('impact', 0.35) +
-                actionable * weights.get('actionable', 0.25)
+                impact * weights.get('impact', 0.3) +
+                talkability * weights.get('talkability', 0.3)
             )
-            
-            # Check against threshold
-            threshold = getattr(config, 'NEWSWORTHINESS_THRESHOLD', 5.0)
+
+            # Check against threshold: explicit arg > per-category > global default
+            if threshold is None:
+                per_category = getattr(config, 'NEWSWORTHINESS_THRESHOLD_BY_CATEGORY', {})
+                threshold = per_category.get(category, getattr(config, 'NEWSWORTHINESS_THRESHOLD', 5.0))
             passed = weighted_score >= threshold
-            
+
             result_dict = {
                 'score': round(weighted_score, 1),
                 'surprising': surprising,
                 'impact': impact,
-                'actionable': actionable,
+                'talkability': talkability,
                 'reasoning': reasoning,
                 'passed': passed
             }
-            
+
             # Log the rating
             status = "PASS" if passed else "FAIL"
             logger.info(
-                f"Newsworthiness: {weighted_score:.1f}/10 (S:{surprising} I:{impact} A:{actionable}) "
-                f"[{status}] - \"{reasoning}\""
+                f"Reaction-worthiness: {weighted_score:.1f}/10 (S:{surprising} I:{impact} T:{talkability}) "
+                f"[{status} @ {threshold}] - \"{reasoning}\""
             )
-            
+
             return result_dict
             
         except json.JSONDecodeError as e:
@@ -939,7 +962,7 @@ Respond with ONLY this JSON, no other text:
                 'score': 10.0,
                 'surprising': 10,
                 'impact': 10,
-                'actionable': 10,
+                'talkability': 10,
                 'reasoning': f'JSON parse error — letting through: {str(e)[:50]}',
                 'passed': True
             }
@@ -951,7 +974,7 @@ Respond with ONLY this JSON, no other text:
                 'score': 10.0,
                 'surprising': 10,
                 'impact': 10,
-                'actionable': 10,
+                'talkability': 10,
                 'reasoning': f'Rating error — letting through: {str(e)[:50]}',
                 'passed': True
             }
