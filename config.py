@@ -424,6 +424,13 @@ DISCORD_FILE_SIZE_LIMIT_MB = 25
 FEEDBACK_LEARNING_ENABLED = True  # Enable learning from user feedback (removed entries)
 FEEDBACK_EXAMPLES_COUNT = 10  # Number of removed entries to include in system prompt
 
+# Reaction-Gate Feedback Learning
+# Entries the gate passed but the user demoted to ignore are injected into the
+# rate_newsworthiness prompt as "score content like this low" examples, so the
+# gate keeps learning the user's taste from their corrections. Refreshes hourly.
+GATE_FEEDBACK_EXAMPLES_ENABLED = True
+GATE_FEEDBACK_EXAMPLES_COUNT = 8
+
 # Ignore-entry Learning Configuration
 # Feeds entries categorized as 'ignore' (including user-recategorized ones) into the AI
 # system prompt as additional negative examples. User-flagged ignores are prioritized.

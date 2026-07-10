@@ -368,6 +368,29 @@ class Database:
                 'newsworthiness_score': row['newsworthiness_score'] if 'newsworthiness_score' in keys else None
             }
     
+    def get_gate_demotion_examples(self, limit=8, max_preview_length=120):
+        """
+        Entries the reaction gate passed (posted to a real category) but the user
+        then demoted to ignore. Used as negative few-shot examples in the
+        rate_newsworthiness prompt so the gate learns the user's taste.
+
+        Returns:
+            list of (content_preview, gate_score) tuples, newest first
+        """
+        with get_db_lock():
+            rows = self.conn.execute(
+                """SELECT content, newsworthiness_score FROM message_mapping
+                   WHERE category = 'ignore'
+                     AND newsworthiness_score IS NOT NULL
+                     AND (placement_reason LIKE 'User re-categorization%'
+                          OR placement_reason LIKE 'User label update%')
+                     AND content IS NOT NULL AND TRIM(content) != ''
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            return [(row['content'][:max_preview_length], row['newsworthiness_score'])
+                    for row in rows]
+
     def get_entry_id_by_discord_message(self, discord_message_id):
         """
         Fast reverse lookup: get entry ID from Discord message ID

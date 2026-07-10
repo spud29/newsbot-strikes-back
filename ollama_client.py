@@ -71,6 +71,10 @@ class OllamaClient:
         self._cache_timestamp = 0
         self._cache_ttl = 3600  # 1 hour
 
+        # Cache for the reaction-gate feedback block (user demotions as negative examples)
+        self._gate_feedback_cache = None
+        self._gate_feedback_timestamp = 0
+
         logger.info(f"Ollama client initialized: {self.base_url}")
     
     def generate_enhanced_system_prompt(self):
@@ -813,6 +817,48 @@ class OllamaClient:
             logger.error(f"Error generating embedding: {e}")
             raise
     
+    def _gate_feedback_block(self):
+        """
+        Build the user-feedback section of the rating prompt: recent entries the
+        gate passed but the user demoted to ignore. Cached for an hour so each
+        rating call doesn't hit the DB.
+
+        Returns:
+            str: Prompt block (empty string when disabled or no examples yet)
+        """
+        if not getattr(config, 'GATE_FEEDBACK_EXAMPLES_ENABLED', True) or not self.database:
+            return ""
+
+        now = time.time()
+        if self._gate_feedback_cache is not None and (now - self._gate_feedback_timestamp) < self._cache_ttl:
+            return self._gate_feedback_cache
+
+        block = ""
+        try:
+            examples = self.database.get_gate_demotion_examples(
+                limit=getattr(config, 'GATE_FEEDBACK_EXAMPLES_COUNT', 8),
+                max_preview_length=120
+            )
+            if examples:
+                lines = []
+                for preview, old_score in examples:
+                    clean = " ".join(preview.split())
+                    lines.append(f'- (was wrongly scored {old_score}) "{clean}"')
+                block = (
+                    "\nOVERRIDING RULE — RECENT USER FEEDBACK. The channel owner removed these "
+                    "exact posts as boring. This overrides every scoring rule above: if the item "
+                    "is one of these or closely resembles one (same company, same event type, or "
+                    "same style of story), cap surprising, impact, AND talkability at 4:\n"
+                    + "\n".join(lines) + "\n"
+                )
+                logger.debug(f"Gate feedback block built with {len(examples)} demotion examples")
+        except Exception as e:
+            logger.error(f"Error building gate feedback block: {e}")
+
+        self._gate_feedback_cache = block
+        self._gate_feedback_timestamp = now
+        return block
+
     @retry_with_backoff(max_retries=3, initial_delay=2)
     def rate_newsworthiness(self, content, category, threshold=None):
         """
@@ -849,6 +895,9 @@ class OllamaClient:
             }
 
         try:
+            # Recent user demotions become negative few-shot examples (cached hourly)
+            feedback_block = self._gate_feedback_block()
+
             # Build the rating prompt — kept concise so the model reliably returns JSON
             prompt = f"""You rate news items for a Discord news channel whose readers want stories that get a REACTION — a reply, a share, a "whoa". Rate this item 1-10 on three criteria:
 
@@ -863,20 +912,28 @@ CALIBRATION — score 1-2 on ALL THREE, no matter how big the numbers look:
 - Fan memes and reaction content without a real event
 - Incremental follow-ups that add nothing new to an already-known story
 
+SINGLE-COMPANY RULE — a big dollar figure is NOT impact. Ask: whose life changes?
+- ONE firm's operational news scores at most 4-5 overall: its regulatory approval or license, treasury buys/sells, debt moves, product/feature launches, exchange listings, earnings-as-expected.
+- Hacks, exploits, or losses hitting ONE wallet, whale, or firm are insider noise: at most 4-5 overall. Systemic events (major exchange halts withdrawals, protocol-wide exploit affecting thousands) are the exception.
+- Reserve impact 6+ for industry-wide rules, government policy, or events that change what MANY ordinary people can do or pay.
+
 Score 3-5 for real but ordinary news: routine official commentary ("inflation still too high"), minor product updates, industry housekeeping, scheduled events going as planned.
 
-Score 6-8 for stories with a genuine hook: consumer price hikes, unusual scientific finds, provocative quotes from major figures, surprising study results, big-money surprises, David-vs-Goliath conflicts.
+Score 6-8 for stories with a genuine hook: consumer price hikes, unusual scientific finds, provocative quotes from major figures, surprising study results, policy shifts with broad reach, David-vs-Goliath conflicts.
 
 Score 9-10 for jaw-droppers: major breaking events, historic firsts, huge reversals, scandals with names attached.
 
 EXAMPLES:
 - "Microsoft raises Xbox prices: Series X now $799.99" -> surprising 7, impact 7, talkability 8 (hits wallets, provokes outrage)
 - "Archaeologists find 5,000-year-old prototype of Stonehenge nearby" -> surprising 8, impact 4, talkability 7 (wow factor)
-- "Trump reported more crypto income than any US digital-asset company earned" -> surprising 8, impact 6, talkability 8
+- "Japan moves toward legalizing crypto ETFs under financial products law" -> surprising 7, impact 7, talkability 7 (industry-wide policy shift)
+- "Circle receives final OCC approval to establish national trust bank" -> surprising 4, impact 4, talkability 3 (one firm's regulatory milestone)
+- "Bitcoin treasury firm sold 1,400 BTC to repay debt" -> surprising 3, impact 3, talkability 3 (one firm's treasury housekeeping)
+- "Early Solana whale hacked for $14.2M, funds bridged to Ethereum" -> surprising 4, impact 3, talkability 4 (one wallet's loss, insider noise)
 - "Fed official: core inflation still too high, trending wrong way" -> surprising 2, impact 4, talkability 2 (routine commentary, no event)
 - "Top 100 24h Gainers: M +73%, UNI +15%..." -> surprising 1, impact 1, talkability 1 (scheduled data dump)
 - "Whale Alert: 50,000 ETH moved to Binance" -> surprising 1, impact 1, talkability 1 (wallet tracking noise)
-
+{feedback_block}
 Category: {category}
 Content: {content[:1000]}
 
