@@ -7,6 +7,7 @@ import signal
 import sys
 import subprocess
 import os
+from collections import deque
 from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, cleanup_bot_log, shorten_dexerto_url_in_text
 import config
 from db_connection import close_db_connection
@@ -53,6 +54,7 @@ class NewsAggregatorBot:
 
         self.running = False
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
+        self._recent_post_times = deque()  # Timestamps of non-ignore posts (flood guard)
         self._last_log_cleanup: float = 0.0
         self._last_nightly_rebuild: float = 0.0
         # Persisted across restarts so a weekly report isn't re-posted every restart
@@ -373,17 +375,9 @@ class NewsAggregatorBot:
                     )
                     return False
                 
-                # Pause mode: route everything to ignore while preserving AI category
-                if getattr(config, 'PAUSE_MODE', False):
-                    original_category = category
-                    category = 'ignore'
-                    secondary_category = None
-                    reasoning = (
-                        f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
-                        f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
-                    )
-                    logger.info(f"Pause mode: routing '{original_category}' to 'ignore'")
-                    placement_reason = f"Pause mode override: bot was paused, routed to ignore instead of '{original_category}'"
+                # NOTE: pause mode / auto-post gating now happens AFTER the content
+                # filters (see "Routing decision" below) so the reaction gate runs
+                # and its scores are recorded even while the bot is in review mode.
 
                 # If exact duplicate was detected, override category to ignore
                 # but preserve the AI reasoning and append duplicate info
@@ -511,12 +505,18 @@ class NewsAggregatorBot:
                         self.media_handler.cleanup_entry_media(entry)
                         return True
                 
-                # Apply newsworthiness filter (skip for similar, superseded, or already-ignore entries)
-                if not similarity_info and not superseded and category != 'ignore':
-                    if getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
-                        logger.debug("Rating newsworthiness...")
+                # Reaction-worthiness gate (skip for similar/superseded entries).
+                # Two directions:
+                #   demote — AI assigned a real category but the entry is boring
+                #   rescue — AI said ignore but the entry is too interesting to bury
+                newsworthiness_score = None
+                if not similarity_info and not superseded and not duplicate_info \
+                        and getattr(config, 'NEWSWORTHINESS_FILTER_ENABLED', False):
+                    if category != 'ignore':
+                        logger.debug("Rating reaction-worthiness...")
                         newsworthiness = await asyncio.to_thread(self.ollama.rate_newsworthiness, combined_content, category)
-                        
+                        newsworthiness_score = newsworthiness['score']
+
                         if not newsworthiness['passed']:
                             original_category = category
                             category = 'ignore'
@@ -538,6 +538,37 @@ class NewsAggregatorBot:
                                 f"- routing from '{original_category}' to 'ignore' "
                                 f"(reason: {newsworthiness['reasoning']})"
                             )
+                    elif _ai_category == 'ignore' and getattr(config, 'HIGH_SCORE_RESCUE_ENABLED', False):
+                        # AI said ignore — 28% of those were user-rescued historically.
+                        # Rate anyway; a very high reaction score earns a second look.
+                        rescue_threshold = getattr(config, 'RESCUE_NEWSWORTHINESS_THRESHOLD', 7.5)
+                        logger.debug("Rating reaction-worthiness of AI-ignored entry (rescue check)...")
+                        newsworthiness = await asyncio.to_thread(
+                            self.ollama.rate_newsworthiness, combined_content, 'general news', rescue_threshold
+                        )
+                        newsworthiness_score = newsworthiness['score']
+
+                        if newsworthiness['passed']:
+                            rescued_cat, rescued_reasoning, rescued_secondary = await asyncio.to_thread(
+                                self.ollama.categorize, combined_content, ['ignore']
+                            )
+                            if rescued_cat != 'ignore':
+                                category = rescued_cat
+                                secondary_category = rescued_secondary
+                                reasoning = (
+                                    f"AI suggested 'ignore' but reaction gate scored "
+                                    f"{newsworthiness['score']:.1f}/10 — rescued as '{rescued_cat}': "
+                                    f"{rescued_reasoning or 'no reasoning provided'}"
+                                )
+                                placement_reason = (
+                                    f"Gate rescue: AI said 'ignore' but reaction score "
+                                    f"{newsworthiness['score']:.1f}/10 >= {rescue_threshold}, "
+                                    f"re-categorized as '{rescued_cat}'"
+                                )
+                                logger.info(
+                                    f"Gate rescue: score {newsworthiness['score']:.1f}/10 "
+                                    f"— promoting AI-ignored entry to '{rescued_cat}'"
+                                )
                 
                 # Filter short videos (under threshold) to ignore channel
                 if not similarity_info and not superseded and category != 'ignore':
@@ -578,6 +609,58 @@ class NewsAggregatorBot:
                             logger.info(
                                 f"Audience question filter: entry ends with reader-engagement question "
                                 f"- routing from '{original_category}' to 'ignore'"
+                            )
+
+                # Routing decision: pause mode, category graduation, flood guard.
+                # Runs AFTER the content filters so gate scores and filter verdicts are
+                # recorded honestly even while the bot is paused or a category is
+                # still under review.
+                if category != 'ignore':
+                    auto_post = getattr(config, 'AUTO_POST_CATEGORIES', None)
+                    if getattr(config, 'PAUSE_MODE', False):
+                        original_category = category
+                        category = 'ignore'
+                        secondary_category = None
+                        reasoning = (
+                            f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                            f"| OVERRIDDEN: Pause mode enabled - all entries routed to ignore"
+                        )
+                        placement_reason = f"Pause mode override: bot was paused, routed to ignore instead of '{original_category}'"
+                        logger.info(f"Pause mode: routing '{original_category}' to 'ignore'")
+                    elif auto_post is not None and category not in auto_post:
+                        original_category = category
+                        category = 'ignore'
+                        secondary_category = None
+                        reasoning = (
+                            f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                            f"| OVERRIDDEN: category not graduated to auto-post, routed to ignore for review"
+                        )
+                        placement_reason = (
+                            f"Graduation override: '{original_category}' not in AUTO_POST_CATEGORIES, "
+                            f"routed to ignore for review"
+                        )
+                        logger.info(f"Category '{original_category}' not graduated - routing to 'ignore' for review")
+                    else:
+                        # Flood guard: cap auto-posts per rolling hour
+                        max_per_hour = getattr(config, 'MAX_AUTO_POSTS_PER_HOUR', 0)
+                        now = time.time()
+                        while self._recent_post_times and now - self._recent_post_times[0] > 3600:
+                            self._recent_post_times.popleft()
+                        if max_per_hour and len(self._recent_post_times) >= max_per_hour:
+                            original_category = category
+                            category = 'ignore'
+                            secondary_category = None
+                            reasoning = (
+                                f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                                f"| OVERRIDDEN: rate limit ({max_per_hour} posts/hour) exceeded"
+                            )
+                            placement_reason = (
+                                f"Rate limit override: {max_per_hour} posts in the last hour, "
+                                f"routed '{original_category}' to ignore"
+                            )
+                            logger.warning(
+                                f"Flood guard: {max_per_hour} posts in the last hour - "
+                                f"routing '{original_category}' entry to 'ignore'"
                             )
 
                 # Strip wire-service prefixes (e.g. "JUST IN:", "BREAKING:", "🚨NEW:")
@@ -666,9 +749,14 @@ class NewsAggregatorBot:
                             original_category=_ai_category,
                             placement_reason=placement_reason,
                             secondary_category=secondary_category,
-                            original_secondary_category=_ai_secondary_category
+                            original_secondary_category=_ai_secondary_category,
+                            newsworthiness_score=newsworthiness_score
                         )
-                    
+
+                    # Track post time for the flood guard
+                    if category != 'ignore':
+                        self._recent_post_times.append(time.time())
+
                     # Update last message ID for Telegram entries
                     if source_type == 'telegram':
                         message_id = entry.get('message_id')
@@ -1089,7 +1177,9 @@ class NewsAggregatorBot:
             )
             
             if success:
-                # Update the stored content in the mapping (preserve source_url, category, and source_type)
+                # Update the stored content in the mapping. INSERT OR REPLACE rewrites the
+                # whole row, so every metadata field must be carried over or it gets nulled
+                # (placement_reason/secondary_category were being lost on edits before).
                 await asyncio.to_thread(
                     self.db.store_message_mapping,
                     telegram_entry_id=entry_id,
@@ -1102,7 +1192,11 @@ class NewsAggregatorBot:
                     category=mapping_info.get('category'),
                     source_type=mapping_info.get('source_type', 'telegram'),
                     reasoning=mapping_info.get('reasoning'),
-                    original_category=mapping_info.get('original_category')
+                    original_category=mapping_info.get('original_category'),
+                    placement_reason=mapping_info.get('placement_reason'),
+                    secondary_category=mapping_info.get('secondary_category'),
+                    original_secondary_category=mapping_info.get('original_secondary_category'),
+                    newsworthiness_score=mapping_info.get('newsworthiness_score')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:

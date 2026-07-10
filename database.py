@@ -278,7 +278,7 @@ class Database:
             'message_mappings': mapping_count
         }
     
-    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None, original_category=None, placement_reason=None, secondary_category=None, original_secondary_category=None):
+    def store_message_mapping(self, telegram_entry_id, telegram_message_id, discord_channel_id, discord_message_id, content=None, source_url=None, video_urls=None, category=None, source_type=None, reasoning=None, original_category=None, placement_reason=None, secondary_category=None, original_secondary_category=None, newsworthiness_score=None):
         """
         Store mapping between Telegram and Discord messages
 
@@ -297,14 +297,16 @@ class Database:
             placement_reason: Human-readable explanation of why this entry is in its current category
             secondary_category: Optional second category for cross-topic entries
             original_secondary_category: AI's initial secondary category before user changes
+            newsworthiness_score: Reaction-worthiness gate score (1-10) if the gate ran
         """
         with get_db_lock():
             self.conn.execute(
                 """INSERT OR REPLACE INTO message_mapping
                    (entry_id, telegram_message_id, discord_channel_id, discord_message_id,
                     content, source_url, video_urls, category, source_type, reasoning, timestamp,
-                    original_category, placement_reason, secondary_category, original_secondary_category)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    original_category, placement_reason, secondary_category, original_secondary_category,
+                    newsworthiness_score)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     telegram_entry_id,
                     telegram_message_id,
@@ -320,7 +322,8 @@ class Database:
                     original_category if original_category is not None else category,
                     placement_reason,
                     secondary_category,
-                    original_secondary_category if original_secondary_category is not None else secondary_category
+                    original_secondary_category if original_secondary_category is not None else secondary_category,
+                    newsworthiness_score
                 )
             )
             self.conn.commit()
@@ -361,7 +364,8 @@ class Database:
                 'original_category': row['original_category'] if 'original_category' in keys else row['category'],
                 'placement_reason': row['placement_reason'] if 'placement_reason' in keys else None,
                 'secondary_category': row['secondary_category'] if 'secondary_category' in keys else None,
-                'original_secondary_category': row['original_secondary_category'] if 'original_secondary_category' in keys else None
+                'original_secondary_category': row['original_secondary_category'] if 'original_secondary_category' in keys else None,
+                'newsworthiness_score': row['newsworthiness_score'] if 'newsworthiness_score' in keys else None
             }
     
     def get_entry_id_by_discord_message(self, discord_message_id):

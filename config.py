@@ -100,7 +100,30 @@ FALLBACK_CATEGORY = "general news"
 # Pause Mode - When enabled, ALL entries are routed to the 'ignore' channel
 # regardless of their AI categorization. The original category is preserved in reasoning.
 # Useful for temporarily silencing all channels without changing any other config.
-PAUSE_MODE = True
+# This is the master kill switch: it overrides AUTO_POST_CATEGORIES.
+# Disabled 2026-07-10: automation enabled with the calibrated reaction gate
+# (see evals/calibrate_reaction_gate.py and PLAN.md status log).
+PAUSE_MODE = False
+
+# Categories allowed to auto-post when PAUSE_MODE is False (PLAN.md Phase 2/3).
+# None  = every category auto-posts (full automation).
+# list  = only the listed categories auto-post; everything else routes to the
+#         ignore channel for manual review. Use this as the per-category
+#         rollback lever if one category starts misbehaving.
+AUTO_POST_CATEGORIES = None
+
+# High-score rescue: when the AI says 'ignore' but the reaction-worthiness gate
+# scores the entry at/above this threshold, re-categorize it (with 'ignore'
+# excluded) and let it post. Catches interesting stories the categorizer's
+# quality rules would otherwise bury (28% of AI ignores were user-rescued).
+# Threshold calibrated with evals/calibrate_reaction_gate.py — keep it strict:
+# junk flooding back into the feed defeats the point of the filter.
+HIGH_SCORE_RESCUE_ENABLED = True
+RESCUE_NEWSWORTHINESS_THRESHOLD = 7.5
+
+# Flood guard: max non-ignore posts per rolling hour when auto-posting.
+# Entries over the cap go to the ignore channel with a rate-limit reason.
+MAX_AUTO_POSTS_PER_HOUR = 25
 
 # Unified Channel Mode - route ALL non-ignore categories to a single Discord channel.
 # Each message is prefixed with a bold [Category] tag so readers can filter by topic.
@@ -464,12 +487,19 @@ AUDIENCE_QUESTION_FILTER_ENABLED = True
 CAPS_FIX_ENABLED = True
 CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
 
-NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the newsworthiness filter
-NEWSWORTHINESS_THRESHOLD = 6.0  # Post solid news; "wow tier" was too aggressive at 7.0
+NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the reaction-worthiness gate
+# Default cutoff. Calibrated 2026-07-10 against 30 days of user move/leave decisions
+# (evals/runs/reaction_calibration_20260710T203505Z.json): at 6.0 the gate passes
+# 71% of user-approved entries and blocks 47% of user-left ones — the best
+# precision knee for a "reaction-worthy" channel. The weekly accuracy report's
+# REACTION GATE section re-derives the best threshold as cleaner data accumulates.
+NEWSWORTHINESS_THRESHOLD = 6.0
+# Per-category threshold overrides (categories not listed use NEWSWORTHINESS_THRESHOLD)
+NEWSWORTHINESS_THRESHOLD_BY_CATEGORY = {}
 NEWSWORTHINESS_WEIGHTS = {
-    'surprising': 0.45,   # 45% weight - must be genuinely unexpected, not routine
-    'impact': 0.35,       # 35% weight - must affect many people significantly
-    'actionable': 0.20    # 20% weight - should prompt action or attention
+    'surprising': 0.40,   # would a reader stop scrolling?
+    'impact': 0.30,       # real stakes — money, power, what things cost
+    'talkability': 0.30   # would someone share it, argue about it, react to it?
 }
 
 # Entry Superseding Configuration

@@ -8,22 +8,33 @@ Each iteration session: run `python accuracy_report.py` first, append a line her
 |---|---|---|
 | 2026-07-09 | Phase 1 enabled: FEEDBACK_LEARNING, IGNORE_EXAMPLES, CORRECTION_EXAMPLES, IGNORE_RESCUE all set to True. Built `accuracy_report.py`. Awaiting service restart to take effect. | 7-day baseline: politics 99.6% (223 reviewed), AI 97.4% (38), sports 97.0% (33), stocks 91.7%, crypto 92.3%, general news 83.1%. Ignore precision 72% (67 rescues / 240). Top confusion: general news→politics (9). |
 | 2026-07-09 | Automated the accuracy report: bot now posts it to the ignore channel weekly (ACCURACY_REPORT_* settings in config.py, default: every 7 days at 9 AM local). Last-posted time persists in `data/accuracy_report_state.txt`. | Same baseline as above. |
+| 2026-07-10 | **Phases 2+3 enabled (full automation).** Fixed `think:False` being silently ignored (was inside Ollama `options`; qwen3 burned its whole token budget thinking — the newsworthiness rater had NEVER produced real output). Rewrote the rater as a reaction-worthiness gate (surprise/impact/talkability) and calibrated it against 30 days of user move/leave decisions (`evals/calibrate_reaction_gate.py`, 480 samples). Pipeline reordered so the gate runs before pause/graduation routing and its score persists to `message_mapping.newsworthiness_score`. Added: gate rescue for AI-ignored entries (threshold 7.5), AUTO_POST_CATEGORIES lever (None = all graduated), flood guard (25 posts/hour), gate section in the weekly accuracy report. `PAUSE_MODE = False`. | 7-day: politics 100% (222 reviewed), AI 97.8%, sports 97.2%, crypto 94.9%, stocks 90%. Calibration at threshold 6.0: passes 71% of user-approved, blocks 47% of user-left (labels noisy — many "left" entries were skipped duplicates, not boring). Rescue at 7.5: ~60% precision, low volume. |
 
-## Current State
+## Current State (updated 2026-07-10)
 
-The bot is running in a fully manual review mode. Every entry is processed through the full pipeline (fetch → categorize → filter → embed), but `PAUSE_MODE = True` forces everything to the ignore channel. You review entries there and manually move good ones to the unified channel via "Move to Channel" or `/move`.
+**The bot is auto-posting.** `PAUSE_MODE = False`, all categories graduated (`AUTO_POST_CATEGORIES = None`). The decision chain per entry:
 
-The key insight: **you're already generating training data** — every time you move an entry from ignore to the unified channel, or re-categorize a mislabeled entry, the database records it. But the feedback learning systems that would USE this data are all disabled:
+1. Categorizer assigns a category (feedback-enhanced prompt, Phase 1 learning live).
+2. Duplicate/similarity suppression as before.
+3. **Reaction-worthiness gate** (`rate_newsworthiness`): real-category entries scoring below `NEWSWORTHINESS_THRESHOLD` (6.0) are demoted to ignore; AI-ignored entries scoring ≥ `RESCUE_NEWSWORTHINESS_THRESHOLD` (7.5) are re-categorized and rescued. Every score persists in `message_mapping.newsworthiness_score`.
+4. Short-video and audience-question filters as before.
+5. Routing: pause kill switch → graduation allowlist → flood guard (`MAX_AUTO_POSTS_PER_HOUR`).
+
+Manual moves are now the exception, not the workflow — and each one still feeds the learning loop and the weekly report's REACTION GATE section, which re-derives the best threshold from post-automation data (demotes/rescues are much cleaner labels than pause-mode move/leave).
+
+**Rollback levers** (strongest first): `PAUSE_MODE = True` (everything back to review); `AUTO_POST_CATEGORIES = [...]` (only listed categories post); raise `NEWSWORTHINESS_THRESHOLD` (stricter gate); `HIGH_SCORE_RESCUE_ENABLED = False` (no rescues).
 
 | Toggle | Status | Effect |
 |---|---|---|
-| `PAUSE_MODE` | ON | Everything → ignore |
-| `FEEDBACK_LEARNING_ENABLED` | OFF | Removed entries not used as negative examples |
-| `IGNORE_EXAMPLES_ENABLED` | OFF | Ignore-channel entries not used as negative examples |
-| `CORRECTION_EXAMPLES_ENABLED` | OFF | User re-categorizations not fed back to AI |
-| `IGNORE_RESCUE_ENABLED` | OFF | Ignore→category rescues not fed back to AI |
-| `SUPERSEDE_ENABLED` | OFF | No auto-replacement of old entries |
-| `TRANSCRIPTION_ENABLED` | OFF | No audio transcription from videos |
+| `PAUSE_MODE` | OFF | Entries auto-post through the filter chain |
+| `AUTO_POST_CATEGORIES` | None (all) | Every category graduated |
+| `FEEDBACK_LEARNING_ENABLED` | ON | Removed entries used as negative examples |
+| `IGNORE_EXAMPLES_ENABLED` | ON | Ignore-channel entries used as negative examples |
+| `CORRECTION_EXAMPLES_ENABLED` | ON | User re-categorizations fed back to AI |
+| `IGNORE_RESCUE_ENABLED` | ON | Ignore→category rescues fed back to AI |
+| `HIGH_SCORE_RESCUE_ENABLED` | ON | Gate rescues buried-but-interesting AI ignores |
+| `SUPERSEDE_ENABLED` | OFF | No auto-replacement of old entries (Phase 4, next) |
+| `TRANSCRIPTION_ENABLED` | OFF | No audio transcription from videos (Phase 5) |
 
 ---
 

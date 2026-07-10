@@ -47,6 +47,7 @@ data/*.bak
 data/newsbot.db
 data/newsbot.db-shm
 data/newsbot.db-wal
+data/accuracy_report_state.txt
 
 # Temporary media files
 temp_media/

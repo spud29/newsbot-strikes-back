@@ -31,6 +31,9 @@ ROUTING_CAUSES = [
     ("Content filter: newsworthiness", "newsworthiness"),
     ("Content filter: short video", "short_video"),
     ("Content filter: audience engagement", "audience_question"),
+    ("Gate rescue", "gate_rescue"),
+    ("Graduation override", "graduation"),
+    ("Rate limit override", "rate_limited"),
     ("AI categorized as", "direct"),
     ("User re-categorization", "user_moved"),
     ("User label update", "user_moved"),
@@ -63,6 +66,11 @@ def classify(row):
     ai_cat = row["original_category"] or row["category"]
     cur_cat = row["category"]
     cause = routing_cause(row["placement_reason"])
+
+    # Gate rescue: AI said ignore but the reaction gate promoted it. Attribute the
+    # posted category to the pipeline (not the user) — untouched until the user acts.
+    if cause == "gate_rescue":
+        return cur_cat, "untouched"
 
     if ai_cat == "ignore":
         return ai_cat, ("rescued" if cur_cat != "ignore" else "stayed_ignored")
@@ -98,7 +106,8 @@ def build_report(days=7, db_path=DB_PATH):
         window_label = "all time" if days == 0 else f"last {days} days"
 
         rows = conn.execute(
-            """SELECT category, original_category, placement_reason, user_reason
+            """SELECT category, original_category, placement_reason, user_reason,
+                      newsworthiness_score, timestamp
                FROM message_mapping
                WHERE timestamp >= ?""",
             (cutoff,),
@@ -175,6 +184,53 @@ def build_report(days=7, db_path=DB_PATH):
             out.append("-" * 40)
             for cat, count in rescues.most_common():
                 out.append(f"{cat:25} {count:>6}")
+
+        # ---- Reaction gate performance ----
+        # Uses the persisted newsworthiness_score: compares what the gate would do
+        # at the current threshold against what the user actually did.
+        try:
+            import config as _config
+            gate_threshold = getattr(_config, "NEWSWORTHINESS_THRESHOLD", 6.0)
+        except Exception:
+            gate_threshold = 6.0
+
+        review_lag = time.time() - 86400  # entries younger than 24h may be unreviewed
+        gate_pos, gate_neg = [], []       # scores of entries user approved / rejected
+        for row in rows:
+            score = row["newsworthiness_score"]
+            if score is None:
+                continue
+            _, outcome = classify(row)
+            if outcome in ("confirmed", "corrected", "rescued", "untouched"):
+                gate_pos.append(score)
+            elif outcome == "demoted" or (
+                outcome in ("in_review", "stayed_ignored") and row["timestamp"] < review_lag
+            ):
+                gate_neg.append(score)
+
+        if gate_pos or gate_neg:
+            out.append("\nREACTION GATE (newsworthiness score vs. user judgment)")
+            out.append("-" * 60)
+            n_pass_pos = sum(1 for s in gate_pos if s >= gate_threshold)
+            n_pass_neg = sum(1 for s in gate_neg if s >= gate_threshold)
+            out.append(f"User-approved entries scored: {len(gate_pos)} "
+                       f"(gate at {gate_threshold} would post {n_pass_pos} = "
+                       f"{n_pass_pos / len(gate_pos):.0%})" if gate_pos else
+                       "User-approved entries scored: 0")
+            out.append(f"User-rejected entries scored: {len(gate_neg)} "
+                       f"(gate at {gate_threshold} would post {n_pass_neg} = "
+                       f"{n_pass_neg / len(gate_neg):.0%})" if gate_neg else
+                       "User-rejected entries scored: 0")
+            if gate_pos and gate_neg:
+                best_t, best_acc = gate_threshold, 0.0
+                t = 4.0
+                while t <= 8.01:
+                    acc = (sum(1 for s in gate_pos if s >= t)
+                           + sum(1 for s in gate_neg if s < t)) / (len(gate_pos) + len(gate_neg))
+                    if acc > best_acc:
+                        best_t, best_acc = round(t, 2), acc
+                    t += 0.25
+                out.append(f"Best threshold on this window: {best_t} ({best_acc:.0%} agreement)")
 
         # ---- Removals ----
         removed = conn.execute(

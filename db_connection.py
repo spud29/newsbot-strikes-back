@@ -163,6 +163,10 @@ def _run_migrations(conn):
         conn.execute("ALTER TABLE message_mapping ADD COLUMN original_secondary_category TEXT DEFAULT NULL")
         conn.commit()
 
+    if 'newsworthiness_score' not in columns:
+        conn.execute("ALTER TABLE message_mapping ADD COLUMN newsworthiness_score REAL DEFAULT NULL")
+        conn.commit()
+
 
 def close_db_connection():
     """Close the shared connection (call on shutdown)."""
