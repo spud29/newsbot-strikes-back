@@ -132,7 +132,7 @@ def run_categorization(rows: list[dict]) -> list[str]:
     preds: list[str] = []
     for row in iterator:
         try:
-            cat, _reasoning = ollama.categorize(row["content"])
+            cat, _reasoning, _secondary = ollama.categorize(row["content"])
         except Exception as e:
             print(f"  error on {row.get('entry_id')}: {e}", file=sys.stderr)
             cat = "ignore"  # conservative fallback matches live-bot error path
