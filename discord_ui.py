@@ -5,7 +5,7 @@ import discord
 import asyncio
 import config
 import re
-from utils import logger, ensure_url_on_own_line, shorten_urls_in_text
+from utils import logger, ensure_url_on_own_line, shorten_urls_in_text, format_category_label
 
 
 _UNCHANGED = object()
@@ -105,7 +105,7 @@ class RecategorizeView(discord.ui.View):
             elif cat == config.DEFAULT_CATEGORY:
                 options.append(discord.SelectOption(label="Ignore", value=cat))
             else:
-                options.append(discord.SelectOption(label=cat.title(), value=cat))
+                options.append(discord.SelectOption(label=format_category_label(cat), value=cat))
 
         select = discord.ui.Select(
             placeholder=f"Currently: {current_cat} — pick a new category",
@@ -356,7 +356,7 @@ class SetCategoryView(discord.ui.View):
 
         # Primary category dropdown (row 0)
         primary_options = [
-            discord.SelectOption(label=cat.title(), value=cat)
+            discord.SelectOption(label=format_category_label(cat), value=cat)
             for cat in sorted(available_categories)
         ]
         primary_select = discord.ui.Select(
@@ -375,7 +375,7 @@ class SetCategoryView(discord.ui.View):
             if cat != config.DEFAULT_CATEGORY and cat != current_cat:
                 is_current = (cat == self.current_secondary)
                 secondary_options.append(discord.SelectOption(
-                    label=cat.title(), value=cat, default=is_current
+                    label=format_category_label(cat), value=cat, default=is_current
                 ))
         sec_label = self.current_secondary or "none"
         secondary_select = discord.ui.Select(

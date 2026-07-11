@@ -10,7 +10,7 @@ import re
 import aiohttp
 import tempfile
 import hashlib
-from utils import logger, retry_with_backoff, ensure_url_on_own_line, shorten_urls_in_text
+from utils import logger, retry_with_backoff, ensure_url_on_own_line, shorten_urls_in_text, format_category_label
 import config
 from removed_entries import RemovedEntriesDB
 from discord_commands import register_commands
@@ -18,9 +18,9 @@ from discord_commands import register_commands
 
 def _format_category_tag(primary, secondary=None):
     """Format the bold category tag(s) for unified channel mode."""
-    tag = f"**[{primary.title()}]**"
+    tag = f"**[{format_category_label(primary)}]**"
     if secondary and secondary != primary:
-        tag += f" **[{secondary.title()}]**"
+        tag += f" **[{format_category_label(secondary)}]**"
     return tag
 
 

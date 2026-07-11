@@ -231,13 +231,26 @@ def ensure_directory(directory):
 def get_temp_dir():
     """
     Get a temporary directory for media downloads
-    
+
     Returns:
         Path to temporary directory
     """
     temp_dir = os.path.join(os.getcwd(), 'temp_media')
     ensure_directory(temp_dir)
     return temp_dir
+
+
+def format_category_label(category: str) -> str:
+    """
+    Title-case a category name for display, keeping 'us' as the 'US' abbreviation.
+
+    str.title() turns "us politics" into "Us Politics" since it only capitalizes
+    the first letter of each word-run — not what we want for the "US" acronym.
+    """
+    label = category.title()
+    if label.startswith("Us "):
+        label = "US " + label[3:]
+    return label
 
 def extract_urls_from_html(text):
     """
