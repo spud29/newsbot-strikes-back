@@ -131,7 +131,7 @@ class RecategorizeView(discord.ui.View):
             if new_category == "__unified__":
                 new_category = self.entry_data.get('original_category')
                 if not new_category or new_category == config.DEFAULT_CATEGORY:
-                    new_category = next((cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY), 'politics')
+                    new_category = next((cat for cat in config.DISCORD_CHANNELS.keys() if cat != config.DEFAULT_CATEGORY), config.FALLBACK_CATEGORY)
                 logger.debug(f"Resolved '__unified__' token to category: {new_category}")
 
             source_type = self.entry_id.split('_')[0] if self.entry_id else None

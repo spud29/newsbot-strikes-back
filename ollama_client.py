@@ -25,9 +25,25 @@ _CATEGORY_ALIASES = {
     "science&technology":     "science & technology",
     "science and technology": "science & technology",
     "sciencetechnology":      "science & technology",
-    "software":          "software development",
-    "dev":               "software development",
-    "development":       "software development",
+    # Retired categories (2026-07-11 revamp) mapped to their absorbers so old
+    # labels in learning examples and stale LLM habits still parse.
+    "software":             "science & technology",
+    "software development": "science & technology",
+    "dev":                  "science & technology",
+    "development":          "science & technology",
+    "music":                "pop culture",
+    "fashion":              "pop culture",
+    "fitness":              "general news",
+    # Old unified 'politics' label; US domestic was its larger half.
+    "politics":          "us politics",
+    "us political":      "us politics",
+    "american politics": "us politics",
+    "domestic politics": "us politics",
+    "geopolitics":       "world news",
+    "international":     "world news",
+    "world":             "world news",
+    "world politics":    "world news",
+    "foreign affairs":   "world news",
     "news":              "general news",
     "general":           "general news",
     "culture":           "pop culture",
@@ -418,9 +434,9 @@ class OllamaClient:
                 if config.DEFAULT_CATEGORY not in exclude_categories:
                     category = config.DEFAULT_CATEGORY
                 elif valid_categories:
-                    # Find the most generic category (prefer 'politics' or first available)
-                    if 'politics' in valid_categories:
-                        category = 'politics'
+                    # Find the most generic category (prefer FALLBACK_CATEGORY or first available)
+                    if config.FALLBACK_CATEGORY in valid_categories:
+                        category = config.FALLBACK_CATEGORY
                     else:
                         category = valid_categories[0]
                     logger.info(f"Using fallback category: {category}")

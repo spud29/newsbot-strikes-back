@@ -63,9 +63,13 @@ RSS_FEEDS = {
 }
 
 # Discord Channel IDs for each category
+# 2026-07-11 revamp: 'politics' split into 'us politics' + 'world news' (both keep
+# the old politics channel); music/fashion/fitness/software development retired
+# (folded into pop culture / general news / science & technology).
 DISCORD_CHANNELS = {
     "crypto": 775513484221743124,
-    "politics": 1379921787629867138,
+    "us politics": 1379921787629867138,
+    "world news": 1379921787629867138,
     "general news": 1379921787629867138,
     "stocks": 854937605590220810,
     "artificial intelligence": 985273104483885137,
@@ -73,11 +77,7 @@ DISCORD_CHANNELS = {
     "sports": 845809605934317639,
     "food": 852256197494046731,
     "science & technology": 928462998228598794,
-    "music": 1300884069583687800,
-    "fashion": 867223341626294282,
     "pop culture": 1432086691862024403,
-    "software development": 1332081237380173857,
-    "fitness": 748918222551777412,
     "ignore": 1344410355224547441
 }
 
@@ -85,9 +85,9 @@ DISCORD_CHANNELS = {
 # This is separate from DISCORD_CHANNELS so the AI's correct answers
 # aren't rejected just because a channel is disabled
 VALID_CATEGORIES = [
-    "crypto", "politics", "stocks", "artificial intelligence",
+    "crypto", "us politics", "world news", "stocks", "artificial intelligence",
     "video games", "sports", "food", "science & technology",
-    "music", "fashion", "pop culture", "software development", "fitness", "general news", "ignore"
+    "pop culture", "general news", "ignore"
 ]
 
 # Default category for uncertain/unmatched content
@@ -170,19 +170,29 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Crypto exchanges, trading, regulations
 - Crypto market analysis and price movements
 
-### politics
-- Political events, elections, government policies
-- International relations, diplomacy, geopolitics
-- War, military conflict, and armed operations
-- Social issues, protests, activism
-- Legal cases and legislation
-- Use 'general news' for breaking events that aren't driven by government, policy, or ideology
-- Economic policy and government decisions
+### us politics
+- US federal, state, and local politics: White House, Congress, governors, city halls
+- US elections, campaigns, polling, and political parties
+- US courts and legal cases with a political angle (Supreme Court, federal enforcement actions)
+- US legislation, regulation, and executive actions
+- US economic policy: Fed decisions, tariffs, taxes, budget, debt ceiling
+- US political figures, appointments, and controversies
+- US social issues, protests, and activism
+- Use 'general news' for breaking US events that aren't driven by government, policy, or ideology
+
+### world news
+- International relations, diplomacy, and geopolitics
+- War, military conflict, and armed operations anywhere in the world
+- Foreign governments, elections, and political events outside the US
+- International organizations and alliances (UN, NATO, EU)
+- US involvement abroad counts as world news: airstrikes, negotiations, treaties, sanctions, troop deployments — if the story is about the US acting in the world, it goes here; if it's about US domestic governance, use 'us politics'
+- Foreign protests, unrest, and political crises
 
 ### general news
 - Natural disasters, extreme weather events, and accidents
 - Crime, law enforcement, and court cases without a political angle (including recreational drug busts, trafficking, and other drug-related crime)
 - Public health and medical news: outbreaks, hospital incidents, drug-use statistics and societal trends — NOT pharma R&D, clinical trials, or FDA drug approvals (see 'science & technology')
+- Fitness, wellness, and lifestyle trends (workout culture, dieting trends, wellness influencers)
 - Human interest and society: local events, viral real-world stories
 - Consumer and economic news affecting everyday people (inflation, housing, jobs) without a direct government policy angle
 
@@ -193,6 +203,8 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Traditional finance and banking
 - Investment strategies and market analysis
 - Corporate earnings and financial reports
+- Company news with the potential to influence the stock price, even when no price move is reported yet: lawsuits involving a public company, product launches and recalls, executive changes, regulatory action against a company, major partnerships or breakups
+- When a story about a public company could fit a topical category (food, tech, entertainment) but its significance is what it means for the company, prefer 'stocks'
 
 ### artificial intelligence
 - AI/ML models, research, and breakthroughs
@@ -222,17 +234,9 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Restaurants, chefs, culinary news
 - Food trends and recipes
 - Restaurant reviews and openings
-- Food industry developments
 - Nutrition and dietary topics
 - Cooking techniques and cuisines
-
-### fitness
-- Gym culture, workout trends, and training techniques
-- Nutrition, dieting, and supplementation news
-- Running, cycling, and endurance sports (recreational)
-- Yoga, mindfulness, and wellness
-- Fitness influencers, apps, and equipment
-- Health-focused fitness topics (weight loss, muscle gain, rehabilitation)
+- Corporate actions by public food companies (M&A, lawsuits, earnings) follow the stocks rule — use 'stocks' when the significance is what it means for the company
 
 ### science & technology
 - General tech products and gadgets
@@ -243,32 +247,8 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Hardware, electronics, consumer tech
 - Space exploration and space technology: missions, launches, astronomy, and discoveries
 - Scientific discoveries and research (non-AI): physics, biology, chemistry, archaeology, climate data
-- Pharmaceutical and medical research: drug development, clinical trials, and FDA drug approvals — NOT recreational drug crime, drug policy, or drug-use statistics (see 'general news'/'politics')
-
-### software development
-- Programming languages, frameworks, and libraries
-- Developer tools, IDEs, and workflows
-- Open source projects and contributions
-- Software engineering practices and methodologies
-- APIs, SDKs, and developer platforms
-- Version control, CI/CD, DevOps
-- Coding tutorials, documentation, and developer communities
-
-### music
-- Music releases, albums, singles
-- Artist news and announcements
-- Music industry developments
-- Concerts, tours, festivals
-- Music streaming and platforms
-- Musical instruments and production
-
-### fashion
-- Fashion shows, collections, trends
-- Designer news and brand updates
-- Fashion industry developments
-- Style and clothing trends
-- Fashion technology and sustainability
-- Models, fashion photography
+- Pharmaceutical and medical research: drug development, clinical trials, and FDA drug approvals — NOT recreational drug crime, drug policy, or drug-use statistics (see 'general news'/'us politics')
+- Software development: programming languages, frameworks, developer tools, open source projects, APIs and developer platforms
 
 ### pop culture
 - Celebrity news and entertainment gossip
@@ -279,6 +259,8 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Entertainment industry news (Hollywood, actors, directors)
 - Reality TV and popular culture phenomena
 - Influencers and internet personalities
+- Music: releases, artist news, concerts, tours, festivals, streaming platforms
+- Fashion: shows, designers, brand updates, style trends
 
 ### ignore
 - Clearly non-news content: personal messages, advertisements without newsworthy value, memes without substantive content
@@ -299,12 +281,12 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 
 1. **Read Carefully**: Analyze the entire content, not just keywords
 2. **Primary Topic**: Choose the category that represents the PRIMARY focus
-3. **Be Specific**: If content spans multiple categories, pick the most dominant one. If the content genuinely has strong relevance to a second category (e.g., a crypto regulation story is both 'crypto' and 'politics'), include a secondary_category. Most entries should NOT have one — only assign it when a reader in the second category would genuinely want to see this entry. Never set secondary_category to 'ignore' or to the same value as category.
+3. **Be Specific**: If content spans multiple categories, pick the most dominant one. If the content genuinely has strong relevance to a second category (e.g., a crypto regulation story is both 'crypto' and 'us politics'), include a secondary_category. Most entries should NOT have one — only assign it when a reader in the second category would genuinely want to see this entry. Never set secondary_category to 'ignore' or to the same value as category.
 4. **Newsworthiness is Downstream**: Once an entry has enough substance to stand alone (passes the quality check), assign the correct category even if the event seems modest. The newsworthiness filter evaluates impact AFTER categorization — don't pre-filter modest-but-real events at this stage.
 5. **Context Clues**: Consider source, tone, and depth of information
 6. **When Unclear**: If the content discusses a real topic but lacks sufficient context or detail to stand alone as a worthwhile post, 'ignore' is appropriate — it's a quality filter, not just a spam filter. Assign a real category when the entry has enough substance to stand alone.
 7. **Entertainment Context**: Theme parks, entertainment venues, and entertainment-focused technology (Disney animatronics, movie theater tech, concert staging) should be categorized as **pop culture**, NOT science & technology. Consider the PRIMARY CONTEXT: Is this entertainment news or tech industry news?
-8. **Drug & Pharma Boundary**: Pharmaceutical R&D, clinical trial results, and FDA drug approvals/regulatory actions belong in **science & technology** — medical research is science. Recreational drug crime (busts, trafficking, smuggling), drug policy/legislation/court rulings, and drug-use statistics or societal trends stay in **general news** or **politics** per their normal rules; do NOT move them just because the word "drug" appears. If the story is primarily framed as a stock-price reaction to trial results, prefer **stocks** over science & technology.
+8. **Drug & Pharma Boundary**: Pharmaceutical R&D, clinical trial results, and FDA drug approvals/regulatory actions belong in **science & technology** — medical research is science. Recreational drug crime (busts, trafficking, smuggling), drug policy/legislation/court rulings, and drug-use statistics or societal trends stay in **general news**, **us politics**, or **world news** per their normal rules; do NOT move them just because the word "drug" appears. If the story is primarily framed as a stock-price reaction to trial results, prefer **stocks** over science & technology.
 9. **Structural vs. Thin vs. Modest**: Three distinct cases — (a) structural junk (routine scheduled data, no triggering event) → always ignore; (b) thin/bare entry about a real event (single headline with no context, no elaboration) → ignore, a better entry will follow; (c) modest but real event WITH some context ("Bitcoin up 2% after Fed rate hold") → categorize as 'crypto', the newsworthiness filter handles impact downstream.
 
 ## DECISION TREE
@@ -333,14 +315,16 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "New MacBook Pro features M4 chip" → science & technology
 "Bitcoin reaches new all-time high" → crypto
 "Bitcoin jumps 3% as traders respond to Fed rate decision" → crypto (categorizable event, even if modest)
-"Fed raises interest rates by 0.25%" → politics
+"Fed raises interest rates by 0.25%" → us politics
+"Senate passes budget bill after all-night session" → us politics
 "7.8 magnitude earthquake strikes Turkey, rescue operations underway" → general news
 "CDC confirms new measles outbreak across 4 states" → general news
 "Man arrested after largest bank heist in US history" → general news
 "NASA's James Webb captures image of earliest known galaxy" → science & technology
-"UK Parliament debates new immigration policy" → politics
-"Iran estimates $270 billion in war damage" → politics
-"US airstrikes target Houthi positions in Yemen" → politics
+"UK Parliament debates new immigration policy" → world news
+"Iran estimates $270 billion in war damage" → world news
+"US airstrikes target Houthi positions in Yemen" → world news (US acting abroad, not domestic governance)
+"Kremlin says Trump and Putin held a 90-minute call on ending the Ukraine war" → world news
 "Call of Duty releases new battle pass" → video games
 "LeBron James scores 40 points in playoff game" → sports
 "Taylor Swift announces new album release date" → pop culture
@@ -350,6 +334,8 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "Robotics lab develops new AI-powered humanoid robot" → science & technology
 "Engineers create breakthrough in autonomous navigation" → artificial intelligence
 "Coinbase reports record Q3 revenue of $2.3B" → stocks (corporate earnings — concrete news event)
+"Apple, $AAPL, files a lawsuit against OpenAI alleging trade secret theft" → stocks (company news with stock-price implications)
+"Danone sues Chobani, alleging its protein claims were vastly inflated" → stocks (public-company legal dispute, not culinary news)
 "Top 100 24h Gainers: INJ $3.84 +13.12%, MORPHO $1.62 +7.00%... Top 100 24h Losers: NIGHT $0.0582 -4.26%..." → ignore (routine market data, no event)
 "95.6% of Pump.fun wallets broke even or lost money. Only 0.4% ever made over $10K. The platform collected $950M in fees." → ignore
 "Crypto Fear and Greed Index Value: 9, Sentiment: Extreme Fear, BTC Price: $68005" → ignore (routine index reading)
@@ -369,10 +355,10 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 
 Quality vs. thin coverage — same story, different substance:
 "US Treasury Secretary Bessent says the US has seized $450 million in Iranian cryptocurrency." → ignore (bare headline, no context about the operation, motive, or broader significance)
-"U.S. Treasury seizes nearly $500M in Iranian crypto as part of Operation Economic Fury, targeting sanctions evasion networks across Asia." → politics (named operation, context, significance explained)
+"U.S. Treasury seizes nearly $500M in Iranian crypto as part of Operation Economic Fury, targeting sanctions evasion networks across Asia." → world news (named operation, context, significance explained; US acting abroad)
 
 "The Fed Leaves Rates Unchanged." → ignore (single bare fact with no context, analysis, or market reaction — not enough to post)
-"Fed holds rates steady as Powell signals caution on inflation outlook despite White House pressure for cuts." → politics (substantive framing that gives the post meaning)
+"Fed holds rates steady as Powell signals caution on inflation outlook despite White House pressure for cuts." → us politics (substantive framing that gives the post meaning)
 
 "7.4 MAGNITUDE EARTHQUAKE HITS NORTHERN JAPAN" → ignore (bare headline with no casualties, damage, or significance — a more complete entry will likely follow)
 "7.4 earthquake strikes northern Japan; tsunami warning issued for coastal areas, 12 confirmed dead, rescue operations underway." → general news (has the context and impact needed to stand alone)
@@ -384,8 +370,8 @@ Drug & pharma boundary — same topic, different category depending on framing:
 "Eli Lilly says its experimental obesity drug cut sleep apnea severity by 60.6% in a Phase 3 trial." → science & technology (pharma R&D / clinical trial result)
 "FDA unveils Operation TrialBlazer, a new effort to speed up U.S. drug development." → science & technology (FDA regulatory/approval process, not law enforcement)
 "AstraZeneca and Daiichi are reportedly nearing a UK pricing deal for breast cancer drug Enhertu." → science & technology (drug development/commercialization, not a stock-price move)
-"Alibaba agrees to pay $600 million to resolve U.S. allegations over illegal drug sales." → politics (legal enforcement action, not medical research)
-"Supreme Court rules drug users & addicts cannot automatically be barred from owning firearms." → politics (legal ruling, not medical research)
+"Alibaba agrees to pay $600 million to resolve U.S. allegations over illegal drug sales." → us politics (US legal enforcement action, not medical research)
+"Supreme Court rules drug users & addicts cannot automatically be barred from owning firearms." → us politics (legal ruling, not medical research)
 "UN warns of an unprecedented spike in synthetic drugs as cocaine and meth surge worldwide." → general news (drug-use statistics/societal trend, not pharma R&D)
 "Psychedelic drugmaker Definium surges +53% after late-stage data showed strong results for its depression treatment." → stocks (stock-price-move framing wins over the drug-trial content)
 
@@ -396,7 +382,7 @@ Respond with ONLY valid JSON matching this format exactly:
 
 secondary_category is optional. Set it to a second category name ONLY when the content genuinely spans two categories with roughly equal relevance. Set to null when the entry fits cleanly in one category (which is most of the time).
 
-Valid categories: crypto, politics, stocks, artificial intelligence, video games, sports, food, science & technology, music, fashion, pop culture, software development, fitness, general news, ignore"""
+Valid categories: crypto, us politics, world news, stocks, artificial intelligence, video games, sports, food, science & technology, pop culture, general news, ignore"""
 
 # Duplicate detection thresholds (cosine similarity)
 DUPLICATE_THRESHOLD = 0.95  # Exact duplicates only (>0.95 similarity)
