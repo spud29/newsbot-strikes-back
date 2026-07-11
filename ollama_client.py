@@ -283,9 +283,9 @@ class OllamaClient:
                 logger.error(f"Error adding ignore-rescue examples to system prompt: {e}", exc_info=True)
 
         # Warn well before this shares an 8192-token window with per-item content and
-        # output — leave that room by flagging use above 70% of the window.
+        # output — leave that room by flagging use above 80% of the window.
         token_estimate = _estimate_tokens(enhanced_prompt)
-        warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.7
+        warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.8
         if token_estimate > warn_budget:
             logger.warning(
                 f"Enhanced system prompt is ~{token_estimate} tokens "

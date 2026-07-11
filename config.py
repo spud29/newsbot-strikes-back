@@ -435,16 +435,16 @@ GATE_FEEDBACK_EXAMPLES_COUNT = 8
 # Feeds entries categorized as 'ignore' (including user-recategorized ones) into the AI
 # system prompt as additional negative examples. User-flagged ignores are prioritized.
 IGNORE_EXAMPLES_ENABLED = True  # Enable learning from ignore-channel entries
-IGNORE_EXAMPLES_COUNT = 5  # Number of recent ignore entries to include in system prompt
+IGNORE_EXAMPLES_COUNT = 10  # Number of recent ignore entries to include in system prompt
 
 # Correction Learning Configuration
 # Feeds user re-categorization corrections into the AI system prompt so it learns from
 # mistakes. Covers both category-to-category corrections and entries moved TO ignore.
 CORRECTION_EXAMPLES_ENABLED = True  # Enable learning from user re-categorizations
-CORRECTION_EXAMPLES_COUNT = 15      # Category-to-category corrections (AI said X, user changed to Y)
-IGNORE_PROMOTION_EXAMPLES_COUNT = 3  # Entries the user moved TO ignore (AI said X, should be ignore)
+CORRECTION_EXAMPLES_COUNT = 30      # Category-to-category corrections (AI said X, user changed to Y)
+IGNORE_PROMOTION_EXAMPLES_COUNT = 6  # Entries the user moved TO ignore (AI said X, should be ignore)
 IGNORE_RESCUE_ENABLED = True         # Learn from AI-assigned ignores that users promoted to real categories
-IGNORE_RESCUE_EXAMPLES_COUNT = 10   # Max ignore-rescue examples to include in system prompt
+IGNORE_RESCUE_EXAMPLES_COUNT = 20   # Max ignore-rescue examples to include in system prompt
 
 # Automated Accuracy Report
 # The bot posts the categorization accuracy report (accuracy_report.py) to Discord
