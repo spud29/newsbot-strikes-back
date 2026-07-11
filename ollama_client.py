@@ -5,7 +5,7 @@ import requests
 import time
 import json
 import re
-from utils import logger, retry_with_backoff
+from utils import logger, retry_with_backoff, fix_sentence_capitalization
 import config
 
 # Known LLM abbreviations and alternate forms mapped to canonical category names.
@@ -644,6 +644,7 @@ class OllamaClient:
                 )
                 return content
 
+            rewritten = fix_sentence_capitalization(rewritten)
             logger.info(f"Text formatted: '{content[:60]}...' -> '{rewritten[:60]}...'")
             return rewritten
 

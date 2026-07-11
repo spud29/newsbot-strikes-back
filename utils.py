@@ -552,6 +552,10 @@ def remove_corrupted_emoji_marks(text):
     
     return text
 
+# Common emoji ranges used as a leading-emoji marker (e.g. "🚨BREAKING: ...").
+# Shared by strip_wire_prefixes and fix_sentence_capitalization.
+_EMOJI_LEAD = r'[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u26A0\u203C\u2757\u2755\u274C\u274E\u2705\u267B\uFE0F]'
+
 def strip_wire_prefixes(text):
     """
     Remove wire-service style prefix labels from the start of content.
@@ -582,9 +586,8 @@ def strip_wire_prefixes(text):
     #   "🔥 Bitcoin up"        -> "🔥 Bitcoin up"  (no label, emoji kept)
     # Matches an ASCII or fullwidth ("：", common in CJK/Korea-sourced posts) colon
     # with optional surrounding spaces; case-insensitive.
-    emoji_lead = r'[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B50\u26A0\u203C\u2757\u2755\u274C\u274E\u2705\u267B\uFE0F]'
     text = re.sub(
-        rf'^(?P<emoji>{emoji_lead}+)?\s*'
+        rf'^(?P<emoji>{_EMOJI_LEAD}+)?\s*'
         r'(?:JUST IN|BREAKING|NEW|DEVELOPING|EXCLUSIVE|ALERT|FLASH|URGENT|UPDATE|REPORT|WATCH|LIVE|SCOOP|HAPPENING NOW|ICYMI)\s*[:：]\s*',
         lambda m: (m.group('emoji') + ' ') if m.group('emoji') else '',
         text,
@@ -976,6 +979,84 @@ def is_all_caps(text, threshold=0.65):
     ratio = upper_count / len(alpha_chars)
 
     return ratio >= threshold
+
+
+def fix_sentence_capitalization(text):
+    """
+    Deterministically enforce sentence-case capitalization as a safety net
+    for OllamaClient.format_text(), whose LLM-driven capitalization is not
+    always reliable (e.g. can collapse ALL CAPS input to all-lowercase).
+
+    Capitalizes the first letter of the string (after an optional leading
+    emoji), the first letter after sentence-ending punctuation or a
+    newline (skipping an optional opening quote/bracket), and the
+    standalone pronoun "i" (including contractions like i'm/i've/i'll/i'd,
+    since the apostrophe is a non-word character and breaks the word
+    boundary the same way a space would).
+
+    URLs are protected before either pass runs, so this never rewrites
+    characters inside one (e.g. the scheme letter after a period, or the
+    "i" in a twitter.com/i/status/... permalink). A short list of common
+    abbreviations (U.S., Mr., a.m., etc.) prevents their periods from
+    being mistaken for sentence boundaries.
+
+    Never lowercases or otherwise alters existing casing, so running it on
+    already-correctly-cased text is a no-op (idempotent: f(f(x)) == f(x)).
+
+    Known limitation: a quoted phrase with no preceding sentence-ending
+    punctuation (e.g. 'he said "stop"') can't be identified as a new
+    sentence by regex alone and is left as-is.
+
+    Examples:
+        "trump: i requested another cognitive test." ->
+            "Trump: I requested another cognitive test."
+        "officials in the u.s. said the plan would proceed." ->
+            "Officials in the u.s. said the plan would proceed."
+
+    Args:
+        text: Text to correct
+
+    Returns:
+        str: Text with sentence-case capitalization enforced
+    """
+    if not text:
+        return text
+
+    import re
+
+    # Protect URLs first so neither pass below can touch characters inside one.
+    urls = []
+    def _stash(m):
+        urls.append(m.group(0))
+        return f'\x00{len(urls) - 1}\x00'
+    text = re.sub(r'https?://\S+', _stash, text)
+
+    abbreviations = {
+        'u.s', 'u.s.a', 'u.k', 'u.n', 'mr', 'mrs', 'ms', 'dr', 'vs',
+        'etc', 'approx', 'e.g', 'i.e', 'a.m', 'p.m',
+    }
+
+    def _cap(m):
+        prefix, quote, letter = m.group(1), m.group(2), m.group(3)
+        stripped = prefix.lstrip()
+        if stripped and stripped[0] in '.!?':
+            before = m.string[:m.start()]
+            word = re.search(r'([A-Za-z]+(?:\.[A-Za-z]+)*)$', before)
+            if word and word.group(1).lower() in abbreviations:
+                return m.group(0)
+        return prefix + quote + letter.upper()
+
+    text = re.sub(
+        rf'(^\s*(?:{_EMOJI_LEAD}\s*)?|[.!?]["\')\]]*\s+|\n\s*)(["\'(\[]*)([a-z])',
+        _cap,
+        text
+    )
+    text = re.sub(r'\bi\b', 'I', text)
+
+    # Restore the protected URLs verbatim.
+    text = re.sub(r'\x00(\d+)\x00', lambda m: urls[int(m.group(1))], text)
+
+    return text
 
 
 def clean_dropstab_content(text):
