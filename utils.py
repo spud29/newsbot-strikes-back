@@ -1072,6 +1072,72 @@ def fix_sentence_capitalization(text):
     return text
 
 
+# Well-known wire services and news organizations, lowercased -> canonical
+# capitalization. A bounded, deterministic safety net for the highest-
+# frequency wire-attribution names (e.g. "... — REUTERS" style endings) on
+# top of the LLM's general (best-effort) proper-noun capitalization. Unlike
+# general proper nouns, this is a small, finite set, so an exact-match list
+# carries no meaningful false-positive risk. Extend as new sources show up
+# in bot.log, same maintenance model as CRYPTO_TICKER_CODES above.
+_KNOWN_NEWS_SOURCES = {
+    'reuters': 'Reuters',
+    'bloomberg': 'Bloomberg',
+    'afp': 'AFP',
+    'ap': 'AP',
+    'upi': 'UPI',
+    'bbc': 'BBC',
+    'cnn': 'CNN',
+    'cnbc': 'CNBC',
+    'npr': 'NPR',
+    'nyt': 'NYT',
+    'wsj': 'WSJ',
+    'axios': 'Axios',
+    'politico': 'Politico',
+    'fox news': 'Fox News',
+    'sky news': 'Sky News',
+    'al jazeera': 'Al Jazeera',
+    'abc news': 'ABC News',
+    'the guardian': 'The Guardian',
+    'the new york times': 'The New York Times',
+    'the wall street journal': 'The Wall Street Journal',
+    'the washington post': 'The Washington Post',
+    'the associated press': 'The Associated Press',
+}
+
+
+def capitalize_known_news_sources(text):
+    """
+    Deterministically capitalize well-known wire-service and news-org names
+    wherever they appear in text, as a bounded safety net layered on top of
+    fix_sentence_capitalization().
+
+    Matches case-insensitively and longest-name-first, so multi-word names
+    (e.g. "the new york times") are replaced as a whole rather than leaving
+    a partial match from a shorter entry. A no-op on text that already has
+    these names correctly capitalized.
+
+    Args:
+        text: Text to correct
+
+    Returns:
+        str: Text with known news-source names correctly capitalized
+    """
+    if not text:
+        return text
+
+    import re
+
+    for name in sorted(_KNOWN_NEWS_SOURCES, key=len, reverse=True):
+        text = re.sub(
+            rf'\b{re.escape(name)}\b',
+            _KNOWN_NEWS_SOURCES[name],
+            text,
+            flags=re.IGNORECASE
+        )
+
+    return text
+
+
 def clean_dropstab_content(text):
     """
     Remove boilerplate/referral noise from drops_analytics Telegram messages.

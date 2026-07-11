@@ -5,7 +5,7 @@ import requests
 import time
 import json
 import re
-from utils import logger, retry_with_backoff, fix_sentence_capitalization
+from utils import logger, retry_with_backoff, fix_sentence_capitalization, capitalize_known_news_sources
 import config
 
 # Known LLM abbreviations and alternate forms mapped to canonical category names.
@@ -631,10 +631,10 @@ class OllamaClient:
                     "prompt": prompt,
                     "stream": False,
                     "keep_alive": "30m",
-                    "think": False,
+                    "think": True,
                     "options": {
-                        "temperature": 0.1,
-                        "num_predict": 500
+                        "temperature": 0.0,
+                        "num_predict": 4000
                     }
                 },
                 timeout=300
@@ -642,6 +642,14 @@ class OllamaClient:
 
             response.raise_for_status()
             result = response.json()
+
+            # With thinking enabled, a too-small token budget can be entirely
+            # consumed by reasoning before any answer is written, leaving
+            # response empty with done_reason == 'length'. Treat that the
+            # same as an empty response rather than silently returning "".
+            if result.get('done_reason') == 'length':
+                logger.warning("format_text hit the token limit while thinking, using original")
+                return content
 
             rewritten = result.get('response', '').strip()
 
@@ -661,6 +669,7 @@ class OllamaClient:
                 return content
 
             rewritten = fix_sentence_capitalization(rewritten)
+            rewritten = capitalize_known_news_sources(rewritten)
             logger.info(f"Text formatted: '{content[:60]}...' -> '{rewritten[:60]}...'")
             return rewritten
 
