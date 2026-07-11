@@ -48,6 +48,22 @@ _CATEGORY_ALIASES = {
     "television":        "pop culture",
 }
 
+# Ollama has no tokenize endpoint and pulling in a real tokenizer just for a warning
+# log isn't worth it, so this rough chars-per-token ratio is enough to catch a runaway
+# prompt before it silently overflows the model's context window (Ollama/llama.cpp
+# shifts older tokens out rather than erroring, so overflow fails silently otherwise).
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+# qwen3:8b's context window as currently loaded (checked via `ollama ps` / `/api/ps`).
+# Not passed to the API — categorize()/rate_newsworthiness() don't set num_ctx, so this
+# is Ollama's own default for the model, kept here only to size the budget warnings below.
+_CATEGORIZATION_CONTEXT_WINDOW = 8192
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text) // _CHARS_PER_TOKEN_ESTIMATE
+
+
 class OllamaClient:
     """Client for interacting with local Ollama API"""
     
@@ -265,6 +281,21 @@ class OllamaClient:
 
             except Exception as e:
                 logger.error(f"Error adding ignore-rescue examples to system prompt: {e}", exc_info=True)
+
+        # Warn well before this shares an 8192-token window with per-item content and
+        # output — leave that room by flagging use above 70% of the window.
+        token_estimate = _estimate_tokens(enhanced_prompt)
+        warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.7
+        if token_estimate > warn_budget:
+            logger.warning(
+                f"Enhanced system prompt is ~{token_estimate} tokens "
+                f"(~{token_estimate / _CATEGORIZATION_CONTEXT_WINDOW:.0%} of the "
+                f"{_CATEGORIZATION_CONTEXT_WINDOW}-token context window) — little room left for "
+                f"per-item content and output. Consider lowering the *_EXAMPLES_COUNT settings "
+                f"in config.py."
+            )
+        else:
+            logger.debug(f"Enhanced system prompt is ~{token_estimate} tokens")
 
         # Cache the enhanced prompt
         self._enhanced_prompt_cache = enhanced_prompt
@@ -854,6 +885,20 @@ class OllamaClient:
                 logger.debug(f"Gate feedback block built with {len(examples)} demotion examples")
         except Exception as e:
             logger.error(f"Error building gate feedback block: {e}")
+
+        # This block shares its context window with a large fixed rules/examples template
+        # in rate_newsworthiness() plus the item content, so it needs to stay a short list —
+        # warn if it's grown past ~10% of the window (well beyond what 8 one-liners costs).
+        if block:
+            token_estimate = _estimate_tokens(block)
+            warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.1
+            if token_estimate > warn_budget:
+                logger.warning(
+                    f"Gate feedback block is ~{token_estimate} tokens "
+                    f"(GATE_FEEDBACK_EXAMPLES_COUNT={getattr(config, 'GATE_FEEDBACK_EXAMPLES_COUNT', 8)}) "
+                    f"— it shares the rating prompt's context window with a large fixed "
+                    f"instructions block; consider lowering the count in config.py."
+                )
 
         self._gate_feedback_cache = block
         self._gate_feedback_timestamp = now
