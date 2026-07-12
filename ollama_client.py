@@ -70,11 +70,6 @@ _CATEGORY_ALIASES = {
 # shifts older tokens out rather than erroring, so overflow fails silently otherwise).
 _CHARS_PER_TOKEN_ESTIMATE = 4
 
-# qwen3:8b's context window as currently loaded (checked via `ollama ps` / `/api/ps`).
-# Not passed to the API — categorize()/rate_newsworthiness() don't set num_ctx, so this
-# is Ollama's own default for the model, kept here only to size the budget warnings below.
-_CATEGORIZATION_CONTEXT_WINDOW = 8192
-
 
 def _estimate_tokens(text: str) -> int:
     return len(text) // _CHARS_PER_TOKEN_ESTIMATE
@@ -93,6 +88,7 @@ class OllamaClient:
         """
         self.base_url = config.OLLAMA_BASE_URL
         self.categorization_model = config.OLLAMA_CATEGORIZATION_MODEL
+        self.categorization_num_ctx = config.OLLAMA_CATEGORIZATION_NUM_CTX
         self.embedding_model = config.OLLAMA_EMBEDDING_MODEL
         self.embedding_num_ctx = config.OLLAMA_EMBEDDING_NUM_CTX
         self.removed_entries_db = removed_entries_db
@@ -298,15 +294,16 @@ class OllamaClient:
             except Exception as e:
                 logger.error(f"Error adding ignore-rescue examples to system prompt: {e}", exc_info=True)
 
-        # Warn well before this shares an 8192-token window with per-item content and
-        # output — leave that room by flagging use above 80% of the window.
+        # Warn well before this shares the categorization context window with per-item
+        # content and output — leave that room by flagging use above 80% of the window.
+        ctx_window = self.categorization_num_ctx
         token_estimate = _estimate_tokens(enhanced_prompt)
-        warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.8
+        warn_budget = ctx_window * 0.8
         if token_estimate > warn_budget:
             logger.warning(
                 f"Enhanced system prompt is ~{token_estimate} tokens "
-                f"(~{token_estimate / _CATEGORIZATION_CONTEXT_WINDOW:.0%} of the "
-                f"{_CATEGORIZATION_CONTEXT_WINDOW}-token context window) — little room left for "
+                f"(~{token_estimate / ctx_window:.0%} of the "
+                f"{ctx_window}-token context window) — little room left for "
                 f"per-item content and output. Consider lowering the *_EXAMPLES_COUNT settings "
                 f"in config.py."
             )
@@ -370,11 +367,17 @@ class OllamaClient:
                     "stream": False,
                     "keep_alive": "30m",
                     # NOTE: "think" is a top-level API parameter — inside "options" it is
-                    # silently ignored and qwen3 burns the whole num_predict budget thinking.
+                    # silently ignored and qwen-family models burn the whole num_predict
+                    # budget thinking.
                     "think": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 500
+                        "num_predict": 500,
+                        # Must be identical across every call site using categorization_model —
+                        # a mismatch forces Ollama to reload/reallocate the KV cache (root cause
+                        # of the 2026-06-28 VRAM-thrash outage). See OLLAMA_CATEGORIZATION_NUM_CTX
+                        # in config.py.
+                        "num_ctx": self.categorization_num_ctx
                     }
                 },
                 timeout=300
@@ -634,7 +637,8 @@ class OllamaClient:
                     "think": True,
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 4000
+                        "num_predict": 4000,
+                        "num_ctx": self.categorization_num_ctx  # keep in sync — see categorize() above
                     }
                 },
                 timeout=300
@@ -735,7 +739,8 @@ class OllamaClient:
                     "think": False,
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 100
+                        "num_predict": 100,
+                        "num_ctx": self.categorization_num_ctx
                     }
                 },
                 timeout=300
@@ -806,7 +811,8 @@ class OllamaClient:
                     "think": False,
                     "options": {
                         "temperature": 0.2,
-                        "num_predict": 200
+                        "num_predict": 200,
+                        "num_ctx": self.categorization_num_ctx
                     }
                 },
                 timeout=300
@@ -917,7 +923,7 @@ class OllamaClient:
         # warn if it's grown past ~10% of the window (well beyond what 8 one-liners costs).
         if block:
             token_estimate = _estimate_tokens(block)
-            warn_budget = _CATEGORIZATION_CONTEXT_WINDOW * 0.1
+            warn_budget = self.categorization_num_ctx * 0.1
             if token_estimate > warn_budget:
                 logger.warning(
                     f"Gate feedback block is ~{token_estimate} tokens "
@@ -1022,7 +1028,8 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                     "think": False,
                     "options": {
                         "temperature": 0.1,  # Low temperature for consistent, comparable ratings
-                        "num_predict": 200   # Give model enough room for JSON response
+                        "num_predict": 200,  # Give model enough room for JSON response
+                        "num_ctx": self.categorization_num_ctx
                     }
                 },
                 timeout=300

@@ -148,15 +148,29 @@ TELEGRAM_CHANNELS = [
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_CATEGORIZATION_MODEL = "qwen3:8b"
+OLLAMA_CATEGORIZATION_MODEL = "qwen3.5:9b"
 OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 # Context window for embedding requests. Kept small because embeddings run over short
 # news text — at the 8192 default this model occupies ~2.9 GB of VRAM, but at 512 it
-# needs only ~1.0 GB, letting it stay GPU-resident alongside the 8B categorizer when
+# needs only ~1.0 GB, letting it stay GPU-resident alongside the categorizer when
 # OLLAMA_MAX_LOADED_MODELS=2. This avoids the model load/unload thrash that fragmented
 # VRAM and stalled all processing for ~6.5 hours on 2026-06-28. Raise only if you also
 # free VRAM elsewhere (e.g. a smaller categorizer or lower categorizer context).
 OLLAMA_EMBEDDING_NUM_CTX = 512
+# Context window for the categorization model — shared by categorize(), format_text(),
+# verify_similarity(), compare_entries(), and rate_newsworthiness() in ollama_client.py,
+# plus enrichment.py's synthesize_enriched_post(). Ollama sizes a model's KV cache to
+# num_ctx at load time: if any of these six call sites requested a different num_ctx for
+# the same model, Ollama would reload/reallocate between calls — this exact churn
+# fragmented VRAM and stalled all processing for ~6.5 hours on 2026-06-28 (see
+# OLLAMA_EMBEDDING_NUM_CTX above; same failure mode, other model). Every one of the six
+# call sites must pass this exact value.
+# 16384 (vs. Ollama's 8192 implicit default) was chosen deliberately conservatively:
+# qwen3.5:9b's weights alone (6.59 GB, Q4_K_M) already exceed qwen3:8b's entire old
+# footprint at 8192 ctx, so headroom is tighter than before even at this value. Do not
+# raise without first re-verifying VRAM headroom (`ollama ps` cross-checked against
+# `nvidia-smi` — Ollama's self-reported free VRAM has been wrong on this machine before).
+OLLAMA_CATEGORIZATION_NUM_CTX = 16384
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.

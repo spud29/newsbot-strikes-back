@@ -2,8 +2,9 @@
 Enrichment pipeline: search for related articles, extract text, and rewrite
 headlines into more informative Discord posts.
 
-Uses SearXNG for web search, Jina Reader for article extraction, and Ollama
-(qwen3:8b) for summarization. Falls back to the original content on any failure.
+Uses SearXNG for web search, Jina Reader for article extraction, and the
+categorization model configured in config.py for summarization. Falls back to
+the original content on any failure.
 """
 import requests
 import time
@@ -94,7 +95,7 @@ def synthesize_enriched_post(original_content, articles, category):
         str: The enriched post text, or empty string on failure.
     """
     base_url = getattr(config, 'OLLAMA_BASE_URL', 'http://localhost:11434')
-    model = getattr(config, 'ENRICHMENT_MODEL', 'qwen3:8b')
+    model = getattr(config, 'ENRICHMENT_MODEL', config.OLLAMA_CATEGORIZATION_MODEL)
 
     context_blocks = []
     source_urls = []
@@ -143,6 +144,7 @@ Output ONLY the rewritten post text, nothing else."""
                 'options': {
                     'temperature': 0.3,
                     'num_predict': 300,
+                    'num_ctx': config.OLLAMA_CATEGORIZATION_NUM_CTX,
                 },
             },
             timeout=getattr(config, 'ENRICHMENT_SYNTHESIS_TIMEOUT', 60),
