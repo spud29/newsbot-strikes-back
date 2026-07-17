@@ -471,6 +471,10 @@ SOURCE_COMMAND_ENABLED = True
 # Uses the same RECATEGORIZE_ALLOWED_USER_IDS for permission checks
 EDIT_TEXT_COMMAND_ENABLED = True
 
+# "Remove Images" context menu command - strips image attachments from a bot message, keeping text
+# Uses the same RECATEGORIZE_ALLOWED_USER_IDS for permission checks
+REMOVE_IMAGES_COMMAND_ENABLED = True
+
 # Delete Message Context Menu Command (Right-click on bot messages → Apps → "Delete Message")
 # Force-deletes any bot message from Discord without requiring a database entry.
 # Useful for removing duplicate posts where only one has a DB mapping.
