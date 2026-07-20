@@ -4,6 +4,7 @@ Core DiscordPoster class with message posting, editing, and recategorization
 """
 import discord
 from discord import app_commands
+import logging
 import os
 import asyncio
 import re
@@ -49,6 +50,7 @@ class DiscordPoster:
         self.ready = False
         self._verified_channels = False
         self._client_task = None
+        self._shutting_down = False  # True during intentional stop(); gates the watchdog
         self.perplexity_client = perplexity_client
 
         # Initialize database and removed entries if not provided
@@ -195,11 +197,39 @@ class DiscordPoster:
             logger.error(f"Error extracting thread content: {e}", exc_info=True)
             return None
 
+    def _on_client_task_done(self, task):
+        """Watchdog for the background client task.
+
+        client.start() only ever returns when the client is closed — during an
+        intentional stop() that's fine, but any other completion (bad token,
+        LoginFailure, unrecoverable gateway error) means the bot would keep
+        running headless: Telegram polls, Ollama categorizes, and every post
+        silently returns False. Exit non-zero instead so NSSM's restart policy
+        turns the silent failure into an automatic recovery.
+        """
+        if self._shutting_down or task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical(
+                f"Discord client task died unexpectedly: {exc} — exiting so the "
+                f"service manager can restart the bot",
+                exc_info=exc,
+            )
+        else:
+            logger.critical(
+                "Discord client task exited without an active shutdown — exiting "
+                "so the service manager can restart the bot"
+            )
+        logging.shutdown()
+        os._exit(1)
+
     async def start(self):
         """Start the Discord client"""
         if not self._client_task:
             # Start the Discord client in the background
             self._client_task = asyncio.create_task(self.client.start(self.token))
+            self._client_task.add_done_callback(self._on_client_task_done)
             logger.info("Discord client starting...")
 
             # Wait for the client to be ready (with timeout)
@@ -213,6 +243,7 @@ class DiscordPoster:
 
     async def stop(self):
         """Stop the Discord client"""
+        self._shutting_down = True  # disarm the watchdog before closing
         if self.client:
             await self.client.close()
             logger.info("Discord client stopped")
