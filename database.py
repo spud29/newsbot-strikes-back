@@ -31,18 +31,26 @@ class Database:
     def _load_embeddings_cache(self):
         """Load all embeddings from SQLite into memory for fast similarity search.
         Pre-converts to numpy arrays and pre-computes L2 norms to avoid
-        repeated conversion and norm calculation during find_best_match()."""
+        repeated conversion and norm calculation during find_best_match().
+
+        CACHE CONCURRENCY CONTRACT: _embeddings_cache is copy-on-write. Writers
+        (which already serialize on get_db_lock) build a NEW dict and swap the
+        reference in one atomic assignment; a published dict is never mutated.
+        Readers (find_best_match/find_top_matches, called on the event loop)
+        grab the current reference and iterate it without any lock — in-place
+        mutation here used to race them into "dictionary changed size during
+        iteration"."""
         with get_db_lock():
             rows = self.conn.execute(
                 "SELECT content_hash, embedding, timestamp, preview, content, entry_id FROM embeddings"
             ).fetchall()
 
-            self._embeddings_cache = {}
+            cache = {}
             for row in rows:
                 embedding_list = json.loads(row['embedding'])
                 embedding_np = np.array(embedding_list)
                 norm = np.linalg.norm(embedding_np)
-                self._embeddings_cache[row['content_hash']] = {
+                cache[row['content_hash']] = {
                     'embedding': embedding_list,
                     'embedding_np': embedding_np,
                     'norm': norm,
@@ -51,6 +59,7 @@ class Database:
                     'content': row['content'],
                     'entry_id': row['entry_id']
                 }
+            self._embeddings_cache = cache
     
     def is_processed(self, entry_id):
         """
@@ -109,10 +118,13 @@ class Database:
             )
             self.conn.commit()
 
-            # Keep in-memory cache in sync (pre-compute numpy array and norm)
+            # Keep in-memory cache in sync (pre-compute numpy array and norm).
+            # Copy-on-write: publish a new dict rather than mutating the live
+            # one — see the contract note on _load_embeddings_cache.
             embedding_np = np.array(embedding_list)
             norm = np.linalg.norm(embedding_np)
-            self._embeddings_cache[content_hash] = {
+            new_cache = dict(self._embeddings_cache)
+            new_cache[content_hash] = {
                 'embedding': embedding_list,
                 'embedding_np': embedding_np,
                 'norm': norm,
@@ -121,6 +133,7 @@ class Database:
                 'content': content,
                 'entry_id': entry_id
             }
+            self._embeddings_cache = new_cache
         
         logger.debug(f"Stored embedding for: {content[:50]}...")
         return content_hash
@@ -138,7 +151,13 @@ class Database:
         Returns:
             tuple: (best_similarity, best_preview, best_content, best_entry_id) or (0.0, None, None, None)
         """
-        if not self._embeddings_cache:
+        # Lock-free read: _embeddings_cache is copy-on-write (writers publish a
+        # new dict, never mutate the live one — see _load_embeddings_cache), so
+        # grabbing the current reference gives a stable dict to iterate. This
+        # runs on the event loop, so it must not contend for the DB lock.
+        snapshot = self._embeddings_cache.values()
+
+        if not snapshot:
             return 0.0, None, None, None
 
         query = np.array(embedding)
@@ -149,7 +168,7 @@ class Database:
         best_sim = 0.0
         best_data = None
 
-        for data in self._embeddings_cache.values():
+        for data in snapshot:
             stored_norm = data['norm']
             if stored_norm == 0:
                 continue
@@ -174,7 +193,10 @@ class Database:
         Returns:
             list of tuples: [(similarity, preview, content, entry_id), ...]
         """
-        if not self._embeddings_cache:
+        # Lock-free read of the copy-on-write cache — see find_best_match.
+        snapshot = self._embeddings_cache.values()
+
+        if not snapshot:
             return []
 
         query = np.array(embedding)
@@ -183,7 +205,7 @@ class Database:
             return []
 
         results = []
-        for data in self._embeddings_cache.values():
+        for data in snapshot:
             stored_norm = data['norm']
             if stored_norm == 0:
                 continue
@@ -257,8 +279,12 @@ class Database:
             )
             deleted_embeddings = cursor.rowcount
 
-            for ch in stale_hashes:
-                self._embeddings_cache.pop(ch, None)
+            # Copy-on-write removal — see contract note on _load_embeddings_cache
+            if stale_hashes:
+                stale_set = set(stale_hashes)
+                self._embeddings_cache = {
+                    k: v for k, v in self._embeddings_cache.items() if k not in stale_set
+                }
 
             self.conn.commit()
 
@@ -737,7 +763,12 @@ class Database:
             ).fetchall()
             for row in rows:
                 self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (row['content_hash'],))
-                self._embeddings_cache.pop(row['content_hash'], None)
+            # Copy-on-write removal — see contract note on _load_embeddings_cache
+            if rows:
+                dead = {row['content_hash'] for row in rows}
+                self._embeddings_cache = {
+                    k: v for k, v in self._embeddings_cache.items() if k not in dead
+                }
             self.conn.commit()
         logger.debug(f"Deleted {len(rows)} embedding(s) for entry_id: {entry_id}")
 
@@ -755,8 +786,11 @@ class Database:
             self.conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (content_hash,))
             self.conn.commit()
 
-            # Keep in-memory cache in sync
-            self._embeddings_cache.pop(content_hash, None)
+            # Copy-on-write removal — see contract note on _load_embeddings_cache
+            if content_hash in self._embeddings_cache:
+                new_cache = dict(self._embeddings_cache)
+                new_cache.pop(content_hash, None)
+                self._embeddings_cache = new_cache
         logger.debug(f"Deleted embedding for content hash: {content_hash}")
     
     def get_all_message_mappings(self):
