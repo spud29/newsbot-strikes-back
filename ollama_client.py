@@ -316,17 +316,70 @@ class OllamaClient:
 
         return enhanced_prompt
     
-    @retry_with_backoff(max_retries=4, initial_delay=3)
+    def _request_generate(self, payload, timeout=300, max_retries=2, initial_delay=1,
+                          op="generate", require_response=False):
+        """
+        POST /api/generate with real retry + exponential backoff; returns the
+        parsed JSON body.
+
+        The public methods used to declare @retry_with_backoff while their
+        bodies caught every exception and returned a fallback — the decorator
+        never saw a failure, so retries never happened. Centralizing the
+        network call here makes them real: connection errors, HTTP errors,
+        timeouts, and undecodable bodies raise and are retried; only after the
+        final attempt does the exception propagate to the caller's fallback
+        handling.
+
+        Args:
+            payload: JSON body for /api/generate
+            timeout: per-attempt requests timeout (seconds)
+            max_retries: retries after the first attempt
+            initial_delay: backoff start (doubles per retry)
+            op: label for log lines
+            require_response: treat an empty 'response' field as a retryable
+                failure (the empty-response + done_reason=length signature) —
+                leave False for callers that inspect done_reason themselves
+        """
+        delay = initial_delay
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/api/generate", json=payload, timeout=timeout
+                )
+                response.raise_for_status()
+                result = response.json()
+                if require_response and not result.get('response', '').strip():
+                    raise ValueError(
+                        f"Ollama returned empty response "
+                        f"(done_reason={result.get('done_reason')})"
+                    )
+                return result
+            except Exception as e:
+                last_exc = e
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Ollama {op} attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+        logger.error(f"Ollama {op}: all {max_retries + 1} attempts failed: {last_exc}")
+        raise last_exc
+
     def categorize(self, content, exclude_categories=None):
         """
-        Categorize content using Ollama
-        
+        Categorize content using Ollama. Transient failures retry inside
+        _request_generate; the error fallback below is reached only after all
+        retries fail (main.py matches the 'Error during categorization' prefix
+        to skip the entry and retry it next cycle).
+
         Args:
             content: Text content to categorize
             exclude_categories: List of category names to exclude from results
-        
+
         Returns:
-            tuple: (category_name, reasoning) where reasoning is a brief explanation
+            tuple: (category_name, reasoning, secondary_category)
         """
         logger.debug(f"Categorizing content: {content[:100]}...")
         if exclude_categories:
@@ -358,9 +411,8 @@ class OllamaClient:
 
             # Call Ollama API — use separate 'system' field so Ollama can reuse
             # KV cache for the system prompt across consecutive categorize calls
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
+            result = self._request_generate(
+                {
                     "model": self.categorization_model,
                     "system": system_prompt,
                     "prompt": prompt,
@@ -380,11 +432,12 @@ class OllamaClient:
                         "num_ctx": self.categorization_num_ctx
                     }
                 },
-                timeout=300
+                timeout=300,
+                max_retries=4,
+                initial_delay=3,
+                op="categorize",
+                require_response=True,
             )
-
-            response.raise_for_status()
-            result = response.json()
 
             # Extract category and reasoning from response
             response_text = result.get('response', '').strip()
@@ -579,7 +632,6 @@ class OllamaClient:
         logger.warning(f"Unknown category '{category}', defaulting to '{config.DEFAULT_CATEGORY}'")
         return config.DEFAULT_CATEGORY
     
-    @retry_with_backoff(max_retries=2, initial_delay=1)
     def format_text(self, content):
         """
         Clean up text using Ollama: fix ALL CAPS, grammar, punctuation, and spelling.
@@ -628,9 +680,10 @@ class OllamaClient:
             )
 
             def _generate(think, temperature, num_predict):
-                resp = requests.post(
-                    f"{self.base_url}/api/generate",
-                    json={
+                # require_response stays False: the caller inspects done_reason
+                # to run its own no-thinking policy retry on empty responses.
+                return self._request_generate(
+                    {
                         "model": self.categorization_model,
                         "prompt": prompt,
                         "stream": False,
@@ -642,10 +695,11 @@ class OllamaClient:
                             "num_ctx": self.categorization_num_ctx  # keep in sync — see categorize() above
                         }
                     },
-                    timeout=300
+                    timeout=300,
+                    max_retries=2,
+                    initial_delay=1,
+                    op="format_text",
                 )
-                resp.raise_for_status()
-                return resp.json()
 
             result = _generate(think=True, temperature=0.0, num_predict=4000)
 
@@ -687,7 +741,6 @@ class OllamaClient:
             logger.error(f"Error in format_text: {e}")
             return content
 
-    @retry_with_backoff(max_retries=2, initial_delay=1)
     def verify_similarity(self, new_content, existing_content):
         """
         Use the LLM to verify whether two pieces of content are about the same specific
@@ -735,9 +788,8 @@ class OllamaClient:
         )
         
         try:
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
+            data = self._request_generate(
+                {
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
@@ -749,13 +801,13 @@ class OllamaClient:
                         "num_ctx": self.categorization_num_ctx
                     }
                 },
-                timeout=300
+                timeout=300,
+                max_retries=2,
+                initial_delay=1,
+                op="verify_similarity",
+                require_response=True,
             )
-            response.raise_for_status()
-            result = response.json().get('response', '').strip().lower()
-
-            if not result:
-                raise ValueError("LLM returned empty response for similarity check")
+            result = data.get('response', '').strip().lower()
 
             is_same = result.startswith('yes')
             logger.info(f"LLM similarity verdict: {'SAME story' if is_same else 'DIFFERENT stories'} (raw: '{result}')")
@@ -768,14 +820,16 @@ class OllamaClient:
             # is better than a missed genuine story.
             return False
     
-    @retry_with_backoff(max_retries=2, initial_delay=2)
     def compare_entries(self, new_content, existing_content):
         """
         Compare a new entry against an existing one about the same story.
         Determines whether the new entry should supersede (replace) the old one.
 
         Returns:
-            dict: {'verdict': 'supersede'|'ignore', 'reasoning': str}
+            dict: {'verdict': 'supersede'|'keep_both'|'ignore', 'reasoning': str}
+            On error the verdict is 'keep_both' — failing open (both entries
+            post) is safe; the old 'ignore' fallback silently discarded the
+            new entry whenever Ollama had a transient failure.
         """
         logger.debug("Comparing entries for supersede decision...")
 
@@ -807,9 +861,8 @@ class OllamaClient:
         )
 
         try:
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
+            data = self._request_generate(
+                {
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
@@ -821,10 +874,13 @@ class OllamaClient:
                         "num_ctx": self.categorization_num_ctx
                     }
                 },
-                timeout=300
+                timeout=300,
+                max_retries=2,
+                initial_delay=2,
+                op="compare_entries",
+                require_response=True,
             )
-            response.raise_for_status()
-            response_text = response.json().get('response', '').strip()
+            response_text = data.get('response', '').strip()
 
             # Try JSON parse (balanced-brace extraction handles '}' inside strings)
             parsed = self._extract_json(response_text)
@@ -840,8 +896,11 @@ class OllamaClient:
             return {'verdict': 'keep_both', 'reasoning': 'Could not parse response, defaulting to keep_both'}
 
         except Exception as e:
+            # Fail open: keep_both posts the new entry alongside the old one.
+            # The previous 'ignore' fallback silently dropped the new entry on
+            # any transient Ollama failure.
             logger.error(f"Error comparing entries: {e}")
-            return {'verdict': 'ignore', 'reasoning': f'Error: {e}'}
+            return {'verdict': 'keep_both', 'reasoning': f'Error during comparison, keeping both: {e}'}
 
     @retry_with_backoff(max_retries=4, initial_delay=3)
     def generate_embedding(self, content):
@@ -942,7 +1001,6 @@ class OllamaClient:
         self._gate_feedback_timestamp = now
         return block
 
-    @retry_with_backoff(max_retries=3, initial_delay=2)
     def rate_newsworthiness(self, content, category, threshold=None):
         """
         Rate how reaction-worthy content is: surprise, impact, and talkability.
@@ -1024,9 +1082,8 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
 {{"surprising": <1-10>, "impact": <1-10>, "talkability": <1-10>, "reasoning": "<one sentence>"}}"""
 
             # Call Ollama API
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
+            result = self._request_generate(
+                {
                     "model": self.categorization_model,
                     "prompt": prompt,
                     "stream": False,
@@ -1038,11 +1095,12 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                         "num_ctx": self.categorization_num_ctx
                     }
                 },
-                timeout=300
+                timeout=300,
+                max_retries=3,
+                initial_delay=2,
+                op="rate_newsworthiness",
+                require_response=True,
             )
-
-            response.raise_for_status()
-            result = response.json()
 
             # Parse the JSON response
             response_text = result.get('response', '').strip()
