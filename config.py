@@ -408,8 +408,22 @@ DB_PATH = "data/newsbot.db"
 # Polling interval (seconds)
 POLL_INTERVAL = 300  # 5 minutes
 
-# Database retention period (hours)
+# Embedding retention period (hours) — the dedup window. Embeddings are the
+# expensive rows (full content + vector JSON), so this stays short.
 DB_RETENTION_HOURS = 48
+
+# processed_ids retention — deliberately much longer than the embedding window.
+# These rows are tiny (id + timestamp), and pruning them at 48h opened a re-post
+# hole: rss.app feeds retain items by count, so on a quiet feed an item older
+# than 48h lost BOTH its "seen" flag and its dedup embedding at the same moment
+# and was posted again. 30 days comfortably outlives any feed's item list.
+PROCESSED_IDS_RETENTION_HOURS = 720  # 30 days
+
+# Freshness guard for RSS entries: skip feed items whose pub_date is older than
+# this, regardless of DB state. Belt-and-braces with the retention split above —
+# it removes the dependency on rss.app's (undocumented) item-retention behavior.
+# Items with missing/unparseable dates are processed normally.
+RSS_MAX_ENTRY_AGE_HOURS = 24
 
 # OCR Configuration
 OCR_ENABLED = True  # Set to False to disable OCR text extraction

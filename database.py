@@ -225,15 +225,22 @@ class Database:
         return False, 0.0, None, None
     
     def cleanup_old_entries(self):
-        """Remove entries older than DB_RETENTION_HOURS"""
+        """Prune old rows: embeddings at DB_RETENTION_HOURS, processed_ids at the
+        (much longer) PROCESSED_IDS_RETENTION_HOURS. The windows are split so an
+        item that lingers in a slow RSS feed past the embedding window doesn't
+        also lose its "already posted" flag and get re-posted."""
         import config
         current_time = time.time()
-        cutoff_time = current_time - (config.DB_RETENTION_HOURS * 3600)
+        embedding_cutoff = current_time - (config.DB_RETENTION_HOURS * 3600)
+        processed_retention = getattr(
+            config, 'PROCESSED_IDS_RETENTION_HOURS', config.DB_RETENTION_HOURS
+        )
+        processed_cutoff = current_time - (processed_retention * 3600)
 
         with get_db_lock():
             # Clean processed IDs
             cursor = self.conn.execute(
-                "DELETE FROM processed_ids WHERE timestamp < ?", (cutoff_time,)
+                "DELETE FROM processed_ids WHERE timestamp < ?", (processed_cutoff,)
             )
             deleted_ids = cursor.rowcount
 
@@ -242,11 +249,11 @@ class Database:
             stale_hashes = [
                 row['content_hash'] for row in
                 self.conn.execute(
-                    "SELECT content_hash FROM embeddings WHERE timestamp < ?", (cutoff_time,)
+                    "SELECT content_hash FROM embeddings WHERE timestamp < ?", (embedding_cutoff,)
                 ).fetchall()
             ]
             cursor = self.conn.execute(
-                "DELETE FROM embeddings WHERE timestamp < ?", (cutoff_time,)
+                "DELETE FROM embeddings WHERE timestamp < ?", (embedding_cutoff,)
             )
             deleted_embeddings = cursor.rowcount
 

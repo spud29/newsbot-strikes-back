@@ -4,6 +4,8 @@ RSS feed poller for Twitter feeds
 import feedparser
 import re
 import socket
+import time
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils import logger, retry_with_backoff, extract_urls_from_html, clean_text_content, remove_twitter_attribution
 import config
@@ -77,7 +79,24 @@ class RSSPoller:
             
             # Get publication date
             pub_date = entry.get('published', entry.get('updated', ''))
-            
+
+            # Freshness guard: DB retention can outlive a slow feed's item list,
+            # so an old item still present in the feed would otherwise be
+            # re-posted once its processed/embedding rows expire. Items with
+            # missing or unparseable dates are processed normally.
+            max_age_hours = getattr(config, 'RSS_MAX_ENTRY_AGE_HOURS', 0)
+            if max_age_hours and pub_date:
+                try:
+                    age_hours = (time.time() - parsedate_to_datetime(pub_date).timestamp()) / 3600
+                    if age_hours > max_age_hours:
+                        logger.debug(
+                            f"Skipping stale RSS entry ({age_hours:.1f}h old, "
+                            f"max {max_age_hours}h): {link}"
+                        )
+                        return None
+                except (TypeError, ValueError):
+                    pass
+
             # Extract Twitter status ID from link
             status_id = self._extract_status_id(link)
             
