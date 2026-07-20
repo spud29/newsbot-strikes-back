@@ -554,19 +554,6 @@ class DiscordPoster:
 
                 media_files = downloaded_files if downloaded_files else None
 
-            # Delete the original message
-            try:
-                await original_message.delete()
-                logger.info(f"Deleted original message {message_id} from channel {channel_id}")
-            except Exception as e:
-                # Clean up downloaded files
-                for file_path in downloaded_files:
-                    try:
-                        os.remove(file_path)
-                    except:
-                        pass
-                return False, None, None, f"Error deleting original message: {str(e)}"
-
             # Look up the original AI category so the tag reflects topic, not routing choice
             cross_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
             original_ai_cat = (cross_info.get('original_category') if cross_info else None) or new_category
@@ -574,14 +561,18 @@ class DiscordPoster:
                 original_ai_cat = new_category
             secondary_cat = cross_info.get('secondary_category') if cross_info else None
 
-            # Post to new channel
+            # Post to the new channel FIRST — the original is deleted only after
+            # the repost succeeds. The old delete-first order meant any repost
+            # failure (Discord outage, 429 exhaustion) destroyed the message and
+            # its attachments with no rollback, leaving the DB pointing at a
+            # deleted message.
             success, new_message_id, new_channel_id = await self.post_message(
                 category=new_category,
                 content=content,
                 media_files=media_files,
                 video_urls=video_urls,
                 source_type=source_type,
-                entry_id=None,  # no nonce — avoids 5-min deduplication collision with the just-deleted original
+                entry_id=None,  # no nonce — avoids 5-min dedup collision with the original's post
                 display_category=original_ai_cat,
                 secondary_category=secondary_cat,
             )
@@ -595,7 +586,21 @@ class DiscordPoster:
                     logger.warning(f"Could not delete temporary file {file_path}: {e}")
 
             if not success:
-                return False, None, None, "Error posting to new channel"
+                return False, None, None, "Error posting to new channel (original message preserved)"
+
+            # Repost is live — now remove the original. A delete failure is logged
+            # loudly but does NOT fail the operation: a visible duplicate beats
+            # losing the message, and the DB mapping below points at the new
+            # message either way.
+            try:
+                await original_message.delete()
+                logger.info(f"Deleted original message {message_id} from channel {channel_id}")
+            except Exception as e:
+                logger.error(
+                    f"Reposted entry {entry_id} as message {new_message_id} but FAILED to delete "
+                    f"the original message {message_id} in channel {channel_id}: {e} — "
+                    f"remove the old copy manually"
+                )
 
             # Recreate thread with Perplexity content if it was extracted
             if thread_data:
