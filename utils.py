@@ -9,49 +9,167 @@ import sys
 import asyncio
 import inspect
 from functools import wraps
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import config
 
-# Set up logging
-def setup_logging():
-    """Configure logging with debug level for comprehensive diagnostics"""
-    # Configure console handler with UTF-8 encoding
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
+_LOGGING_CONFIGURED = False
 
-    # Set UTF-8 encoding for console on Windows
-    if sys.platform == 'win32':
+# Libraries that drown bot.log in DEBUG/INFO chatter under normal operation.
+_NOISY_LOGGERS = (
+    "discord",
+    "discord.client",
+    "discord.gateway",
+    "discord.http",
+    "discord.voice_state",
+    "telethon",
+    "telethon.network",
+    "telethon.client",
+    "telethon.client.updates",
+    "asyncio",
+    "urllib3",
+    "urllib3.connectionpool",
+    "aiohttp",
+    "aiohttp.access",
+    "aiohttp.client",
+    "httpx",
+    "httpcore",
+    "charset_normalizer",
+    "filelock",
+    "openai",
+    "httpcore.http11",
+    "httpcore.connection",
+)
+
+
+def _resolve_level(name: str, default: int = logging.INFO) -> int:
+    level = getattr(logging, str(name or "").upper(), None)
+    return level if isinstance(level, int) else default
+
+
+def setup_logging(force: bool = False):
+    """Configure app logging: INFO by default, rotating file, quiet libraries.
+
+    Set config.LOG_LEVEL / env LOG_LEVEL=DEBUG for full diagnostics.
+    Idempotent unless force=True.
+    """
+    global _LOGGING_CONFIGURED
+
+    if _LOGGING_CONFIGURED and not force:
+        return logging.getLogger(__name__)
+
+    level_name = str(getattr(config, "LOG_LEVEL", "INFO") or "INFO").upper()
+    level = _resolve_level(level_name, logging.INFO)
+    level_name = logging.getLevelName(level)
+
+    log_file = getattr(config, "LOG_FILE", "bot.log")
+    max_bytes = int(getattr(config, "LOG_MAX_BYTES", 5 * 1024 * 1024))
+    backup_count = int(getattr(config, "LOG_BACKUP_COUNT", 5))
+    to_console = bool(getattr(config, "LOG_TO_CONSOLE", True))
+
+    # Shrink legacy oversized logs before opening handlers (best-effort if unlocked).
+    def _pretrim(path_str, keep):
         try:
-            # Reconfigure stdout to use UTF-8
-            sys.stdout.reconfigure(encoding='utf-8')
-        except AttributeError:
-            # Python < 3.7, use a different approach
-            import codecs
-            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+            if not path_str or not os.path.exists(path_str):
+                return
+            size = os.path.getsize(path_str)
+            if size <= keep:
+                return
+            with open(path_str, "rb") as f:
+                f.seek(-keep, os.SEEK_END)
+                data = f.read()
+            nl = data.find(b"\n")
+            if nl != -1 and nl + 1 < len(data):
+                data = data[nl + 1:]
+            with open(path_str, "wb") as f:
+                f.write(data)
+        except OSError:
+            pass
 
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(formatter)
+    _pretrim(log_file, max_bytes)
+    _service_max = int(getattr(config, "SERVICE_LOG_MAX_BYTES", 10 * 1024 * 1024))
+    _pretrim(getattr(config, "SERVICE_STDOUT_LOG", "service_stdout.log"), _service_max)
+    _pretrim(getattr(config, "SERVICE_STDERR_LOG", "service_stderr.log"), _service_max)
 
-    handlers = [console_handler]
-    # Configure file handler — may fail when bot.log is already locked by another
-    # process (e.g. the main bot holds it while the eval subprocess runs).
-    try:
-        file_handler = logging.FileHandler('bot.log', encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        handlers.append(file_handler)
-    except PermissionError:
-        pass  # console-only logging; caller's stdout redirection captures output
+    # UTF-8 console on Windows so emoji/symbols in posts do not crash handlers
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            try:
+                import codecs
+                sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "strict")
+            except Exception:
+                pass
 
-    # Configure root logger
-    logging.basicConfig(
-        level=logging.DEBUG,
-        handlers=handlers
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    
-    return logging.getLogger(__name__)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Drop previous handlers so reconfigure/re-import does not duplicate output
+    for handler in list(root.handlers):
+        try:
+            handler.close()
+        except Exception:
+            pass
+        root.removeHandler(handler)
+
+    if to_console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        root.addHandler(console_handler)
+
+    # Rotating file handler — may fail when another process holds bot.log exclusively
+    try:
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except PermissionError:
+        pass  # console-only; NSSM stdout still captures process output
+
+    # Quieten third-party frameworks unless the operator explicitly asked for DEBUG
+    if getattr(config, "LOG_QUIET_LIBRARIES", True):
+        if level <= logging.DEBUG:
+            # Even in DEBUG, gateways/network hex dumps are rarely useful
+            for name in (
+                "discord.gateway",
+                "discord.client",
+                "telethon.network",
+                "asyncio",
+                "charset_normalizer",
+            ):
+                logging.getLogger(name).setLevel(logging.INFO)
+        else:
+            lib_level = _resolve_level(
+                getattr(config, "LOG_LIBRARY_LEVEL", "WARNING"),
+                logging.WARNING,
+            )
+            for name in _NOISY_LOGGERS:
+                logging.getLogger(name).setLevel(lib_level)
+
+    _LOGGING_CONFIGURED = True
+    configured = logging.getLogger(__name__)
+    configured.info(
+        "Logging configured: level=%s file=%s max_bytes=%s backups=%s quiet_libs=%s",
+        level_name,
+        log_file,
+        max_bytes,
+        backup_count,
+        bool(getattr(config, "LOG_QUIET_LIBRARIES", True)),
+    )
+    return configured
+
 
 logger = setup_logging()
 
@@ -183,40 +301,111 @@ def cleanup_old_media_files(media_dir="temp_media", retention_days=2):
         logger.error(f"Error cleaning up old media files: {e}")
 
 
-def cleanup_bot_log(log_path: str = 'bot.log', max_age_hours: int = 24) -> None:
-    import re
-    from datetime import datetime, timedelta
-    if not os.path.exists(log_path):
-        return
-    cutoff = datetime.now() - timedelta(hours=max_age_hours)
-    ts_re = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)')
-    kept, include_block = [], False
-    with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-        for line in f:
-            m = ts_re.match(line)
-            if m:
-                try:
-                    include_block = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S,%f') >= cutoff
-                except ValueError:
-                    include_block = True
-            if include_block:
-                kept.append(line)
-    # On Windows os.replace() fails while the logging FileHandler holds bot.log open.
-    # Close all FileHandlers pointing to this path, overwrite in place, then reopen them.
-    abs_path = os.path.abspath(log_path)
-    open_handlers = [
-        h for h in logging.getLogger().handlers
-        if isinstance(h, logging.FileHandler) and os.path.abspath(h.baseFilename) == abs_path
-    ]
-    for h in open_handlers:
-        h.close()
+def _truncate_file_keep_tail(path: str, keep_bytes: int) -> int:
+    """Rewrite *path* keeping only the last keep_bytes (aligned to a newline).
+
+    Returns bytes retained. Raises OSError if the file cannot be rewritten
+    (e.g. another process holds an exclusive lock).
+    """
+    size = os.path.getsize(path)
+    if size <= keep_bytes:
+        return size
+
+    with open(path, "rb") as f:
+        f.seek(-keep_bytes, os.SEEK_END)
+        data = f.read()
+
+    # Drop a partial first line so the truncated file starts cleanly
+    nl = data.find(b"\n")
+    if nl != -1 and nl + 1 < len(data):
+        data = data[nl + 1 :]
+
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
+
+
+def cleanup_bot_log(log_path: str = None, max_age_hours: int = 24) -> None:
+    """Prune rotated leftovers and oversized service logs.
+
+    ``bot.log`` itself is size-rotated by RotatingFileHandler; this helper
+    only removes excess ``bot.log.N`` files beyond backup_count and trims
+    NSSM service_*.log files that predate rotation settings.
+
+    max_age_hours is accepted for call-site compatibility but unused —
+    retention is size-based now, which is what keeps OneDrive/disk healthy.
+    """
+    del max_age_hours  # size-based retention; kept in signature for callers
+
+    log_path = log_path or getattr(config, "LOG_FILE", "bot.log")
+    backup_count = int(getattr(config, "LOG_BACKUP_COUNT", 5))
+    service_max = int(getattr(config, "SERVICE_LOG_MAX_BYTES", 10 * 1024 * 1024))
+
+    removed = 0
+    # RotatingFileHandler keeps .1 .. .backup_count; bury anything beyond
+    for i in range(backup_count + 1, backup_count + 50):
+        candidate = f"{log_path}.{i}"
+        if not os.path.exists(candidate):
+            continue
+        try:
+            os.remove(candidate)
+            removed += 1
+        except OSError as e:
+            logger.warning(f"Could not remove old rotated log {candidate}: {e}")
+
+    # Sweep non-standard rotated names (timestamped leftovers, etc.)
+    log_dir = os.path.dirname(os.path.abspath(log_path)) or "."
+    base_name = os.path.basename(log_path)
     try:
-        with open(log_path, 'w', encoding='utf-8') as f:
-            f.writelines(kept)
-    finally:
-        for h in open_handlers:
-            h.stream = open(h.baseFilename, h.mode, encoding='utf-8')
-    logger.info(f"Log cleanup complete: retained {len(kept)} lines (last {max_age_hours}h)")
+        for name in os.listdir(log_dir):
+            if not name.startswith(base_name + "."):
+                continue
+            suffix = name[len(base_name) + 1 :]
+            full = os.path.join(log_dir, name)
+            if os.path.abspath(full) == os.path.abspath(log_path):
+                continue
+            # Keep numeric rotations within backup_count
+            if suffix.isdigit() and int(suffix) <= backup_count:
+                continue
+            try:
+                os.remove(full)
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    service_logs = [
+        getattr(config, "SERVICE_STDOUT_LOG", "service_stdout.log"),
+        getattr(config, "SERVICE_STDERR_LOG", "service_stderr.log"),
+    ]
+    trimmed = []
+    for service_log in service_logs:
+        if not service_log or not os.path.exists(service_log):
+            continue
+        try:
+            size = os.path.getsize(service_log)
+        except OSError:
+            continue
+        if size <= service_max:
+            continue
+        try:
+            kept = _truncate_file_keep_tail(service_log, service_max)
+            trimmed.append(f"{service_log}->{kept}B")
+        except OSError as e:
+            logger.warning(
+                f"Could not trim {service_log} (may be locked by the service wrapper): {e}"
+            )
+
+    if removed or trimmed:
+        parts = []
+        if removed:
+            parts.append(f"removed {removed} excess rotated file(s)")
+        if trimmed:
+            parts.append("trimmed " + ", ".join(trimmed))
+        logger.info("Log cleanup complete: " + "; ".join(parts))
+    else:
+        logger.debug("Log cleanup: nothing to prune")
 
 
 def ensure_directory(directory):

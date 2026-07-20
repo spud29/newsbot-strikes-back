@@ -917,7 +917,7 @@ class NewsAggregatorBot:
         from utils import cleanup_old_media_files
         cleanup_old_media_files(retention_days=2)
 
-        # Trim bot.log to last 24 hours once every 7 days
+        # Prune excess rotated logs / oversized service logs once every 7 days
         _LOG_CLEANUP_INTERVAL = 7 * 24 * 3600
         _now = time.time()
         if _now - self._last_log_cleanup >= _LOG_CLEANUP_INTERVAL:
@@ -1214,7 +1214,7 @@ class NewsAggregatorBot:
         
         logger.info(f"\nStarting main loop (polling every {config.POLL_INTERVAL}s)...")
 
-        # Trim log to last 24 hours on startup, then every 7 days thereafter
+        # Prune excess rotated / oversized service logs on startup, then weekly
         await asyncio.to_thread(cleanup_bot_log)
         self._last_log_cleanup = time.time()
 

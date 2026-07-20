@@ -25,12 +25,14 @@ wheels/
 
 # Virtual environments
 venv/
+.venv/
 ENV/
 env/
 
 # Logs
 *.log
 bot.log
+bot.log.*
 
 # Database files
 data/processed_ids.json
@@ -44,6 +46,7 @@ data/statistics.json
 data/bot_stats.json
 data/removed_entries.json
 data/*.bak
+data/*.bak-*
 data/newsbot.db
 data/newsbot.db-shm
 data/newsbot.db-wal
@@ -67,6 +70,9 @@ twitter_cookies.txt
 .claude/settings.local.json
 .claude/worktrees/
 
+# Local knowledge-base indexer config (machine-specific)
+.oikb.yaml
+
 # IDE
 .vscode/
 .idea/
@@ -83,4 +89,3 @@ Thumbs.db
 evals/runs/
 evals/variants/pending/
 evals/.tuning.lock
-

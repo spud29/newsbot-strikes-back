@@ -27,11 +27,15 @@ echo Configuring service...
 :: Set the working directory so .env and config.py are found
 %NSSM% set NewsBot AppDirectory %BOT_DIR%
 
-:: Redirect stdout/stderr to log files
+:: Redirect stdout/stderr to log files (rotated; do not grow forever)
 %NSSM% set NewsBot AppStdout %BOT_DIR%\service_stdout.log
 %NSSM% set NewsBot AppStderr %BOT_DIR%\service_stderr.log
 %NSSM% set NewsBot AppStdoutCreationDisposition 4
 %NSSM% set NewsBot AppStderrCreationDisposition 4
+:: Rotate while running when a log exceeds ~10 MB
+%NSSM% set NewsBot AppRotateFiles 1
+%NSSM% set NewsBot AppRotateOnline 1
+%NSSM% set NewsBot AppRotateBytes 10485760
 
 :: Restart automatically on crash, with 5-second delay
 %NSSM% set NewsBot AppRestartDelay 5000

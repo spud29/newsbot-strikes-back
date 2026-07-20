@@ -528,3 +528,24 @@ TRANSCRIPTION_ENABLED = False
 TRANSCRIPTION_MODEL = "large-v3-turbo"  # ~3 GB RAM/VRAM; use "medium" if constrained
 TRANSCRIPTION_DEVICE = "auto"           # "cuda", "cpu", or "auto" (detects GPU)
 TRANSCRIPTION_MAX_DURATION = 300        # Skip videos longer than this (seconds)
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+# Default INFO keeps routing/decisions/errors visible without DEBUG sludge.
+# Override at runtime with env var LOG_LEVEL=DEBUG when diagnosing an issue.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+LOG_TO_CONSOLE = True
+# Rotating app log: ~5 MB x 5 backups ≈ 25 MB max for bot.log*
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+# Keep discord/telethon/http libraries quiet unless LOG_LEVEL=DEBUG
+LOG_QUIET_LIBRARIES = True
+LOG_LIBRARY_LEVEL = os.getenv("LOG_LIBRARY_LEVEL", "WARNING").upper()
+# Service/stdout logs written by NSSM (separate from bot.log)
+SERVICE_STDOUT_LOG = "service_stdout.log"
+SERVICE_STDERR_LOG = "service_stderr.log"
+# Cap retained size when trimming legacy/overgrown service logs
+SERVICE_LOG_MAX_BYTES = int(os.getenv("SERVICE_LOG_MAX_BYTES", str(10 * 1024 * 1024)))

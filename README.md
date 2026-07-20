@@ -87,6 +87,10 @@ All settings live in `config.py`. Key options:
 | `FEEDBACK_LEARNING_ENABLED` | `True` | Inject removed entries into LLM prompt |
 | `NOT_VALUABLE_VOTES_REQUIRED` | `2` | Votes needed to auto-remove a post |
 
+### Logging
+
+Default level is **INFO** (routing decisions + errors). App logs rotate at ~5 MB x 5 backups (`bot.log`). For temporary diagnostics set env `LOG_LEVEL=DEBUG` (or `LOG_LEVEL = "DEBUG"` in `config.py`) and restart.
+
 ## Categories
 
 Content is categorized into one of:
