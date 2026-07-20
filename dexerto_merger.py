@@ -108,45 +108,65 @@ class DexertoMerger:
 
         for entry_id, entry_json, buffered_at in rows:
             age_hours = (time.time() - buffered_at) / 3600
-            entry = json.loads(entry_json)
 
-            # Try one final conversation fetch before posting alone.
-            # The RSS feed no longer delivers tweet 2 (Dexerto's self-reply with the
-            # article URL), but gallery-dl with conversations=true can fetch it directly.
-            follow_up, tweet2_entry_id = await asyncio.to_thread(
-                self._find_follow_up_sync, entry
-            )
-            if follow_up:
-                logger.info(
-                    f"DexertoMerger: found follow-up for {entry_id} at flush time — merging"
-                )
-                entry['dexerto_follow_up'] = follow_up
-                if tweet2_entry_id:
-                    self._db.mark_processed(tweet2_entry_id)
-            else:
-                logger.warning(
-                    f"DexertoMerger: headline {entry_id} waited {age_hours:.1f}h with no "
-                    f"follow-up tweet — posting alone"
-                )
-
-            # Only remove from pending after the entry has been handled (posted or
-            # marked processed by a filter). If process_entry fails transiently
-            # (e.g. Ollama down) the row stays in pending so the next flush cycle
-            # retries it — otherwise the entry would be silently lost.
+            # An unparseable row can never succeed, and an uncaught exception here
+            # used to abort poll_cycle at the same point every cycle — a single
+            # corrupt row permanently halted all polling. Drop it instead.
             try:
-                success = await self._process_entry(entry)
-            except Exception as e:
-                logger.error(f"DexertoMerger: error flushing stale entry {entry_id}: {e}", exc_info=True)
-                success = False
-
-            if success or self._db.is_processed(entry_id):
+                entry = json.loads(entry_json)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"DexertoMerger: dropping corrupt pending row {entry_id}: {e}")
                 with get_db_lock():
                     conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
                     conn.commit()
-            else:
-                logger.warning(
-                    f"DexertoMerger: stale flush of {entry_id} did not complete — "
-                    f"leaving in pending buffer to retry next cycle"
+                continue
+
+            # Any other per-row failure leaves the row for the next cycle but must
+            # not take down the loop (or the poll cycle awaiting it).
+            try:
+                # Try one final conversation fetch before posting alone.
+                # The RSS feed no longer delivers tweet 2 (Dexerto's self-reply with the
+                # article URL), but gallery-dl with conversations=true can fetch it directly.
+                follow_up, tweet2_entry_id = await asyncio.to_thread(
+                    self._find_follow_up_sync, entry
+                )
+                if follow_up:
+                    logger.info(
+                        f"DexertoMerger: found follow-up for {entry_id} at flush time — merging"
+                    )
+                    entry['dexerto_follow_up'] = follow_up
+                    if tweet2_entry_id:
+                        self._db.mark_processed(tweet2_entry_id)
+                else:
+                    logger.warning(
+                        f"DexertoMerger: headline {entry_id} waited {age_hours:.1f}h with no "
+                        f"follow-up tweet — posting alone"
+                    )
+
+                # Only remove from pending after the entry has been handled (posted or
+                # marked processed by a filter). If process_entry fails transiently
+                # (e.g. Ollama down) the row stays in pending so the next flush cycle
+                # retries it — otherwise the entry would be silently lost.
+                try:
+                    success = await self._process_entry(entry)
+                except Exception as e:
+                    logger.error(f"DexertoMerger: error flushing stale entry {entry_id}: {e}", exc_info=True)
+                    success = False
+
+                if success or self._db.is_processed(entry_id):
+                    with get_db_lock():
+                        conn.execute("DELETE FROM dexerto_pending WHERE entry_id = ?", (entry_id,))
+                        conn.commit()
+                else:
+                    logger.warning(
+                        f"DexertoMerger: stale flush of {entry_id} did not complete — "
+                        f"leaving in pending buffer to retry next cycle"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"DexertoMerger: unexpected error flushing {entry_id}, "
+                    f"leaving row for next cycle: {e}",
+                    exc_info=True
                 )
 
     # ------------------------------------------------------------------

@@ -907,8 +907,12 @@ class NewsAggregatorBot:
         logger.info("Cleaning up old database entries...")
         await asyncio.to_thread(self.db.cleanup_old_entries)
 
-        # Flush Dexerto headlines that have been waiting too long with no follow-up tweet
-        await self.dexerto_merger.flush_stale()
+        # Flush Dexerto headlines that have been waiting too long with no follow-up tweet.
+        # Guarded so a merger failure can never abort the poll cycle before RSS/Telegram run.
+        try:
+            await self.dexerto_merger.flush_stale()
+        except Exception as e:
+            logger.error(f"Error flushing stale Dexerto entries: {e}", exc_info=True)
         
         # Clean up old retry queue entries (older than 24 hours)
         self.retry_queue.cleanup_old_entries(max_age_hours=24)
