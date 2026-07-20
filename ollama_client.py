@@ -627,33 +627,39 @@ class OllamaClient:
                 "CLEANED TEXT:"
             )
 
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.categorization_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "keep_alive": "30m",
-                    "think": True,
-                    "options": {
-                        "temperature": 0.0,
-                        "num_predict": 4000,
-                        "num_ctx": self.categorization_num_ctx  # keep in sync — see categorize() above
-                    }
-                },
-                timeout=300
-            )
+            def _generate(think, temperature, num_predict):
+                resp = requests.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.categorization_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": "30m",
+                        "think": think,
+                        "options": {
+                            "temperature": temperature,
+                            "num_predict": num_predict,
+                            "num_ctx": self.categorization_num_ctx  # keep in sync — see categorize() above
+                        }
+                    },
+                    timeout=300
+                )
+                resp.raise_for_status()
+                return resp.json()
 
-            response.raise_for_status()
-            result = response.json()
+            result = _generate(think=True, temperature=0.0, num_predict=4000)
 
             # With thinking enabled, a too-small token budget can be entirely
             # consumed by reasoning before any answer is written, leaving
-            # response empty with done_reason == 'length'. Treat that the
-            # same as an empty response rather than silently returning "".
+            # response empty with done_reason == 'length'. Retry once without
+            # thinking (the pre-thinking-mode settings) so ALL CAPS content
+            # still gets rewritten instead of posted verbatim when this happens.
             if result.get('done_reason') == 'length':
-                logger.warning("format_text hit the token limit while thinking, using original")
-                return content
+                logger.warning("format_text hit the token limit while thinking, retrying without thinking")
+                result = _generate(think=False, temperature=0.1, num_predict=500)
+                if result.get('done_reason') == 'length':
+                    logger.warning("format_text hit the token limit on non-thinking retry too, using original")
+                    return content
 
             rewritten = result.get('response', '').strip()
 
