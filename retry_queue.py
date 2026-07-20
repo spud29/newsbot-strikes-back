@@ -2,25 +2,33 @@
 Retry queue for failed Twitter media extractions
 """
 import json
+import time
+import config
 from utils import logger
 from db_connection import get_db_connection, get_db_lock
 
 
 class RetryQueue:
-    """Manages retry attempts for entries where gallery-dl failed"""
-    
+    """Manages retry attempts for entries where gallery-dl failed.
+
+    Timing is wall-clock based (persisted first/last attempt timestamps).
+    The old in-memory cycle counter reset to 0 on every restart while the
+    queue rows persisted, which froze all pending retries until the new
+    counter caught up with the pre-restart cycle numbers.
+    """
+
     def __init__(self, max_retries=3, retry_delay_cycles=2):
         """
         Initialize retry queue
-        
+
         Args:
             max_retries: Maximum number of retry attempts per entry
-            retry_delay_cycles: Number of poll cycles to wait before retrying
+            retry_delay_cycles: Poll cycles to wait before retrying; converted
+                to seconds via config.POLL_INTERVAL so restarts don't reset it
         """
         self.max_retries = max_retries
-        self.retry_delay_cycles = retry_delay_cycles
+        self.retry_delay_seconds = retry_delay_cycles * getattr(config, 'POLL_INTERVAL', 300)
         self.conn = get_db_connection()
-        self.current_cycle = 0
     
     def add_entry(self, entry):
         """
@@ -30,6 +38,7 @@ class RetryQueue:
             entry: Entry dictionary that failed to process
         """
         entry_id = entry['id']
+        now = time.time()
 
         with get_db_lock():
             row = self.conn.execute(
@@ -40,8 +49,8 @@ class RetryQueue:
                 # Increment retry count
                 new_count = row['retry_count'] + 1
                 self.conn.execute(
-                    "UPDATE retry_queue SET retry_count = ?, last_attempt_cycle = ? WHERE entry_id = ?",
-                    (new_count, self.current_cycle, entry_id)
+                    "UPDATE retry_queue SET retry_count = ?, last_attempt_ts = ? WHERE entry_id = ?",
+                    (new_count, now, entry_id)
                 )
                 self.conn.commit()
                 logger.info(
@@ -51,9 +60,9 @@ class RetryQueue:
                 # First retry
                 self.conn.execute(
                     """INSERT INTO retry_queue
-                       (entry_id, entry_data, retry_count, first_attempt_cycle, last_attempt_cycle, reason)
+                       (entry_id, entry_data, retry_count, first_attempt_ts, last_attempt_ts, reason)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (entry_id, json.dumps(entry), 1, self.current_cycle, self.current_cycle,
+                    (entry_id, json.dumps(entry), 1, now, now,
                      'gallery-dl failed to extract content')
                 )
                 self.conn.commit()
@@ -67,16 +76,18 @@ class RetryQueue:
             list: List of entry dictionaries to retry
         """
         entries_to_retry = []
+        now = time.time()
 
         with get_db_lock():
             rows = self.conn.execute(
-                "SELECT entry_id, entry_data, retry_count, last_attempt_cycle FROM retry_queue"
+                "SELECT entry_id, entry_data, retry_count, last_attempt_ts FROM retry_queue"
             ).fetchall()
 
             for row in rows:
                 entry_id = row['entry_id']
                 retry_count = row['retry_count']
-                last_attempt_cycle = row['last_attempt_cycle'] or 0
+                # Legacy/NULL timestamps count as "long ago" → eligible now
+                last_attempt_ts = row['last_attempt_ts'] or 0
 
                 # Check if we've exceeded max retries
                 if retry_count > self.max_retries:
@@ -86,9 +97,8 @@ class RetryQueue:
                     self._remove_entry_locked(entry_id, reason="max_retries_exceeded")
                     continue
 
-                # Check if enough cycles have passed since last attempt
-                cycles_since_last = self.current_cycle - last_attempt_cycle
-                if cycles_since_last >= self.retry_delay_cycles:
+                # Check if enough wall-clock time has passed since the last attempt
+                if (now - last_attempt_ts) >= self.retry_delay_seconds:
                     entry_data = json.loads(row['entry_data'])
                     entries_to_retry.append(entry_data)
 
@@ -120,10 +130,6 @@ class RetryQueue:
                 logger.info(f"✓ Entry successfully processed after {retry_count} retry(ies): {entry_id}")
             else:
                 logger.warning(f"Entry removed from retry queue ({reason}): {entry_id}")
-    
-    def increment_cycle(self):
-        """Increment the cycle counter (call at start of each poll cycle)"""
-        self.current_cycle += 1
     
     def get_stats(self):
         """
@@ -158,15 +164,13 @@ class RetryQueue:
         Args:
             max_age_hours: Maximum age in hours
         """
-        # Since we're tracking by cycles, we can estimate based on cycle count
-        # Assuming 5 minute poll interval: 12 cycles per hour
-        max_cycles = max_age_hours * 12
-
-        cutoff_cycle = self.current_cycle - max_cycles
+        cutoff_ts = time.time() - max_age_hours * 3600
 
         with get_db_lock():
+            # COALESCE: rows migrated from the old cycle-based schema were
+            # backfilled at migration time, but treat any stray NULL as expired.
             cursor = self.conn.execute(
-                "DELETE FROM retry_queue WHERE first_attempt_cycle < ?", (cutoff_cycle,)
+                "DELETE FROM retry_queue WHERE COALESCE(first_attempt_ts, 0) < ?", (cutoff_ts,)
             )
             self.conn.commit()
             removed = cursor.rowcount

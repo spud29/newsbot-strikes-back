@@ -893,10 +893,7 @@ class NewsAggregatorBot:
         logger.info("=" * 80)
         
         cycle_start = time.time()
-        
-        # Increment retry queue cycle counter
-        self.retry_queue.increment_cycle()
-        
+
         # Reset per-cycle statistics
         self.stats['duplicates'] = 0
         self.stats['errors'] = 0

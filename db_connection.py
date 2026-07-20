@@ -108,6 +108,8 @@ def _create_tables(conn):
             retry_count INTEGER DEFAULT 1,
             first_attempt_cycle INTEGER,
             last_attempt_cycle INTEGER,
+            first_attempt_ts REAL,
+            last_attempt_ts REAL,
             reason TEXT
         );
 
@@ -165,6 +167,19 @@ def _run_migrations(conn):
 
     if 'newsworthiness_score' not in columns:
         conn.execute("ALTER TABLE message_mapping ADD COLUMN newsworthiness_score REAL DEFAULT NULL")
+        conn.commit()
+
+    # Retry queue moved from restart-fragile cycle counters to wall-clock
+    # timestamps. Backfill existing rows with "now" so they become eligible
+    # after one normal retry delay instead of sitting frozen.
+    rq_columns = {row[1] for row in conn.execute("PRAGMA table_info(retry_queue)").fetchall()}
+    if 'first_attempt_ts' not in rq_columns:
+        conn.execute("ALTER TABLE retry_queue ADD COLUMN first_attempt_ts REAL")
+        conn.execute("ALTER TABLE retry_queue ADD COLUMN last_attempt_ts REAL")
+        conn.execute(
+            "UPDATE retry_queue SET first_attempt_ts = strftime('%s','now'), "
+            "last_attempt_ts = strftime('%s','now')"
+        )
         conn.commit()
 
 
