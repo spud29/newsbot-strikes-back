@@ -1187,26 +1187,15 @@ class NewsAggregatorBot:
             )
             
             if success:
-                # Update the stored content in the mapping. INSERT OR REPLACE rewrites the
-                # whole row, so every metadata field must be carried over or it gets nulled
-                # (placement_reason/secondary_category were being lost on edits before).
+                # Content-only update. store_message_mapping() is INSERT OR REPLACE, which
+                # rewrites the whole row and nulls any column not re-supplied — that quietly
+                # wiped user_reason (and superseded_by / superseded_channel_discord_message_id)
+                # on every edit. A targeted field update touches only content and preserves
+                # all other metadata plus the original timestamp.
                 await asyncio.to_thread(
-                    self.db.store_message_mapping,
-                    telegram_entry_id=entry_id,
-                    telegram_message_id=mapping_info['telegram_message_id'],
-                    discord_channel_id=discord_channel_id,
-                    discord_message_id=discord_message_id,
+                    self.db.update_message_mapping_fields,
+                    entry_id,
                     content=new_content,
-                    source_url=mapping_info.get('source_url'),
-                    video_urls=mapping_info.get('video_urls', []),
-                    category=mapping_info.get('category'),
-                    source_type=mapping_info.get('source_type', 'telegram'),
-                    reasoning=mapping_info.get('reasoning'),
-                    original_category=mapping_info.get('original_category'),
-                    placement_reason=mapping_info.get('placement_reason'),
-                    secondary_category=mapping_info.get('secondary_category'),
-                    original_secondary_category=mapping_info.get('original_secondary_category'),
-                    newsworthiness_score=mapping_info.get('newsworthiness_score')
                 )
                 logger.info(f"✓ Successfully updated Discord message for edited Telegram message: {entry_id}")
             else:
