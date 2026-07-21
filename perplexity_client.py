@@ -58,6 +58,21 @@ class PerplexityClient:
         return text
     
     @retry_with_backoff(max_retries=3, initial_delay=2)
+    def _chat_completion(self, model, messages):
+        """
+        Single Perplexity chat-completion call. Raises on failure so that
+        @retry_with_backoff actually retries. search()/news_search() wrap their
+        whole body in try/except and return an error dict, so an exception never
+        reached their own decorators — they were dead (the same bug that was
+        fixed in OllamaClient._request_generate). Centralizing the network call
+        here makes the retry real while the callers keep returning a dict.
+        """
+        return self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=False,
+        )
+
     def search(self, content):
         """
         Perform a Perplexity search for more information about news content
@@ -91,10 +106,10 @@ class PerplexityClient:
             logger.info(f"Sending Perplexity search request...")
             logger.debug(f"Prompt: {prompt[:100]}...")
             
-            # Make the API call
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            # Make the API call (retried internally by _chat_completion)
+            response = self._chat_completion(
+                self.model,
+                [
                     {
                         "role": "system",
                         "content": "You are a helpful research assistant. Provide comprehensive, well-organized information about the given news headline. Write in a clear, direct style without showing your thinking process."
@@ -104,7 +119,6 @@ class PerplexityClient:
                         "content": prompt
                     }
                 ],
-                stream=False
             )
             
             # Extract the response
@@ -198,7 +212,6 @@ class PerplexityClient:
                     'error': f'Search failed: {error_msg}'
                 }
     
-    @retry_with_backoff(max_retries=2, initial_delay=1)
     def news_search(self, topic):
         """
         Search for recent news on a topic using Perplexity AI
@@ -226,9 +239,9 @@ class PerplexityClient:
 
             logger.info(f"News search for topic: {topic} (model: {model})")
 
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=[
+            response = self._chat_completion(
+                model,
+                [
                     {
                         "role": "system",
                         "content": (
@@ -245,7 +258,6 @@ class PerplexityClient:
                         "content": f"What is the latest news about: {topic}"
                     }
                 ],
-                stream=False
             )
 
             if response and response.choices:
