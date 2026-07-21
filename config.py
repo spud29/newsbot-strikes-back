@@ -158,12 +158,12 @@ OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 # free VRAM elsewhere (e.g. a smaller categorizer or lower categorizer context).
 OLLAMA_EMBEDDING_NUM_CTX = 512
 # Context window for the categorization model — shared by categorize(), format_text(),
-# verify_similarity(), compare_entries(), and rate_newsworthiness() in ollama_client.py,
-# plus enrichment.py's synthesize_enriched_post(). Ollama sizes a model's KV cache to
-# num_ctx at load time: if any of these six call sites requested a different num_ctx for
+# verify_similarity(), compare_entries(), and rate_newsworthiness() in ollama_client.py.
+# Ollama sizes a model's KV cache to num_ctx at load time: if any of these five call
+# sites requested a different num_ctx for
 # the same model, Ollama would reload/reallocate between calls — this exact churn
 # fragmented VRAM and stalled all processing for ~6.5 hours on 2026-06-28 (see
-# OLLAMA_EMBEDDING_NUM_CTX above; same failure mode, other model). Every one of the six
+# OLLAMA_EMBEDDING_NUM_CTX above; same failure mode, other model). Every one of the five
 # call sites must pass this exact value.
 # 16384 (vs. Ollama's 8192 implicit default) was chosen deliberately conservatively:
 # qwen3.5:9b's weights alone (6.59 GB, Q4_K_M) already exceed qwen3:8b's entire old

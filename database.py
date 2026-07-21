@@ -472,26 +472,6 @@ class Database:
             self.conn.commit()
         logger.debug(f"Marked {entry_id} as superseded by {superseded_by_entry_id}")
 
-    def get_entry_superseded_by(self, superseder_entry_id):
-        """
-        Find the original entry that was superseded by the given entry.
-
-        Args:
-            superseder_entry_id: entry_id of the entry that did the superseding
-
-        Returns:
-            dict of the original entry's columns, or None if not found
-        """
-        with get_db_lock():
-            row = self.conn.execute(
-                "SELECT * FROM message_mapping WHERE superseded_by = ?",
-                (superseder_entry_id,)
-            ).fetchone()
-            if row is None:
-                return None
-            keys = row.keys()
-            return {k: row[k] for k in keys}
-
     def update_superseded_channel_message_id(self, entry_id, channel_msg_id):
         """Store the Discord message ID of the archived copy in the superseded channel."""
         with get_db_lock():
@@ -501,15 +481,6 @@ class Database:
             )
             self.conn.commit()
         logger.debug(f"Stored superseded-channel message ID {channel_msg_id} for {entry_id}")
-
-    def get_entry_by_superseded_channel_message(self, channel_msg_id):
-        """Look up the original entry by its archived-copy message ID in the superseded channel."""
-        with get_db_lock():
-            row = self.conn.execute(
-                "SELECT * FROM message_mapping WHERE superseded_channel_discord_message_id = ?",
-                (channel_msg_id,)
-            ).fetchone()
-            return {k: row[k] for k in row.keys()} if row else None
 
     # ------------------------------------------------------------------
     # Reaction tracking
@@ -554,41 +525,7 @@ class Database:
             ).fetchall()
             return {row['emoji']: json.loads(row['user_ids']) for row in rows}
 
-    def copy_reactions(self, src_entry_id: str, dst_entry_id: str) -> None:
-        with get_db_lock():
-            rows = self.conn.execute(
-                "SELECT emoji, user_ids FROM entry_reactions WHERE entry_id = ?",
-                (src_entry_id,)
-            ).fetchall()
-            for row in rows:
-                self.conn.execute(
-                    """INSERT INTO entry_reactions (entry_id, emoji, user_ids) VALUES (?, ?, ?)
-                       ON CONFLICT(entry_id, emoji) DO UPDATE SET user_ids = excluded.user_ids""",
-                    (dst_entry_id, row['emoji'], row['user_ids'])
-                )
-            self.conn.commit()
-        logger.debug(f"Copied {len(rows)} reaction(s) from {src_entry_id} to {dst_entry_id}")
-
     # ------------------------------------------------------------------
-
-    def restore_superseded_entry(self, original_entry_id, new_discord_message_id, new_discord_channel_id):
-        """
-        Clear the superseded_by flag and update the Discord message IDs for a restored entry.
-
-        Args:
-            original_entry_id: entry_id of the entry being restored
-            new_discord_message_id: ID of the freshly re-posted Discord message
-            new_discord_channel_id: Channel ID of the freshly re-posted message
-        """
-        with get_db_lock():
-            self.conn.execute(
-                """UPDATE message_mapping
-                   SET superseded_by = NULL, discord_message_id = ?, discord_channel_id = ?
-                   WHERE entry_id = ?""",
-                (new_discord_message_id, new_discord_channel_id, original_entry_id)
-            )
-            self.conn.commit()
-        logger.debug(f"Restored {original_entry_id} with new Discord message {new_discord_message_id}")
 
     def get_ignore_entry_previews(self, limit=30, max_preview_length=150):
         """

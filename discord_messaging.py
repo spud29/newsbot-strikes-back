@@ -58,8 +58,6 @@ class DiscordPoster:
         self.removed_entries_db = removed_entries_db if removed_entries_db else RemovedEntriesDB()
 
         self.ollama = ollama
-        self.reprocess_callback = None  # Set by NewsAggregatorBot.start()
-        self.media_handler = None       # Set by NewsAggregatorBot.start()
 
         # Register context menu commands
         register_commands(self)
@@ -888,24 +886,6 @@ class DiscordPoster:
         except Exception as e:
             logger.error(f"delete_message error: {e}", exc_info=True)
             return False
-
-    async def restore_reactions(self, entry_id: str, message: discord.Message) -> None:
-        """Seed emoji reactions from DB onto a freshly re-posted Discord message.
-
-        Called after un-superseding an entry so the community's prior reactions
-        are visible again. The bot adds each emoji once; users can re-react to
-        increment counts. The full per-user history is preserved in the DB.
-        """
-        if self.database is None:
-            return
-        reactions = self.database.get_reactions(entry_id)
-        for emoji, user_ids in reactions.items():
-            if not user_ids:
-                continue
-            try:
-                await message.add_reaction(emoji)
-            except Exception as e:
-                logger.warning(f"Could not restore reaction {emoji} on {entry_id}: {e}")
 
     async def post_superseded_entry(self, old_mapping, new_entry_preview):
         """
