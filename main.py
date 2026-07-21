@@ -919,13 +919,25 @@ class NewsAggregatorBot:
         
         logger.info(f"\nTotal entries collected: {len(all_entries)} ({len(retry_entries)} from retry queue)")
         
-        # Sort entries by timestamp in reverse chronological order (newest first)
+        # Sort entries chronologically (oldest first) so within-cycle dedup/supersede
+        # ordering is consistent across sources.
+        _TWITTER_EPOCH_MS = 1288834974657  # Twitter/X snowflake epoch (2010-11-04 01:42:54 UTC)
+
         def get_entry_timestamp(entry):
-            """Extract timestamp from entry for sorting"""
-            # For Twitter entries, status_id is a snowflake ID — strictly chronological
-            # and more precise than pub_date which can be identical for thread replies
+            """Return a Unix timestamp (seconds) for cross-source sorting.
+
+            Twitter status_ids are snowflakes (~1e18), not epoch seconds. Comparing
+            them directly against the Unix timestamps (~1e9) used by Telegram/RSS
+            pushed every tweet to one end of the sort regardless of real time.
+            Convert the snowflake's embedded millisecond timestamp to seconds so all
+            sources share one scale; its sub-second precision still gives thread
+            replies a stable order.
+            """
             if entry.get('source_type') == 'twitter' and entry.get('status_id'):
-                return int(entry['status_id'])
+                try:
+                    return ((int(entry['status_id']) >> 22) + _TWITTER_EPOCH_MS) / 1000.0
+                except (ValueError, TypeError):
+                    pass
             if 'timestamp' in entry and entry['timestamp']:
                 return entry['timestamp']
             elif 'pub_date' in entry and entry['pub_date']:
