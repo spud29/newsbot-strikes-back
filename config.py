@@ -419,6 +419,12 @@ DB_RETENTION_HOURS = 48
 # and was posted again. 30 days comfortably outlives any feed's item list.
 PROCESSED_IDS_RETENTION_HOURS = 720  # 30 days
 
+# Message-mapping retention (days). Bounds table growth (~170 rows/day). Pruning drops
+# the Discord<->entry mapping for older posts, so Entry Info / Re-categorize / reaction
+# tracking stop working on posts older than this window. Kept generous: the learning
+# queries only look back 7 days, so this doesn't affect them.
+MESSAGE_MAPPING_RETENTION_DAYS = 365
+
 # Freshness guard for RSS entries: skip feed items whose pub_date is older than
 # this, regardless of DB state. Belt-and-braces with the retention split above —
 # it removes the dependency on rss.app's (undocumented) item-retention behavior.

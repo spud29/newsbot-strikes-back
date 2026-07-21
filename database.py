@@ -248,8 +248,9 @@ class Database:
     
     def cleanup_old_entries(self):
         """Prune old rows: embeddings at DB_RETENTION_HOURS, processed_ids at the
-        (much longer) PROCESSED_IDS_RETENTION_HOURS. The windows are split so an
-        item that lingers in a slow RSS feed past the embedding window doesn't
+        (much longer) PROCESSED_IDS_RETENTION_HOURS, message_mapping at
+        MESSAGE_MAPPING_RETENTION_DAYS. The embedding/processed windows are split so
+        an item that lingers in a slow RSS feed past the embedding window doesn't
         also lose its "already posted" flag and get re-posted."""
         import config
         current_time = time.time()
@@ -286,12 +287,26 @@ class Database:
                     k: v for k, v in self._embeddings_cache.items() if k not in stale_set
                 }
 
+            # Prune old message_mapping rows (bounded retention). Drops the
+            # Discord<->entry mapping for old posts, so Entry Info / Re-categorize /
+            # reaction tracking stop working past the window. Generous by default
+            # because growth is tiny and the learning queries only look back 7 days.
+            mapping_retention_days = getattr(config, 'MESSAGE_MAPPING_RETENTION_DAYS', 365)
+            mapping_cutoff = current_time - (mapping_retention_days * 86400)
+            cursor = self.conn.execute(
+                "DELETE FROM message_mapping WHERE timestamp IS NOT NULL AND timestamp < ?",
+                (mapping_cutoff,)
+            )
+            deleted_mappings = cursor.rowcount
+
             self.conn.commit()
 
         if deleted_ids:
             logger.info(f"Cleaned up {deleted_ids} old processed IDs")
         if deleted_embeddings:
             logger.info(f"Cleaned up {deleted_embeddings} old embeddings")
+        if deleted_mappings:
+            logger.info(f"Cleaned up {deleted_mappings} old message mappings")
     
     def get_stats(self):
         """
