@@ -3,7 +3,7 @@ RSS feed poller for Twitter feeds
 """
 import feedparser
 import re
-import socket
+import requests
 import time
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,8 +33,15 @@ class RSSPoller:
         logger.debug(f"Polling RSS feed: {feed_name}")
         
         try:
-            feed = feedparser.parse(feed_url)
-            
+            # Fetch with an explicit per-request timeout instead of a process-global
+            # socket.setdefaulttimeout (which leaked onto every other socket in the
+            # process during the poll window). feedparser then parses the bytes.
+            response = requests.get(
+                feed_url, timeout=30, headers={'User-Agent': 'newsbot/1.0 (+rss)'}
+            )
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
+
             if feed.bozo:
                 logger.warning(f"Feed parsing warning for {feed_name}: {feed.bozo_exception}")
             
@@ -201,35 +208,27 @@ class RSSPoller:
         """
         Poll all configured RSS feeds in parallel using a thread pool.
 
-        Sets a 30-second socket timeout to prevent feedparser.parse() from
-        hanging indefinitely on unresponsive feeds. Each feed is polled in
-        its own thread so total time is max-of-all-feeds instead of sum.
+        Each feed is fetched with a per-request 30s timeout (see poll_feed) and
+        polled in its own thread, so total time is max-of-all-feeds instead of sum.
 
         Returns:
             list: Combined list of all entries from all feeds
         """
         logger.info(f"Polling {len(self.feeds)} RSS feeds...")
 
-        # Protect against dead feeds hanging the bot indefinitely
-        old_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(30)
-
         all_entries = []
-        try:
-            with ThreadPoolExecutor(max_workers=len(self.feeds)) as executor:
-                futures = {
-                    executor.submit(self.poll_feed, name, url): name
-                    for name, url in self.feeds.items()
-                }
-                for future in as_completed(futures):
-                    feed_name = futures[future]
-                    try:
-                        entries = future.result(timeout=35)
-                        all_entries.extend(entries)
-                    except Exception as e:
-                        logger.error(f"Failed to poll feed {feed_name}: {e}")
-        finally:
-            socket.setdefaulttimeout(old_timeout)
+        with ThreadPoolExecutor(max_workers=len(self.feeds)) as executor:
+            futures = {
+                executor.submit(self.poll_feed, name, url): name
+                for name, url in self.feeds.items()
+            }
+            for future in as_completed(futures):
+                feed_name = futures[future]
+                try:
+                    entries = future.result(timeout=35)
+                    all_entries.extend(entries)
+                except Exception as e:
+                    logger.error(f"Failed to poll feed {feed_name}: {e}")
 
         logger.info(f"Total RSS entries collected: {len(all_entries)}")
         return all_entries
