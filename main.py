@@ -546,13 +546,22 @@ class NewsAggregatorBot:
                         newsworthiness = await asyncio.to_thread(
                             self.ollama.rate_newsworthiness, combined_content, 'general news', rescue_threshold
                         )
-                        newsworthiness_score = newsworthiness['score']
+                        # A rating error fails OPEN for demotion (safe) but must fail
+                        # CLOSED for rescue: otherwise an Ollama hiccup auto-promotes an
+                        # AI-ignored entry, and the rescue categorize below can itself fall
+                        # back to an arbitrary real category. Don't record a fake score.
+                        rescue_rating_ok = not newsworthiness.get('error')
+                        newsworthiness_score = newsworthiness['score'] if rescue_rating_ok else None
 
-                        if newsworthiness['passed']:
+                        if rescue_rating_ok and newsworthiness['passed']:
                             rescued_cat, rescued_reasoning, rescued_secondary = await asyncio.to_thread(
                                 self.ollama.categorize, combined_content, ['ignore']
                             )
-                            if rescued_cat != 'ignore':
+                            # Guard the second leg: with 'ignore' excluded, categorize's
+                            # error fallback returns an arbitrary real category tagged
+                            # 'Error during categorization' — never promote on that.
+                            rescued_errored = (rescued_reasoning or '').startswith('Error during categorization')
+                            if rescued_cat != 'ignore' and not rescued_errored:
                                 category = rescued_cat
                                 secondary_category = rescued_secondary
                                 reasoning = (

@@ -1018,7 +1018,9 @@ class OllamaClient:
                 'impact': int (1-10),
                 'talkability': int (1-10),
                 'reasoning': str (brief explanation),
-                'passed': bool (whether score >= threshold)
+                'passed': bool (whether score >= threshold),
+                'error': bool (True if the rating failed and fell open — callers
+                    that must fail closed, e.g. the rescue path, check this)
             }
         """
         logger.debug(f"Rating reaction-worthiness for: {content[:100]}...")
@@ -1032,7 +1034,8 @@ class OllamaClient:
                 'impact': 10,
                 'talkability': 10,
                 'reasoning': 'Filter disabled',
-                'passed': True
+                'passed': True,
+                'error': False
             }
 
         try:
@@ -1141,7 +1144,8 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                 'impact': impact,
                 'talkability': talkability,
                 'reasoning': reasoning,
-                'passed': passed
+                'passed': passed,
+                'error': False
             }
 
             # Log the rating
@@ -1163,7 +1167,8 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                 'impact': 10,
                 'talkability': 10,
                 'reasoning': f'JSON parse error — letting through: {str(e)[:50]}',
-                'passed': True
+                'passed': True,
+                'error': True
             }
         except Exception as e:
             logger.error(f"Error rating newsworthiness: {e}")
@@ -1175,7 +1180,8 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                 'impact': 10,
                 'talkability': 10,
                 'reasoning': f'Rating error — letting through: {str(e)[:50]}',
-                'passed': True
+                'passed': True,
+                'error': True
             }
     
     def health_check(self):
