@@ -24,7 +24,11 @@ import config
 from db_connection import get_db_connection, get_db_lock
 from utils import logger
 
-DEXERTO_URL_PATTERN = re.compile(r'https?://(?:(?:www\.)?dexerto\.com|t\.co)/\S+')
+# Tweet 2 (the article reply) carries a dexerto.com URL. Deliberately NOT matching
+# t.co: any link in a headline tweet becomes a t.co shortlink, so matching t.co here
+# misread headlines-with-links as follow-ups. A follow-up whose link is still an
+# unresolved t.co is caught later by flush_stale()'s reply_id conversation fetch.
+DEXERTO_URL_PATTERN = re.compile(r'https?://(?:www\.)?dexerto\.com/\S+')
 
 
 def is_dexerto_follow_up_tweet(entry: dict) -> bool:
@@ -206,18 +210,34 @@ class DexertoMerger:
             conn.commit()
         return True  # consumed — do NOT call process_entry for this entry yet
 
+    @staticmethod
+    def _status_id_of(entry_id):
+        """Extract the integer Twitter status_id from a 'twitter_<id>' entry_id, or None."""
+        try:
+            return int(entry_id.rsplit('_', 1)[1])
+        except (ValueError, IndexError, AttributeError):
+            return None
+
     async def _handle_follow_up_tweet(self, entry: dict) -> bool:
-        """Match tweet 2 (blurb + URL) to the most recent buffered headline."""
+        """Merge tweet 2 (blurb + URL) into the headline it replies to.
+
+        Picks the pending headline with the greatest status_id still below the
+        follow-up's — Dexerto tweets the headline first, then the article reply
+        seconds later (tweet2.id > tweet1.id). Deterministic when several headlines
+        are pending; the old "newest buffered_at" pick could merge a follow-up into
+        the wrong story. Falls back to newest-buffered if snowflakes are missing.
+        """
         follow_up_entry_id = entry['id']
         follow_up_content = re.sub(r'\n{2,}', '\n', entry.get('content', '').strip())
+        follow_up_sid = self._status_id_of(follow_up_entry_id)
 
         conn = get_db_connection()
         with get_db_lock():
-            row = conn.execute(
-                "SELECT entry_id, entry_json FROM dexerto_pending ORDER BY buffered_at DESC LIMIT 1"
-            ).fetchone()
+            rows = conn.execute(
+                "SELECT entry_id, entry_json, buffered_at FROM dexerto_pending"
+            ).fetchall()
 
-        if not row:
+        if not rows:
             # No pending headline. This means tweet 1 was already processed on a
             # previous cycle. Discard tweet 2 — it has no standalone value.
             logger.info(
@@ -227,7 +247,18 @@ class DexertoMerger:
             self._db.mark_processed(follow_up_entry_id)
             return True  # consumed
 
-        headline_entry_id, entry_json = row
+        match = None
+        if follow_up_sid is not None:
+            below = [
+                r for r in rows
+                if (sid := self._status_id_of(r['entry_id'])) is not None and sid < follow_up_sid
+            ]
+            if below:
+                match = max(below, key=lambda r: self._status_id_of(r['entry_id']))
+        if match is None:
+            match = max(rows, key=lambda r: r['buffered_at'])
+
+        headline_entry_id, entry_json = match['entry_id'], match['entry_json']
 
         # Remove matched headline from pending table
         with get_db_lock():
