@@ -421,6 +421,12 @@ class DiscordPoster:
                 except Exception as fallback_error:
                     logger.error(f"Fallback post without files also failed: {fallback_error}")
                     return False, None, None
+            elif e.status >= 500:
+                # 5xx that survived discord.py's own internal retries ({500,502,504,524}),
+                # or a 503 (which it doesn't retry at all). Re-raise so @retry_with_backoff
+                # takes another attempt — the entry_id nonce dedupes a late-success retry.
+                logger.error(f"Discord server error {e.status}: {e} — retrying")
+                raise
             else:
                 logger.error(f"Discord HTTP error: {e}")
                 return False, None, None
@@ -840,6 +846,11 @@ class DiscordPoster:
             if e.status == 429:  # Rate limit
                 logger.error(f"Discord rate limit hit: {e}")
                 raise  # Let retry decorator handle it
+            elif e.status >= 500:
+                # Retry 5xx (incl. 503, which discord.py doesn't retry internally);
+                # editing to identical content is idempotent, so a retry is safe.
+                logger.error(f"Discord server error {e.status}: {e} — retrying")
+                raise
             else:
                 logger.error(f"Discord HTTP error: {e}")
                 return False
