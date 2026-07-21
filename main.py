@@ -1007,12 +1007,8 @@ class NewsAggregatorBot:
         while True:
             try:
                 entry = await self.telegram_poller.get_queued_message()
-                if entry:
-                    logger.info(f"Processing real-time Telegram message: {entry['id']}")
-                    await self.process_entry(entry)
-                else:
-                    # No message available, brief sleep
-                    await asyncio.sleep(0.1)
+                logger.info(f"Processing real-time Telegram message: {entry['id']}")
+                await self.process_entry(entry)
             except Exception as e:
                 logger.error(f"Error processing Telegram queue: {e}", exc_info=True)
                 await asyncio.sleep(1)
@@ -1022,12 +1018,8 @@ class NewsAggregatorBot:
         while True:
             try:
                 edited_entry = await self.telegram_poller.get_queued_edit()
-                if edited_entry:
-                    logger.info(f"Processing edited Telegram message: {edited_entry['id']}")
-                    await self.process_telegram_edit(edited_entry)
-                else:
-                    # No edit available, brief sleep
-                    await asyncio.sleep(0.1)
+                logger.info(f"Processing edited Telegram message: {edited_entry['id']}")
+                await self.process_telegram_edit(edited_entry)
             except Exception as e:
                 logger.error(f"Error processing Telegram edit queue: {e}", exc_info=True)
                 await asyncio.sleep(1)

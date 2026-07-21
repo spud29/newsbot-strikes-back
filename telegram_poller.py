@@ -157,27 +157,21 @@ class TelegramPoller:
     
     async def get_queued_message(self):
         """
-        Get next message from the queue (non-blocking)
-        
+        Get the next real-time message, waiting until one is available.
+
         Returns:
-            dict: Message entry or None if queue is empty
+            dict: Message entry
         """
-        try:
-            return await asyncio.wait_for(self.message_queue.get(), timeout=0.1)
-        except asyncio.TimeoutError:
-            return None
-    
+        return await self.message_queue.get()
+
     async def get_queued_edit(self):
         """
-        Get next edited message from the edit queue (non-blocking)
-        
+        Get the next edited message, waiting until one is available.
+
         Returns:
-            dict: Edited message entry or None if queue is empty
+            dict: Edited message entry
         """
-        try:
-            return await asyncio.wait_for(self.edit_queue.get(), timeout=0.1)
-        except asyncio.TimeoutError:
-            return None
+        return await self.edit_queue.get()
     
     async def handle_missed_new_message(self, parsed_entry):
         """
