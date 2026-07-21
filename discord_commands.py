@@ -66,7 +66,7 @@ def _build_entry_info_embed(entry_id, entry_data):
     embed.add_field(name="Flags", value=", ".join(flags) if flags else "None", inline=True)
 
     if timestamp:
-        dt = datetime.datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M UTC")
+        dt = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         embed.add_field(name="Processed At", value=dt, inline=True)
 
     return embed

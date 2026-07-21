@@ -501,7 +501,7 @@ class DiscordPoster:
                         import datetime
                         old_category = old_info.get('category') if old_info else 'unknown'
                         user_display = f"@{user.name}" if user else "unknown user"
-                        date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                        date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                         new_placement_reason = (
                             f"User re-categorization: moved from '{old_category}' to '{new_category}' "
                             f"by {user_display} on {date_str}"
@@ -649,7 +649,7 @@ class DiscordPoster:
                     old_info = self.database.get_discord_message_info(entry_id)
                     old_category = old_info.get('category') if old_info else 'unknown'
                     user_display = f"@{user.name}" if user else "unknown user"
-                    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                     new_placement_reason = (
                         f"User re-categorization: moved from '{old_category}' to '{new_category}' "
                         f"by {user_display} on {date_str}"
@@ -749,7 +749,7 @@ class DiscordPoster:
                 try:
                     import datetime
                     user_display = f"@{user.name}" if user else "unknown user"
-                    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                     new_placement_reason = (
                         f"User label update: changed category from '{old_category}' to '{new_category}' "
                         f"by {user_display} on {date_str}"
@@ -909,7 +909,7 @@ class DiscordPoster:
             import datetime
             ts = old_mapping.get('timestamp')
             posted_at = (
-                datetime.datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+                datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 if ts else 'unknown'
             )
             old_content = old_mapping.get('content', '') or ''
