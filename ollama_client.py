@@ -1214,14 +1214,17 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                         return True
                 return False
             
-            # Check if our required models are available
-            if not model_exists(self.categorization_model, model_names):
-                logger.warning(f"Categorization model '{self.categorization_model}' not found in Ollama")
-            
-            if not model_exists(self.embedding_model, model_names):
-                logger.warning(f"Embedding model '{self.embedding_model}' not found in Ollama")
-            
-            return True
+            # Both required models must be present. Returning True with a missing
+            # model just defers the failure to the first categorize/embed call at
+            # runtime — fail the health check so startup aborts loudly instead.
+            categorization_ok = model_exists(self.categorization_model, model_names)
+            embedding_ok = model_exists(self.embedding_model, model_names)
+            if not categorization_ok:
+                logger.error(f"Required categorization model '{self.categorization_model}' not found in Ollama")
+            if not embedding_ok:
+                logger.error(f"Required embedding model '{self.embedding_model}' not found in Ollama")
+
+            return categorization_ok and embedding_ok
             
         except Exception as e:
             logger.error(f"Ollama health check failed: {e}")
