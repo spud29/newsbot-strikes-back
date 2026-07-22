@@ -1061,6 +1061,8 @@ SINGLE-COMPANY RULE — a big dollar figure is NOT impact. Ask: whose life chang
 - Hacks, exploits, or losses hitting ONE wallet, whale, or firm are insider noise: at most 4-5 overall. Systemic events (major exchange halts withdrawals, protocol-wide exploit affecting thousands) are the exception.
 - Reserve impact 6+ for industry-wide rules, government policy, or events that change what MANY ordinary people can do or pay.
 
+HUMAN-INTEREST & SPECTACLE RULE — surprise and talkability alone do NOT earn a 6+. Viral stunts, feel-good oddities, ceremonial spectacle, quirky "can you believe this" curiosities, and influencer/creator drama score impact 1-3 and cap at 5 overall — UNLESS the story carries broader stakes (changes what many people pay or can do, shifts power, involves serious money, or is a genuinely historic first). A story can be weird, fun, and shareable and still not belong in this feed.
+
 Score 3-5 for real but ordinary news: routine official commentary ("inflation still too high"), minor product updates, industry housekeeping, scheduled events going as planned.
 
 Score 6-8 for stories with a genuine hook: consumer price hikes, unusual scientific finds, provocative quotes from major figures, surprising study results, policy shifts with broad reach, David-vs-Goliath conflicts.
@@ -1077,6 +1079,8 @@ EXAMPLES:
 - "Fed official: core inflation still too high, trending wrong way" -> surprising 2, impact 4, talkability 2 (routine commentary, no event)
 - "Top 100 24h Gainers: M +73%, UNI +15%..." -> surprising 1, impact 1, talkability 1 (scheduled data dump)
 - "Whale Alert: 50,000 ETH moved to Binance" -> surprising 1, impact 1, talkability 1 (wallet tracking noise)
+- "VTuber throws a 65 mph ceremonial first pitch at a baseball game" -> surprising 5, impact 2, talkability 6 (fun spectacle, no broader stakes)
+- "Seniors in Singapore take up parkour to stay agile" -> surprising 5, impact 2, talkability 4 (human-interest curiosity, not reaction-worthy news)
 {feedback_block}
 Category: {category}
 Content: {content[:1000]}

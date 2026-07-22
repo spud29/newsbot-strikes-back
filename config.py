@@ -103,7 +103,7 @@ FALLBACK_CATEGORY = "general news"
 # This is the master kill switch: it overrides AUTO_POST_CATEGORIES.
 # Disabled 2026-07-10: automation enabled with the calibrated reaction gate
 # (see evals/calibrate_reaction_gate.py and PLAN.md status log).
-PAUSE_MODE = False
+PAUSE_MODE = True
 
 # Categories allowed to auto-post when PAUSE_MODE is False (PLAN.md Phase 2/3).
 # None  = every category auto-posts (full automation).
@@ -527,10 +527,17 @@ NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the reaction-worthiness g
 NEWSWORTHINESS_THRESHOLD = 6.0
 # Per-category threshold overrides (categories not listed use NEWSWORTHINESS_THRESHOLD)
 NEWSWORTHINESS_THRESHOLD_BY_CATEGORY = {}
+# 2026-07-21 rebalance: impact promoted from 0.30 to the dominant weight (0.45),
+# surprising cut 0.40->0.30, talkability 0.30->0.25. Diagnosis showed the gate was
+# passing viral human-interest oddities (parkour seniors, VTuber stunts, quirky
+# curiosities) at 6-8 because they max out surprising+talkability while having no
+# real stakes. Weighting impact highest makes "no broader stakes" pull the score
+# down even when a story is surprising and shareable. Pairs with the HUMAN-INTEREST
+# & SPECTACLE RULE in rate_newsworthiness (ollama_client.py). Must sum to 1.0.
 NEWSWORTHINESS_WEIGHTS = {
-    'surprising': 0.40,   # would a reader stop scrolling?
-    'impact': 0.30,       # real stakes — money, power, what things cost
-    'talkability': 0.30   # would someone share it, argue about it, react to it?
+    'surprising': 0.30,   # would a reader stop scrolling?
+    'impact': 0.45,       # real stakes — money, power, what things cost
+    'talkability': 0.25   # would someone share it, argue about it, react to it?
 }
 
 # Entry Superseding Configuration
