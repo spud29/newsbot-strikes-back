@@ -36,9 +36,15 @@ class TelegramPoller:
     async def start(self):
         """Start the Telegram client"""
         if not self.client:
-            # Store session in temp directory to avoid OneDrive sync issues
+            # Store the session in a stable, user-independent dir outside OneDrive.
+            # LOCALAPPDATA is not OneDrive-synced and, unlike %TEMP%, is not subject
+            # to Disk Cleanup / Storage Sense. Previously this used tempfile.gettempdir(),
+            # whose result changes with the running account (LocalSystem -> C:\Windows\TEMP
+            # vs. a user -> %LOCALAPPDATA%\Temp), which orphaned the authorized session
+            # when the bot moved from an NSSM service to a user-level scheduled task.
             import tempfile
-            session_dir = os.path.join(tempfile.gettempdir(), 'newsbot')
+            session_base = os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()
+            session_dir = os.path.join(session_base, 'newsbot')
             os.makedirs(session_dir, exist_ok=True)
             session_path = os.path.join(session_dir, 'newsbot_session')
             
