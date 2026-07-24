@@ -56,11 +56,14 @@ class MediaHandler:
             download_dir = os.path.join(self.temp_dir, f"twitter_{entry['status_id']}")
             os.makedirs(download_dir, exist_ok=True)
             
-            # First, extract the full tweet text using gallery-dl --dump-json
-            # Using --dump-json instead of --print ensures we get content even for
-            # text-only tweets (--print only outputs when media items are found)
-            logger.debug(f"Extracting tweet text using gallery-dl from: {link}")
-            text_cmd = [
+            # Extract all tweet metadata in a single gallery-dl call.
+            # --dump-json returns the full metadata for the tweet, so the tweet
+            # text, the video URL, and the video duration all come from this one
+            # authenticated fetch instead of re-fetching the same tweet 2-3 times.
+            # Using --dump-json (not --print/-g) also ensures we get content for
+            # text-only tweets, which emit only a directory message with no media.
+            logger.debug(f"Extracting tweet metadata using gallery-dl from: {link}")
+            meta_cmd = [
                 sys.executable, '-m', 'gallery_dl',
                 '--config', config.GALLERY_DL_CONFIG,
                 '--dump-json',
@@ -69,8 +72,8 @@ class MediaHandler:
                 link
             ]
 
-            text_result = subprocess.run(
-                text_cmd,
+            meta_result = subprocess.run(
+                meta_cmd,
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -78,37 +81,52 @@ class MediaHandler:
                 timeout=30
             )
 
-            # Extract text from gallery-dl JSON output
+            # Parse content, video URL, and duration from the single JSON dump.
+            # --dump-json emits a list of messages: [2, metadata] for the tweet
+            # directory (carries 'content') and [3, url, metadata] for each media
+            # item (video items have a video.twimg.com URL and a 'duration').
             full_text = ''
-            if text_result.returncode == 0 and text_result.stdout.strip():
+            video_urls = []
+            video_duration = None
+            if meta_result.returncode == 0 and meta_result.stdout.strip():
                 try:
-                    json_data = json.loads(text_result.stdout.strip())
-                    # --dump-json returns a list of [directory_info, file_info, ...]
-                    # The metadata dict contains the 'content' field
+                    json_data = json.loads(meta_result.stdout.strip())
                     for item in json_data:
-                        if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
-                            raw_output = item[1].get('content', '')
+                        if not isinstance(item, list) or len(item) < 2:
+                            continue
+                        # Metadata dict is the last element for both message types
+                        meta = item[-1]
+                        if not isinstance(meta, dict):
+                            continue
+                        # Content: take the first message that carries it (the directory msg)
+                        if not full_text:
+                            raw_output = meta.get('content', '')
                             if raw_output:
                                 full_text = raw_output.strip()
-                                logger.debug(f"Raw gallery-dl output ({len(full_text)} chars): {full_text[:500]}")
-                                logger.info(f"✓ Successfully extracted full text from x.com using gallery-dl ({len(full_text)} chars)")
-                                break
-                    if not full_text:
-                        logger.warning(f"gallery-dl JSON had no content for: {link}")
-                except json.JSONDecodeError:
-                    # Fallback: try treating output as plain text (legacy --print behavior)
-                    raw_output = text_result.stdout.strip()
-                    logger.debug(f"gallery-dl output not JSON, using as plain text ({len(raw_output)} chars): {raw_output[:500]}")
-                    full_text = raw_output
+                        # Media URL messages are [3, url, metadata]; keep videos only
+                        # (images are pulled to disk by the download call below)
+                        if item[0] == 3 and len(item) >= 3 and isinstance(item[1], str):
+                            media_url = item[1]
+                            if 'video.twimg.com' in media_url:
+                                video_urls.append(media_url)
+                                logger.debug(f"Found video URL: {media_url}")
+                                if video_duration is None and meta.get('duration') is not None:
+                                    try:
+                                        video_duration = float(meta['duration'])
+                                        logger.info(f"Video duration: {video_duration:.1f} seconds")
+                                    except (ValueError, TypeError):
+                                        logger.debug(f"Could not parse video duration: {meta.get('duration')}")
                     if full_text:
                         logger.info(f"✓ Successfully extracted full text from x.com using gallery-dl ({len(full_text)} chars)")
                     else:
-                        logger.warning(f"gallery-dl returned empty content for: {link}")
+                        logger.warning(f"gallery-dl JSON had no content for: {link}")
+                except json.JSONDecodeError:
+                    logger.warning(f"gallery-dl output was not valid JSON for: {link}")
             else:
-                logger.warning(f"gallery-dl failed to extract text (return code: {text_result.returncode})")
-                if text_result.stderr:
-                    logger.debug(f"gallery-dl stderr: {text_result.stderr[:200]}")
-            
+                logger.warning(f"gallery-dl failed to extract metadata (return code: {meta_result.returncode})")
+                if meta_result.stderr:
+                    logger.debug(f"gallery-dl stderr: {meta_result.stderr[:200]}")
+
             # If gallery-dl didn't get text, fall back to RSS content
             if not full_text:
                 logger.info(f"gallery-dl returned no content, falling back to RSS feed content")
@@ -124,62 +142,6 @@ class MediaHandler:
                     # Only raise exception if both gallery-dl AND RSS have no content
                     logger.warning(f"No content available from gallery-dl or RSS for: {link}")
                     raise GalleryDlFailure(f"No content available from any source for {link}")
-            
-            # Extract video URLs using gallery-dl -g
-            video_urls = []
-            video_url_cmd = [
-                sys.executable, '-m', 'gallery_dl',
-                '--config', config.GALLERY_DL_CONFIG,
-                '--range', '1',
-                '-g',
-                link
-            ]
-            
-            video_url_result = subprocess.run(
-                video_url_cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=30
-            )
-            
-            # Parse video URLs from output (one URL per line)
-            if video_url_result.returncode == 0:
-                for line in video_url_result.stdout.strip().split('\n'):
-                    url = line.strip()
-                    # Check if it's a video URL
-                    if url and 'video.twimg.com' in url:
-                        video_urls.append(url)
-                        logger.debug(f"Found video URL: {url}")
-            
-            # Extract video duration if there are videos
-            video_duration = None
-            if video_urls:
-                duration_cmd = [
-                    sys.executable, '-m', 'gallery_dl',
-                    '--config', config.GALLERY_DL_CONFIG,
-                    '--print', '{duration}',
-                    '--range', '1',
-                    '--no-download',
-                    link
-                ]
-                
-                duration_result = subprocess.run(
-                    duration_cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    timeout=30
-                )
-                
-                if duration_result.returncode == 0 and duration_result.stdout.strip():
-                    try:
-                        video_duration = float(duration_result.stdout.strip().split('\n')[0])
-                        logger.info(f"Video duration: {video_duration:.1f} seconds")
-                    except (ValueError, IndexError):
-                        logger.debug(f"Could not parse video duration: {duration_result.stdout.strip()}")
             
             # Now download media files (images only, skip videos)
             # Videos are handled via video_urls to avoid Discord file size limits
