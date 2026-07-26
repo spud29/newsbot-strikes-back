@@ -196,7 +196,7 @@ OLLAMA_CATEGORIZATION_NUM_CTX = 16384
 # Env var wins so an eval/A-B run can select a backend for one process without
 # editing this file underneath the running bot (a restart mid-run would otherwise
 # pick up the temporary value):  LLM_BACKEND=openrouter python evals/run_eval.py
-LLM_BACKEND = os.getenv('LLM_BACKEND', 'ollama')
+LLM_BACKEND = os.getenv('LLM_BACKEND', 'openrouter')
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Pin an explicit model id — a retired model surfaces as a 404 that health_check()
@@ -574,12 +574,21 @@ CAPS_FIX_ENABLED = True
 CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
 
 NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the reaction-worthiness gate
-# Default cutoff. Calibrated 2026-07-10 against 30 days of user move/leave decisions
-# (evals/runs/reaction_calibration_20260710T203505Z.json): at 6.0 the gate passes
-# 71% of user-approved entries and blocks 47% of user-left ones — the best
-# precision knee for a "reaction-worthy" channel. The weekly accuracy report's
-# REACTION GATE section re-derives the best threshold as cleaner data accumulates.
-NEWSWORTHINESS_THRESHOLD = 6.0
+# Default cutoff. THIS VALUE IS BACKEND-DEPENDENT — it must be re-derived whenever
+# LLM_BACKEND changes, because the two raters do not share a scale.
+#
+# 2026-07-26, gemini-2.5-flash-lite (evals/runs/reaction_calibration_20260726*.json,
+# n=60/class): the hosted rater scores 0.3-0.7 lower than qwen3.5 across every pool
+# while separating the classes *better* (gate separation 0.85 vs qwen3.5's 0.54). So
+# the old 6.0 was not too loose or too tight — it was calibrated to a different scale.
+# At 6.0 this rater passes only 48.3% of user-approved entries; at 5.25 it passes
+# 63.3%, matching what qwen3.5 delivered at 6.0, at comparable precision (57.6% vs
+# 59.4%). Estimated at n=60/class, so treat it as approximate and re-run
+# evals/calibrate_reaction_gate.py --per-class 150 to tighten.
+#
+# Previous value for the ollama backend was 6.0 (calibrated 2026-07-10, see
+# evals/runs/reaction_calibration_20260710T203505Z.json) — restore it if rolling back.
+NEWSWORTHINESS_THRESHOLD = 5.25
 # Per-category threshold overrides (categories not listed use NEWSWORTHINESS_THRESHOLD)
 NEWSWORTHINESS_THRESHOLD_BY_CATEGORY = {}
 # 2026-07-21 rebalance: impact promoted from 0.30 to the dominant weight (0.45),
