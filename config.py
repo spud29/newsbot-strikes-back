@@ -193,7 +193,10 @@ OLLAMA_CATEGORIZATION_NUM_CTX = 16384
 # After cutting over, set OLLAMA_MAX_LOADED_MODELS=1 on the host (env var, needs an
 # Ollama restart) so only the embedder stays resident. qwen3.5:9b unloads on its own
 # 30 minutes after the last categorize call.
-LLM_BACKEND = "ollama"
+# Env var wins so an eval/A-B run can select a backend for one process without
+# editing this file underneath the running bot (a restart mid-run would otherwise
+# pick up the temporary value):  LLM_BACKEND=openrouter python evals/run_eval.py
+LLM_BACKEND = os.getenv('LLM_BACKEND', 'ollama')
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Pin an explicit model id — a retired model surfaces as a 404 that health_check()
@@ -212,15 +215,17 @@ OPENROUTER_TIMEOUT = 120
 OPENROUTER_APP_NAME = "newsbot"
 OPENROUTER_APP_URL = "https://github.com/spud29/newsbot"
 
-# COST NOTE — the per-call payload is the *enhanced* system prompt, not the ~4.3k-token
-# SYSTEM_PROMPT below. The feedback layers append up to 76 examples
+# COST NOTE — the per-call payload is the *enhanced* system prompt (~5.7k tokens), not
+# the ~4.3k-token SYSTEM_PROMPT below: the feedback layers add ~1.4k more
 # (FEEDBACK_EXAMPLES_COUNT + IGNORE_EXAMPLES_COUNT + CORRECTION_EXAMPLES_COUNT +
 # IGNORE_PROMOTION_EXAMPLES_COUNT + IGNORE_RESCUE_EXAMPLES_COUNT, all further down this
-# file), pushing each categorize() call to ~8.5k input tokens. At ~180 entries/day that
-# is the single largest line on the bill — trim those counts first if cost needs to come
-# down. That prefix is byte-stable for an hour (see _cache_ttl in ollama_client.py), so
-# cached reads at $0.01/M should absorb much of it; measure on the dashboard rather than
-# assuming. Budget ~$6/mo uncached.
+# file). That prefix is byte-stable for an hour (see _cache_ttl in ollama_client.py), so
+# cached reads at $0.01/M absorb most of it.
+#
+# MEASURED 2026-07-26 on 150 real production entries (evals/compare_backends.py):
+# $0.00064 per entry including both categorize() and rate_newsworthiness(), i.e.
+# ~$3.45/month at 180 entries/day. Trim the *_EXAMPLES_COUNT settings first if that
+# ever needs to come down.
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
