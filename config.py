@@ -12,6 +12,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
 TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Required only when LLM_BACKEND = "openrouter"
 TELEGRAM_2FA_PASSWORD = os.getenv('TELEGRAM_2FA_PASSWORD')  # Optional: Telegram 2FA password
 
 # Perplexity AI Configuration
@@ -171,6 +172,55 @@ OLLAMA_EMBEDDING_NUM_CTX = 512
 # raise without first re-verifying VRAM headroom (`ollama ps` cross-checked against
 # `nvidia-smi` — Ollama's self-reported free VRAM has been wrong on this machine before).
 OLLAMA_CATEGORIZATION_NUM_CTX = 16384
+
+# ---------------------------------------------------------------------------
+# Categorization backend
+# ---------------------------------------------------------------------------
+# Which backend serves the *categorization* model — categorize(), format_text(),
+# verify_similarity(), compare_entries() and rate_newsworthiness(). Embeddings are
+# NOT affected: generate_embedding() always talks to local Ollama, so dedup vectors
+# stay identical and the database never needs a reset.
+#
+#   "ollama"     — local qwen3.5:9b (the original setup)
+#   "openrouter" — hosted API, frees ~7-9 GB of VRAM on this machine
+#
+# Switching back to "ollama" is a one-line rollback + restart. qwen3.5:9b stays
+# installed for exactly that reason; it just isn't kept loaded. Note the fallback is
+# manual — nothing auto-reverts if OpenRouter has an outage. On a hosted outage
+# categorize() returns its "Error during categorization" fallback, which main.py
+# already treats as "skip this entry, retry next cycle".
+#
+# After cutting over, set OLLAMA_MAX_LOADED_MODELS=1 on the host (env var, needs an
+# Ollama restart) so only the embedder stays resident. qwen3.5:9b unloads on its own
+# 30 minutes after the last categorize call.
+LLM_BACKEND = "ollama"
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Pin an explicit model id — a retired model surfaces as a 404 that health_check()
+# catches at startup rather than mid-poll.
+#
+# Verified live on OpenRouter 2026-07-26: $0.10/M input, $0.40/M output, 1M context,
+# supports response_format. Note gemini-2.0-flash was RETIRED from OpenRouter — this is
+# its same-price successor. Cheaper alternatives if quality holds: google/gemma-3-12b-it
+# ($0.05/$0.15). More capable if it doesn't: google/gemini-2.5-flash ($0.30/$2.50).
+OPENROUTER_CATEGORIZATION_MODEL = "google/gemini-2.5-flash-lite"
+# Per-attempt request timeout (seconds). Retries/backoff are handled by
+# _request_generate; the OpenAI SDK's own retries are disabled so attempt counting
+# lives in exactly one place.
+OPENROUTER_TIMEOUT = 120
+# Optional attribution headers shown on openrouter.ai/rankings. Harmless to leave.
+OPENROUTER_APP_NAME = "newsbot"
+OPENROUTER_APP_URL = "https://github.com/spud29/newsbot"
+
+# COST NOTE — the per-call payload is the *enhanced* system prompt, not the ~4.3k-token
+# SYSTEM_PROMPT below. The feedback layers append up to 76 examples
+# (FEEDBACK_EXAMPLES_COUNT + IGNORE_EXAMPLES_COUNT + CORRECTION_EXAMPLES_COUNT +
+# IGNORE_PROMOTION_EXAMPLES_COUNT + IGNORE_RESCUE_EXAMPLES_COUNT, all further down this
+# file), pushing each categorize() call to ~8.5k input tokens. At ~180 entries/day that
+# is the single largest line on the bill — trim those counts first if cost needs to come
+# down. That prefix is byte-stable for an hour (see _cache_ttl in ollama_client.py), so
+# cached reads at $0.01/M should absorb much of it; measure on the dashboard rather than
+# assuming. Budget ~$6/mo uncached.
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.

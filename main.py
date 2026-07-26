@@ -99,9 +99,14 @@ class NewsAggregatorBot:
         except Exception as e:
             logger.error(f"Failed to write PID file: {e}")
         
-        # Health check Ollama
+        # Health check the LLM backends (local Ollama for embeddings, plus
+        # OpenRouter for categorization when LLM_BACKEND says so)
         if not self.ollama.health_check():
-            logger.error("Ollama health check failed! Please ensure Ollama is running.")
+            logger.error(
+                f"LLM health check failed (LLM_BACKEND={getattr(config, 'LLM_BACKEND', 'ollama')})! "
+                f"Check that Ollama is running and, on the openrouter backend, that "
+                f"OPENROUTER_API_KEY is valid and in credit."
+            )
             return
         
         # Start Discord client

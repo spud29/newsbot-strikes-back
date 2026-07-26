@@ -1,10 +1,16 @@
 """
-Ollama API client for categorization and embeddings
+Client for categorization and embeddings.
+
+Despite the module/class name, the *categorization* model can be served either by
+local Ollama or by OpenRouter — see config.LLM_BACKEND. Embeddings are always local
+Ollama regardless of backend, so dedup vectors never change. The name is kept because
+main.py, discord_messaging.py and evals/ all reference OllamaClient.
 """
 import requests
 import time
 import json
 import re
+from openai import OpenAI
 from utils import logger, retry_with_backoff, fix_sentence_capitalization, capitalize_known_news_sources
 import config
 
@@ -94,6 +100,36 @@ class OllamaClient:
         self.removed_entries_db = removed_entries_db
         self.database = database
 
+        # Categorization backend. Embeddings ignore this and always use local Ollama.
+        self.backend = getattr(config, 'LLM_BACKEND', 'ollama').lower()
+        self.openrouter_client = None
+        self.openrouter_model = None
+        if self.backend == 'openrouter':
+            self.openrouter_model = config.OPENROUTER_CATEGORIZATION_MODEL
+            api_key = config.OPENROUTER_API_KEY
+            if not api_key:
+                # Don't raise here — health_check() is the single startup gate and
+                # main.py already aborts on it, so failing there keeps the error in
+                # one place with a readable message.
+                logger.error(
+                    "LLM_BACKEND='openrouter' but OPENROUTER_API_KEY is not set in .env — "
+                    "categorization will fail the health check"
+                )
+            else:
+                # One client for the process, not one per request. max_retries=0
+                # because _request_generate owns retry/backoff; leaving the SDK's
+                # default of 2 would silently multiply every attempt count (a
+                # categorize call would become up to 15 HTTP requests).
+                self.openrouter_client = OpenAI(
+                    api_key=api_key,
+                    base_url=config.OPENROUTER_BASE_URL,
+                    max_retries=0,
+                    default_headers={
+                        "HTTP-Referer": getattr(config, 'OPENROUTER_APP_URL', ''),
+                        "X-Title": getattr(config, 'OPENROUTER_APP_NAME', 'newsbot'),
+                    },
+                )
+
         # Cache for enhanced system prompt (refreshed every hour)
         self._enhanced_prompt_cache = None
         self._cache_timestamp = 0
@@ -103,7 +139,13 @@ class OllamaClient:
         self._gate_feedback_cache = None
         self._gate_feedback_timestamp = 0
 
-        logger.info(f"Ollama client initialized: {self.base_url}")
+        if self.backend == 'openrouter':
+            logger.info(
+                f"LLM client initialized — categorization: OpenRouter "
+                f"({self.openrouter_model}), embeddings: Ollama ({self.base_url})"
+            )
+        else:
+            logger.info(f"Ollama client initialized: {self.base_url}")
     
     def generate_enhanced_system_prompt(self):
         """
@@ -316,11 +358,91 @@ class OllamaClient:
 
         return enhanced_prompt
     
-    def _request_generate(self, payload, timeout=300, max_retries=2, initial_delay=1,
-                          op="generate", require_response=False):
+    # HTTP statuses where retrying cannot help: bad request, bad key, no
+    # permission, out of credit, unknown/retired model. Fail fast instead of
+    # burning the full backoff ladder (up to ~45s of blocked thread) on them.
+    _NON_RETRYABLE_STATUS = (400, 401, 403, 402, 404)
+
+    def _generate_ollama(self, payload, timeout):
+        """One local Ollama /api/generate call. Raises on any failure."""
+        response = requests.post(
+            f"{self.base_url}/api/generate", json=payload, timeout=timeout
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _generate_openrouter(self, payload, timeout, json_mode, op):
         """
-        POST /api/generate with real retry + exponential backoff; returns the
-        parsed JSON body.
+        One OpenRouter chat-completion call, translated from the Ollama
+        /api/generate payload and translated back into an Ollama-shaped dict so
+        every caller's parsing (_extract_json, done_reason checks) works unchanged.
+
+        Ollama-only fields are dropped deliberately: 'think' (no equivalent —
+        Gemini does not expose a thinking toggle), 'num_ctx' (irrelevant against a
+        1M-token context) and 'keep_alive' (no local model to keep resident).
+        """
+        if self.openrouter_client is None:
+            raise RuntimeError(
+                "OpenRouter backend selected but no client — OPENROUTER_API_KEY missing"
+            )
+
+        # Only categorize() supplies a separate 'system' field; the other four call
+        # sites put everything in 'prompt'. Build the system message conditionally.
+        messages = []
+        system_prompt = payload.get('system')
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": payload.get('prompt', '')})
+
+        options = payload.get('options', {})
+        kwargs = {
+            "model": self.openrouter_model,
+            "messages": messages,
+            "stream": False,
+            # Hosted calls should not hold a worker thread for the 300s that local
+            # generation was sized for.
+            "timeout": min(timeout, getattr(config, 'OPENROUTER_TIMEOUT', 120)),
+        }
+        if 'temperature' in options:
+            kwargs["temperature"] = options["temperature"]
+        if 'num_predict' in options:
+            kwargs["max_tokens"] = options["num_predict"]
+        # Only the three JSON-producing callers opt in. format_text() returns prose
+        # and verify_similarity() returns bare yes/no — forcing JSON on those would
+        # make format_text fail its length-ratio check and verify_similarity always
+        # answer "no", silently disabling LLM dedup.
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        completion = self.openrouter_client.chat.completions.create(**kwargs)
+
+        choice = completion.choices[0] if completion.choices else None
+        text = (choice.message.content or '') if choice else ''
+        # OpenAI-style finish_reason uses the same 'stop'/'length' vocabulary as
+        # Ollama's done_reason, so format_text()'s truncation retry keeps working.
+        finish_reason = (choice.finish_reason if choice else None) or 'stop'
+
+        usage = getattr(completion, 'usage', None)
+        if usage:
+            logger.debug(
+                f"OpenRouter {op}: {usage.prompt_tokens} in / "
+                f"{usage.completion_tokens} out tokens"
+            )
+
+        return {
+            'response': text,
+            'done_reason': finish_reason,
+            'finish_reason': finish_reason,
+        }
+
+    def _request_generate(self, payload, timeout=300, max_retries=2, initial_delay=1,
+                          op="generate", require_response=False, json_mode=False):
+        """
+        Run one categorization-model generation with real retry + exponential
+        backoff; returns an Ollama-shaped dict ({'response': ..., 'done_reason': ...}).
+
+        Routes to local Ollama or OpenRouter based on config.LLM_BACKEND. Callers
+        build one Ollama-style payload and stay backend-agnostic.
 
         The public methods used to declare @retry_with_backoff while their
         bodies caught every exception and returned a fallback — the decorator
@@ -331,40 +453,55 @@ class OllamaClient:
         handling.
 
         Args:
-            payload: JSON body for /api/generate
-            timeout: per-attempt requests timeout (seconds)
+            payload: Ollama-style /api/generate body. On the OpenRouter path
+                'system'/'prompt'/'options' are translated and the Ollama-only
+                fields ('think', 'num_ctx', 'keep_alive') are dropped.
+            timeout: per-attempt timeout (seconds); the OpenRouter path caps this
+                at config.OPENROUTER_TIMEOUT
             max_retries: retries after the first attempt
             initial_delay: backoff start (doubles per retry)
             op: label for log lines
             require_response: treat an empty 'response' field as a retryable
                 failure (the empty-response + done_reason=length signature) —
                 leave False for callers that inspect done_reason themselves
+            json_mode: ask the backend to constrain output to a JSON object. Only
+                safe for callers that actually want JSON — see _generate_openrouter.
+                Ignored on the Ollama path, where the tolerant _extract_json parser
+                has always been the mechanism.
         """
+        backend = self.backend
+        label = "OpenRouter" if backend == 'openrouter' else "Ollama"
         delay = initial_delay
         last_exc = None
         for attempt in range(max_retries + 1):
             try:
-                response = requests.post(
-                    f"{self.base_url}/api/generate", json=payload, timeout=timeout
-                )
-                response.raise_for_status()
-                result = response.json()
+                if backend == 'openrouter':
+                    result = self._generate_openrouter(payload, timeout, json_mode, op)
+                else:
+                    result = self._generate_ollama(payload, timeout)
+
                 if require_response and not result.get('response', '').strip():
                     raise ValueError(
-                        f"Ollama returned empty response "
+                        f"{label} returned empty response "
                         f"(done_reason={result.get('done_reason')})"
                     )
                 return result
             except Exception as e:
                 last_exc = e
+                status = getattr(e, 'status_code', None)
+                if status in self._NON_RETRYABLE_STATUS:
+                    logger.error(
+                        f"{label} {op}: non-retryable HTTP {status} — {e}"
+                    )
+                    raise
                 if attempt < max_retries:
                     logger.warning(
-                        f"Ollama {op} attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
+                        f"{label} {op} attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
                         f"Retrying in {delay}s..."
                     )
                     time.sleep(delay)
                     delay *= 2
-        logger.error(f"Ollama {op}: all {max_retries + 1} attempts failed: {last_exc}")
+        logger.error(f"{label} {op}: all {max_retries + 1} attempts failed: {last_exc}")
         raise last_exc
 
     def categorize(self, content, exclude_categories=None):
@@ -437,6 +574,7 @@ class OllamaClient:
                 initial_delay=3,
                 op="categorize",
                 require_response=True,
+                json_mode=True,
             )
 
             # Extract category and reasoning from response
@@ -879,6 +1017,7 @@ class OllamaClient:
                 initial_delay=2,
                 op="compare_entries",
                 require_response=True,
+                json_mode=True,
             )
             response_text = data.get('response', '').strip()
 
@@ -1107,6 +1246,7 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                 initial_delay=2,
                 op="rate_newsworthiness",
                 require_response=True,
+                json_mode=True,
             )
 
             # Parse the JSON response
@@ -1188,20 +1328,77 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                 'error': True
             }
     
-    def health_check(self):
+    def _openrouter_health_check(self):
         """
-        Check if Ollama is running and models are available
-        
+        Verify the OpenRouter key is present, valid, and has credit.
+
+        Uses GET /key rather than a throwaway completion: it is free, so restarting
+        the bot never costs anything, and it surfaces the remaining balance.
+
         Returns:
             bool: True if healthy
         """
+        if not config.OPENROUTER_API_KEY:
+            logger.error("OPENROUTER_API_KEY is not set in .env — cannot use the openrouter backend")
+            return False
+
+        try:
+            response = requests.get(
+                f"{config.OPENROUTER_BASE_URL}/key",
+                headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
+                timeout=10,
+            )
+            if response.status_code in (401, 403):
+                logger.error("OpenRouter rejected the API key (HTTP %s)", response.status_code)
+                return False
+            response.raise_for_status()
+
+            data = response.json().get('data', {}) or {}
+            usage = data.get('usage')
+            limit = data.get('limit')
+            if limit is not None and usage is not None and usage >= limit:
+                logger.error(
+                    f"OpenRouter key is out of credit (usage {usage} / limit {limit})"
+                )
+                return False
+
+            logger.info(
+                f"OpenRouter health check passed — model: {self.openrouter_model}, "
+                f"usage: {usage}, limit: {limit if limit is not None else 'unlimited'}"
+            )
+            if limit is None:
+                logger.warning(
+                    "OpenRouter key has no spend limit set — consider capping it on the "
+                    "dashboard so a retry storm can't run up the bill"
+                )
+            return True
+
+        except Exception as e:
+            logger.error(f"OpenRouter health check failed: {e}")
+            return False
+
+    def health_check(self):
+        """
+        Check that every backend this bot depends on is reachable and correctly
+        configured.
+
+        Embeddings are always local, so the Ollama embedding model is required
+        regardless of backend. The Ollama *categorization* model is only required
+        when LLM_BACKEND is "ollama".
+
+        Returns:
+            bool: True if healthy
+        """
+        if self.backend == 'openrouter' and not self._openrouter_health_check():
+            return False
+
         try:
             response = requests.get(f"{self.base_url}/api/tags", timeout=10)
             response.raise_for_status()
-            
+
             models = response.json().get('models', [])
             model_names = [m.get('name', '') for m in models]
-            
+
             logger.info(f"Ollama health check passed. Available models: {model_names}")
             
             # Helper function to check if model exists (handles :latest suffix)
@@ -1218,15 +1415,28 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
                         return True
                 return False
             
-            # Both required models must be present. Returning True with a missing
+            # Every required model must be present. Returning True with a missing
             # model just defers the failure to the first categorize/embed call at
             # runtime — fail the health check so startup aborts loudly instead.
-            categorization_ok = model_exists(self.categorization_model, model_names)
+            # The categorization model is only needed locally on the ollama backend;
+            # on openrouter it stays installed as a manual rollback target but is
+            # not required to be present (and deliberately isn't kept loaded).
             embedding_ok = model_exists(self.embedding_model, model_names)
-            if not categorization_ok:
-                logger.error(f"Required categorization model '{self.categorization_model}' not found in Ollama")
             if not embedding_ok:
                 logger.error(f"Required embedding model '{self.embedding_model}' not found in Ollama")
+
+            if self.backend == 'openrouter':
+                if not model_exists(self.categorization_model, model_names):
+                    logger.warning(
+                        f"Ollama categorization model '{self.categorization_model}' is not "
+                        f"installed — fine while LLM_BACKEND='openrouter', but the rollback "
+                        f"to local categorization is not available until it is pulled back"
+                    )
+                return embedding_ok
+
+            categorization_ok = model_exists(self.categorization_model, model_names)
+            if not categorization_ok:
+                logger.error(f"Required categorization model '{self.categorization_model}' not found in Ollama")
 
             return categorization_ok and embedding_ok
             
