@@ -222,10 +222,12 @@ OPENROUTER_APP_URL = "https://github.com/spud29/newsbot"
 # file). That prefix is byte-stable for an hour (see _cache_ttl in ollama_client.py), so
 # cached reads at $0.01/M absorb most of it.
 #
-# MEASURED 2026-07-26 on 150 real production entries (evals/compare_backends.py):
-# $0.00064 per entry including both categorize() and rate_newsworthiness(), i.e.
-# ~$3.45/month at 180 entries/day. Trim the *_EXAMPLES_COUNT settings first if that
-# ever needs to come down.
+# ESTIMATED 2026-07-26 at ~$0.0005/call, i.e. very roughly $4/month at 180 entries/day
+# (~1.5 model calls per entry). Treat that as an order-of-magnitude figure, NOT a
+# measurement: OpenRouter's /key `usage` field is batched with a 1-3 minute lag, so
+# short before/after deltas undercount the tail of a run. The only trustworthy source
+# is the OpenRouter dashboard's activity page. Trim the *_EXAMPLES_COUNT settings first
+# if cost ever needs to come down — the system prompt dominates the input tokens.
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
