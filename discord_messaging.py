@@ -606,6 +606,14 @@ class DiscordPoster:
                     f"remove the old copy manually"
                 )
 
+            # Discord intermittently skips the link-unfurl on a repost: the message
+            # lands with the correct content and flags=0, but no embed is ever
+            # generated, so a Twitter video silently stops playing after a move.
+            # The URL, channel and permissions are all fine in this state — a no-op
+            # edit forces Discord to re-scan the content and produce the embed.
+            if video_urls and new_message_id and new_channel_id:
+                await self._ensure_video_embed(new_channel_id, new_message_id, entry_id)
+
             # Recreate thread with Perplexity content if it was extracted
             if thread_data:
                 try:
@@ -675,6 +683,61 @@ class DiscordPoster:
         except Exception as e:
             logger.error(f"Error in recategorize_entry: {e}", exc_info=True)
             return False, None, None, str(e)
+
+    async def _ensure_video_embed(self, channel_id, message_id, entry_id=None,
+                                  delay=4.0, attempts=2):
+        """
+        Force Discord to unfurl a video link that it silently skipped.
+
+        Discord occasionally accepts a message containing a video URL, reports
+        flags=0 (embeds enabled) and keeps the link intact, yet never generates
+        the embed — the video simply doesn't play. This is observed on reposts
+        (re-categorization) and is not caused by a bad URL, missing permissions
+        or embed suppression: re-sending the identical content unfurls normally.
+
+        A no-op edit (same content, flags explicitly cleared) makes Discord
+        re-scan the message and produce the embed. This is cheap, idempotent and
+        a no-op when the embed already exists.
+        """
+        try:
+            channel = self.client.get_channel(channel_id)
+            if not channel:
+                return False
+
+            for attempt in range(1, attempts + 1):
+                await asyncio.sleep(delay)
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    return False
+
+                if message.embeds:
+                    if attempt > 1:
+                        logger.info(
+                            f"Video embed recovered for entry {entry_id} "
+                            f"(message {message_id}) after {attempt - 1} nudge(s)"
+                        )
+                    return True
+
+                logger.warning(
+                    f"No embed on reposted message {message_id} (entry {entry_id}) — "
+                    f"nudging Discord to unfurl (attempt {attempt}/{attempts})"
+                )
+                try:
+                    await message.edit(content=message.content, suppress=False)
+                except discord.HTTPException as e:
+                    logger.error(f"Embed nudge edit failed for {message_id}: {e}")
+                    return False
+
+            logger.error(
+                f"Video embed still missing for entry {entry_id} (message {message_id}) "
+                f"after {attempts} nudge(s) — Discord declined to unfurl"
+            )
+            return False
+        except Exception as e:
+            # Never let embed recovery break a re-categorization that otherwise worked.
+            logger.error(f"Error in _ensure_video_embed for {message_id}: {e}", exc_info=True)
+            return False
 
     async def update_category_tag(self, message_id, channel_id, new_category, entry_id, content, user=None, user_reason=None):
         """

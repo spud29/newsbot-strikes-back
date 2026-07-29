@@ -12,6 +12,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
 TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Required only when LLM_BACKEND = "openrouter"
 TELEGRAM_2FA_PASSWORD = os.getenv('TELEGRAM_2FA_PASSWORD')  # Optional: Telegram 2FA password
 
 # Perplexity AI Configuration
@@ -171,6 +172,62 @@ OLLAMA_EMBEDDING_NUM_CTX = 512
 # raise without first re-verifying VRAM headroom (`ollama ps` cross-checked against
 # `nvidia-smi` — Ollama's self-reported free VRAM has been wrong on this machine before).
 OLLAMA_CATEGORIZATION_NUM_CTX = 16384
+
+# ---------------------------------------------------------------------------
+# Categorization backend
+# ---------------------------------------------------------------------------
+# Which backend serves the *categorization* model — categorize(), format_text(),
+# verify_similarity(), compare_entries() and rate_newsworthiness(). Embeddings are
+# NOT affected: generate_embedding() always talks to local Ollama, so dedup vectors
+# stay identical and the database never needs a reset.
+#
+#   "ollama"     — local qwen3.5:9b (the original setup)
+#   "openrouter" — hosted API, frees ~7-9 GB of VRAM on this machine
+#
+# Switching back to "ollama" is a one-line rollback + restart. qwen3.5:9b stays
+# installed for exactly that reason; it just isn't kept loaded. Note the fallback is
+# manual — nothing auto-reverts if OpenRouter has an outage. On a hosted outage
+# categorize() returns its "Error during categorization" fallback, which main.py
+# already treats as "skip this entry, retry next cycle".
+#
+# After cutting over, set OLLAMA_MAX_LOADED_MODELS=1 on the host (env var, needs an
+# Ollama restart) so only the embedder stays resident. qwen3.5:9b unloads on its own
+# 30 minutes after the last categorize call.
+# Env var wins so an eval/A-B run can select a backend for one process without
+# editing this file underneath the running bot (a restart mid-run would otherwise
+# pick up the temporary value):  LLM_BACKEND=openrouter python evals/run_eval.py
+LLM_BACKEND = os.getenv('LLM_BACKEND', 'openrouter')
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Pin an explicit model id — a retired model surfaces as a 404 that health_check()
+# catches at startup rather than mid-poll.
+#
+# Verified live on OpenRouter 2026-07-26: $0.10/M input, $0.40/M output, 1M context,
+# supports response_format. Note gemini-2.0-flash was RETIRED from OpenRouter — this is
+# its same-price successor. Cheaper alternatives if quality holds: google/gemma-3-12b-it
+# ($0.05/$0.15). More capable if it doesn't: google/gemini-2.5-flash ($0.30/$2.50).
+OPENROUTER_CATEGORIZATION_MODEL = "google/gemini-2.5-flash-lite"
+# Per-attempt request timeout (seconds). Retries/backoff are handled by
+# _request_generate; the OpenAI SDK's own retries are disabled so attempt counting
+# lives in exactly one place.
+OPENROUTER_TIMEOUT = 120
+# Optional attribution headers shown on openrouter.ai/rankings. Harmless to leave.
+OPENROUTER_APP_NAME = "newsbot"
+OPENROUTER_APP_URL = "https://github.com/spud29/newsbot"
+
+# COST NOTE — the per-call payload is the *enhanced* system prompt (~5.7k tokens), not
+# the ~4.3k-token SYSTEM_PROMPT below: the feedback layers add ~1.4k more
+# (FEEDBACK_EXAMPLES_COUNT + IGNORE_EXAMPLES_COUNT + CORRECTION_EXAMPLES_COUNT +
+# IGNORE_PROMOTION_EXAMPLES_COUNT + IGNORE_RESCUE_EXAMPLES_COUNT, all further down this
+# file). That prefix is byte-stable for an hour (see _cache_ttl in ollama_client.py), so
+# cached reads at $0.01/M absorb most of it.
+#
+# ESTIMATED 2026-07-26 at ~$0.0005/call, i.e. very roughly $4/month at 180 entries/day
+# (~1.5 model calls per entry). Treat that as an order-of-magnitude figure, NOT a
+# measurement: OpenRouter's /key `usage` field is batched with a 1-3 minute lag, so
+# short before/after deltas undercount the tail of a run. The only trustworthy source
+# is the OpenRouter dashboard's activity page. Trim the *_EXAMPLES_COUNT settings first
+# if cost ever needs to come down — the system prompt dominates the input tokens.
 
 # System prompt for categorization
 SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is to analyze content and assign it to exactly ONE category with high precision.
@@ -519,12 +576,21 @@ CAPS_FIX_ENABLED = True
 CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
 
 NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the reaction-worthiness gate
-# Default cutoff. Calibrated 2026-07-10 against 30 days of user move/leave decisions
-# (evals/runs/reaction_calibration_20260710T203505Z.json): at 6.0 the gate passes
-# 71% of user-approved entries and blocks 47% of user-left ones — the best
-# precision knee for a "reaction-worthy" channel. The weekly accuracy report's
-# REACTION GATE section re-derives the best threshold as cleaner data accumulates.
-NEWSWORTHINESS_THRESHOLD = 6.0
+# Default cutoff. THIS VALUE IS BACKEND-DEPENDENT — it must be re-derived whenever
+# LLM_BACKEND changes, because the two raters do not share a scale.
+#
+# 2026-07-26, gemini-2.5-flash-lite (evals/runs/reaction_calibration_20260726*.json,
+# n=60/class): the hosted rater scores 0.3-0.7 lower than qwen3.5 across every pool
+# while separating the classes *better* (gate separation 0.85 vs qwen3.5's 0.54). So
+# the old 6.0 was not too loose or too tight — it was calibrated to a different scale.
+# At 6.0 this rater passes only 48.3% of user-approved entries; at 5.25 it passes
+# 63.3%, matching what qwen3.5 delivered at 6.0, at comparable precision (57.6% vs
+# 59.4%). Estimated at n=60/class, so treat it as approximate and re-run
+# evals/calibrate_reaction_gate.py --per-class 150 to tighten.
+#
+# Previous value for the ollama backend was 6.0 (calibrated 2026-07-10, see
+# evals/runs/reaction_calibration_20260710T203505Z.json) — restore it if rolling back.
+NEWSWORTHINESS_THRESHOLD = 5.25
 # Per-category threshold overrides (categories not listed use NEWSWORTHINESS_THRESHOLD)
 NEWSWORTHINESS_THRESHOLD_BY_CATEGORY = {}
 # 2026-07-21 rebalance: impact promoted from 0.30 to the dominant weight (0.45),
