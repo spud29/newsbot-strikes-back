@@ -3,9 +3,73 @@ services:
     image: searxng/searxng:latest
     container_name: searxng
     ports:
-      - "8080:8080"
+      - "8088:8080"
     volumes:
       - ./searxng:/etc/searxng
     environment:
-      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_BASE_URL=http://localhost:8088/
     restart: unless-stopped
+
+  # Self-hosted Twitter feed discovery for the bot (config.NITTER_BASE_URL).
+  # Adapted from upstream https://github.com/zedeus/nitter/blob/master/compose.yml
+  # with three deliberate changes for Docker Desktop on Windows:
+  #   - published on 8081 because searxng above already holds 8080
+  #   - dropped the ":Z" mount flag (SELinux relabelling; Linux/podman only)
+  #   - dropped upstream's "user: 998:998" on THIS service only: it's a Linux-host
+  #     UID convention that means nothing against a Windows bind mount and only
+  #     risks an unreadable config. Note it is still required on nitter-redis —
+  #     see the comment there before removing it.
+  # NOTE: nitter.conf and sessions.jsonl must already exist as FILES before the
+  # first "up". If they don't, Docker helpfully creates DIRECTORIES at those
+  # paths and the container dies with a confusing "not a directory" error.
+  nitter:
+    image: zedeus/nitter:latest
+    container_name: nitter
+    ports:
+      - "127.0.0.1:8081:8080"  # localhost-only; the bot polls from the host
+    volumes:
+      - ./nitter/nitter.conf:/src/nitter.conf:ro
+      - ./nitter/sessions.jsonl:/src/sessions.jsonl:ro
+    depends_on:
+      - nitter-redis
+    restart: unless-stopped
+    healthcheck:
+      # Fetching a real tweet exercises the X session, so this goes unhealthy
+      # when the cookies expire — which is this instance's expected failure mode.
+      test: wget -nv --tries=1 --spider http://127.0.0.1:8080/Jack/status/20 || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 2
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  nitter-redis:
+    image: redis:6-alpine
+    container_name: nitter-redis
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - nitter-redis:/data
+    restart: unless-stopped
+    healthcheck:
+      test: redis-cli ping
+      interval: 30s
+      timeout: 5s
+      retries: 2
+    # REQUIRED, do not remove. The redis entrypoint starts as root and drops to
+    # the redis user via setpriv, which needs CAP_SETUID/CAP_SETGID — and
+    # cap_drop:ALL below takes those away, so it exits 127 in a crash loop with
+    # "setpriv: setresuid failed". Starting as the user directly avoids the
+    # privilege drop entirely. 999:1000 is redis:6-alpine's own uid:gid and
+    # already owns /data in the image.
+    user: "999:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  nitter-redis:

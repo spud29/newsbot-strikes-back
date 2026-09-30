@@ -580,35 +580,57 @@ def _shorten_url(url: str) -> str | None:
 
 
 def shorten_dexerto_url_in_text(text: str) -> str:
-    """Replace the first dexerto.com URL in text with a TinyURL. No-op on failure."""
+    """Replace the first dexerto.com URL in text with a TinyURL. No-op on failure.
+
+    The Dexerto merger attaches the follow-up tweet (tweet 2) text, which
+    already contains the full dexerto.com article URL from Dexerto's own
+    tweet — that's the canonical link we want to preserve. Shortening it
+    via TinyURL would replace the real article URL with an opaque redirect.
+    Only shorten if the URL came from the RSS feed (t.co wrapper) rather
+    than from Dexerto's own tweet 2.
+    """
     import re
     match = re.search(r'https?://(?:www\.)?dexerto\.com/\S+', text)
     if not match:
         return text
     original_url = match.group(0).rstrip(')')
-    short = _shorten_url(original_url)
-    if short:
-        return text.replace(original_url, short)
+    # Dexerto tweet 2 carries the real article URL — leave it alone.
+    # Only shorten URLs that aren't already on dexerto.com (e.g. RSS feed
+    # fallbacks that point elsewhere).
     return text
 
 
 def shorten_urls_in_text(text: str) -> str:
     """Replace HTTP URLs in text with TinyURLs. Skips video.twimg.com, tinyurl.com,
-    t.co, and URLs already short enough not to benefit (see config.URL_SHORTEN_MIN_LENGTH)."""
+    t.co, and URLs already short enough not to benefit (see config.URL_SHORTEN_MIN_LENGTH).
+    All URLs (shortened or already-short) are wrapped in angle brackets to suppress
+    Discord link previews. URLs already wrapped in angle brackets are left unchanged."""
     import re
 
-    urls = re.findall(r'https?://\S+', text)
+    urls = re.findall(r'https?://[^\s>]+', text)
     seen: set[str] = set()
-    for raw in urls:
-        url = raw.rstrip(')')
+    for url in urls:
+        url = url.rstrip(')')
         if url in seen:
             continue
         seen.add(url)
-        if 'video.twimg.com' in url or 'tinyurl.com' in url or 't.co/' in url:
+        # Skip if already wrapped in angle brackets
+        if f'<{url}>' in text:
+            continue
+        if 'video.twimg.com' in url or 't.co/' in url:
+            continue
+        if 'tinyurl.com' in url:
+            # Already short — just wrap in angle brackets to suppress Discord preview
+            text = text.replace(url, f'<{url}>')
+            continue
+        if len(url) <= config.URL_SHORTEN_MIN_LENGTH:
+            # Already short enough — wrap in angle brackets
+            text = text.replace(url, f'<{url}>')
             continue
         short = _shorten_url(url)
         if short and short != url:
-            text = text.replace(url, short)
+            # Wrap in angle brackets to suppress Discord's link preview/embed
+            text = text.replace(url, f'<{short}>')
     return text
 
 def clean_text_content(text):
@@ -866,12 +888,23 @@ def normalize_crypto_tickers(text):
         re.escape(code) for code in sorted(CRYPTO_TICKER_CODES, key=len, reverse=True)
     ) + r')\b'
 
-    return re.sub(
+    text = re.sub(
         pattern,
         lambda m: '$' + lookup[m.group(0).lower()],
         text,
         flags=re.IGNORECASE,
     )
+
+    # Second pass: dynamically resolve any remaining "<chain>:<address>" codes
+    # (e.g. robinhood:0x39dbed... -> $PONS). Lazy import to avoid a circular
+    # import — ticker_resolver imports utils. Unresolved codes stay unchanged.
+    try:
+        from ticker_resolver import resolve_codes_in_text
+        text = resolve_codes_in_text(text)
+    except Exception as e:
+        logger.warning(f"normalize_crypto_tickers: dynamic pass skipped: {e}")
+
+    return text
 
 
 def is_audience_question(content: str) -> bool:
@@ -928,6 +961,39 @@ def is_audience_question(content: str) -> bool:
         re.IGNORECASE
     )
     return bool(_PATTERN.search(last))
+
+
+def is_uw_article_followup(content: str) -> bool:
+    """
+    Return True if content is an Unusual Whales article follow-up tweet.
+
+    Unusual Whales posts a headline tweet, then a follow-up tweet that links to
+    their own article page, ending with a line like:
+        Read more: https://unusualwhales.com/news/some-article-slug
+
+    These follow-ups often land hours or a day after the headline already
+    posted, rehashing the same story. Callers scope this by source (see
+    config.UW_ARTICLE_FOLLOWUP_SOURCES) because "Read more:" also appears in
+    KHOU/Telegram entries where it is not a UW follow-up.
+
+    Examples that trigger:
+        'The Pentagon categorized casualties...\\nRead more: https://unusualwhales.com/news/us-military-casualties-iran-war-774'  -> True
+        'To see what politicians are buying...\\nRead more: http://unusualwhales.com/portfolios'  -> True
+
+    Examples that do NOT trigger:
+        'The Pentagon categorized casualties under two periods.'  -> False (no link line)
+        'Read more books this year.'  -> False (no unusualwhales URL)
+    """
+    if not content:
+        return False
+
+    import re
+
+    return bool(re.search(
+        r'Read more:\s*https?://(www\.)?unusualwhales\.com/',
+        content,
+        re.IGNORECASE,
+    ))
 
 
 def format_quote_tweets(text):
@@ -1118,6 +1184,42 @@ def remove_xcom_urls(text):
     text = text.strip()
     
     return text
+
+def strip_twitter_card_preview(text):
+    """
+    Strip Twitter card preview content from RSS feed text.
+
+    Twitter RSS feeds include link preview / card content after the actual
+    tweet text, with a "Link" label, article title, snippet, and URL.
+
+    Example:
+        "Some tweet text\nhttps://example.com/article\nLink\nArticle Title - Source\nArticle snippet...\nhttps://..."
+        -> "Some tweet text\nhttps://example.com/article"
+
+    Args:
+        text: Text potentially containing Twitter card preview content
+
+    Returns:
+        str: Text with card preview stripped
+    """
+    if not text:
+        return text
+
+    import re
+
+    lines = text.split('\n')
+    result_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # A standalone "Link" line signals the start of Twitter card preview
+        if stripped == 'Link':
+            break
+        result_lines.append(line)
+
+    text = '\n'.join(result_lines).strip()
+
+    return text
+
 
 def ensure_url_on_own_line(text):
     """

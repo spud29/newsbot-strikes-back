@@ -1,0 +1,30 @@
+﻿sources:
+  - name: newsbot-strikes-back
+    source: "C:/Users/spud9/OneDrive/Documents/newsbot strikes back"
+    kb-id: REPLACE_WITH_YOUR_KB_ID
+    filter:
+      include:
+        - "**/*.py"
+        - "**/*.md"
+        - "**/*.json"
+        - "**/*.jsonl"
+        - "**/*.yml"
+        - "**/*.yaml"
+        - "**/*.ps1"
+        - "**/*.sh"
+        - "**/*.txt"
+      exclude:
+        - ".venv/**"
+        - "venv/**"
+        - "__pycache__/**"
+        - ".git/**"
+        - "data/**"
+        - "temp_media/**"
+        - "temp_media_serve/**"
+        - "*.log"
+        - "*.db"
+        - "*.db-wal"
+        - "*.db-shm"
+        - "*.bak-*"
+        - ".env"
+      max-size: 5mb

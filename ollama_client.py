@@ -139,6 +139,15 @@ class OllamaClient:
         self._gate_feedback_cache = None
         self._gate_feedback_timestamp = 0
 
+        # Prompt-cache accounting (OpenRouter path only). Gemini 2.5 Flash-Lite does
+        # implicit prefix caching — our stable ~4.3k-token SYSTEM_PROMPT prefix gets
+        # cached automatically at ~75% off, but usage.prompt_tokens alone doesn't show
+        # it. These counters accumulate per poll cycle; poll_cycle logs one INFO summary
+        # line and calls get_and_reset_cache_stats() to zero them.
+        self._cache_prompt_tokens = 0
+        self._cache_cached_tokens = 0
+        self._cache_calls = 0
+
         if self.backend == 'openrouter':
             logger.info(
                 f"LLM client initialized — categorization: OpenRouter "
@@ -424,15 +433,49 @@ class OllamaClient:
 
         usage = getattr(completion, 'usage', None)
         if usage:
+            # OpenRouter surfaces the implicitly-cached prefix count under
+            # prompt_tokens_details.cached_tokens (OpenAI-compatible shape). It can be
+            # absent (older payloads) or present-but-zero (cache miss / cold prefix).
+            cached = 0
+            details = getattr(usage, 'prompt_tokens_details', None)
+            if details is not None:
+                cached = getattr(details, 'cached_tokens', 0) or 0
+            self._cache_prompt_tokens += getattr(usage, 'prompt_tokens', 0) or 0
+            self._cache_cached_tokens += cached
+            self._cache_calls += 1
             logger.debug(
-                f"OpenRouter {op}: {usage.prompt_tokens} in / "
-                f"{usage.completion_tokens} out tokens"
+                f"OpenRouter {op}: {usage.prompt_tokens} in "
+                f"({cached} cached) / {usage.completion_tokens} out tokens"
             )
 
         return {
             'response': text,
             'done_reason': finish_reason,
             'finish_reason': finish_reason,
+        }
+
+    def get_and_reset_cache_stats(self):
+        """
+        Return accumulated prompt-cache stats since the last call and zero the
+        counters. OpenRouter path only — on the Ollama backend these stay 0 and
+        the caller should skip logging. Called once per poll cycle by main.py.
+
+        Returns:
+            dict: {'calls': int, 'prompt_tokens': int, 'cached_tokens': int,
+                   'hit_rate': float 0-1}
+        """
+        calls = self._cache_calls
+        prompt_tokens = self._cache_prompt_tokens
+        cached_tokens = self._cache_cached_tokens
+        self._cache_calls = 0
+        self._cache_prompt_tokens = 0
+        self._cache_cached_tokens = 0
+        hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens else 0.0
+        return {
+            'calls': calls,
+            'prompt_tokens': prompt_tokens,
+            'cached_tokens': cached_tokens,
+            'hit_rate': hit_rate,
         }
 
     def _request_generate(self, payload, timeout=300, max_retries=2, initial_delay=1,
@@ -644,6 +687,29 @@ class OllamaClient:
 
         except Exception as e:
             logger.error(f"Error categorizing content: {e}")
+            # OpenRouter fallback: if the backend is OpenRouter and it failed,
+            # try local Ollama once so a transient DNS/connectivity blip doesn't
+            # lose the entry to a retry-next-cycle skip.
+            if self.backend == 'openrouter':
+                logger.warning(
+                    f"OpenRouter categorization failed ({e}), falling back to local "
+                    f"Ollama ({self.categorization_model}) for this entry..."
+                )
+                try:
+                    category, reasoning, secondary_category = self._categorize_local(
+                        content, exclude_categories
+                    )
+                    if not (reasoning or '').startswith('Error during categorization'):
+                        logger.info(
+                            f"Local Ollama fallback succeeded: {category} "
+                            f"(secondary: {secondary_category})"
+                        )
+                        return category, reasoning, secondary_category
+                    logger.warning(
+                        f"Local Ollama fallback also failed, using error fallback: {reasoning}"
+                    )
+                except Exception as fallback_err:
+                    logger.error(f"Local Ollama fallback failed: {fallback_err}")
             # Make sure we don't return an excluded category even on error
             if exclude_categories and config.DEFAULT_CATEGORY in exclude_categories:
                 valid_categories = [cat for cat in config.DISCORD_CHANNELS.keys()
@@ -709,6 +775,136 @@ class OllamaClient:
                         start = None
 
         return None
+
+    def _categorize_local(self, content, exclude_categories=None):
+        """
+        Run categorization against local Ollama directly — no OpenRouter involved.
+
+        Used as a fallback when the OpenRouter path fails, and also by the
+        rescue path (categorize with 'ignore' excluded). Builds the same
+        enhanced prompt and parsing pipeline as categorize() but routes the
+        generate call through _generate_ollama instead of _request_generate.
+
+        Args:
+            content: Text content to categorize
+            exclude_categories: List of category names to exclude from results
+
+        Returns:
+            tuple: (category_name, reasoning, secondary_category)
+        """
+        logger.debug(f"Local Ollama categorization: {content[:100]}...")
+        if exclude_categories:
+            logger.debug(f"Excluding categories: {exclude_categories}")
+
+        system_prompt = self.generate_enhanced_system_prompt()
+
+        if exclude_categories:
+            exclusion_note = (
+                f"\n\nIMPORTANT: Do NOT categorize this content as any of the "
+                f"following: {', '.join(exclude_categories)}. "
+                f"Choose the next most appropriate category."
+            )
+            system_prompt += exclusion_note
+
+        valid_cats = getattr(config, 'VALID_CATEGORIES',
+                             list(config.DISCORD_CHANNELS.keys()))
+        if exclude_categories:
+            valid_cats = [c for c in valid_cats if c not in exclude_categories]
+        valid_names = ", ".join(sorted(valid_cats))
+
+        prompt = (
+            f"Content to categorize:\n{content}\n\n"
+            f"Valid categories (use the exact name): {valid_names}\n\n"
+            f"Respond with ONLY valid JSON: "
+            f"{{\"category\": \"<exact name from above>\", "
+            f"\"reasoning\": \"<1-2 sentence explanation of why this category "
+            f"was chosen over others>\", "
+            f"\"secondary_category\": \"<exact name from above, or null if not applicable>\"}}"
+        )
+
+        result = self._generate_ollama(
+            {
+                "model": self.categorization_model,
+                "system": system_prompt,
+                "prompt": prompt,
+                "stream": False,
+                "keep_alive": "30m",
+                "think": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 500,
+                    "num_ctx": self.categorization_num_ctx,
+                },
+            },
+            timeout=300,
+        )
+
+        response_text = result.get('response', '').strip()
+        category_raw = ''
+        reasoning = None
+
+        parsed = self._extract_json(response_text)
+        if parsed is not None:
+            category_raw = parsed.get('category', '').lower().strip()
+            reasoning = parsed.get('reasoning', None)
+
+        if not category_raw:
+            cat_field = re.search(
+                r'"category"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE
+            )
+            if cat_field:
+                category_raw = cat_field.group(1).lower().strip()
+                reason_field = re.search(
+                    r'"reasoning"\s*:\s*"([^"]*)', response_text, re.IGNORECASE
+                )
+                if reason_field:
+                    reasoning = reason_field.group(1).strip() or None
+                logger.debug(f"Extracted category from truncated JSON: '{category_raw}'")
+
+        if not category_raw:
+            first_line = response_text.split('\n')[0].strip().lower()
+            category_raw = first_line.split(',')[0].split('.')[0].strip()
+            if category_raw:
+                logger.warning(
+                    f"JSON parse failed, using first line as category: '{category_raw}'"
+                )
+
+        category = self._parse_category(category_raw)
+
+        secondary_category = None
+        if parsed is not None:
+            secondary_raw = parsed.get('secondary_category')
+            if secondary_raw and str(secondary_raw).lower().strip() not in (
+                'null', 'none', ''
+            ):
+                secondary_category = self._parse_category(
+                    str(secondary_raw).lower().strip()
+                )
+                if secondary_category == category or secondary_category == config.DEFAULT_CATEGORY:
+                    secondary_category = None
+
+        if exclude_categories and category in exclude_categories:
+            logger.warning(f"AI returned excluded category '{category}', forcing to alternative")
+            reasoning = f"AI suggested '{category}' but it was excluded"
+            valid_categories = [
+                cat for cat in config.DISCORD_CHANNELS.keys()
+                if cat not in exclude_categories
+            ]
+            if config.DEFAULT_CATEGORY not in exclude_categories:
+                category = config.DEFAULT_CATEGORY
+            elif valid_categories:
+                if config.FALLBACK_CATEGORY in valid_categories:
+                    category = config.FALLBACK_CATEGORY
+                else:
+                    category = valid_categories[0]
+                logger.info(f"Using fallback category: {category}")
+            else:
+                logger.error("All categories excluded! Using DEFAULT_CATEGORY anyway")
+                category = config.DEFAULT_CATEGORY
+            secondary_category = None
+
+        logger.info(f"Local Ollama: {category} (raw: {category_raw}, secondary: {secondary_category})")
+        return category, reasoning, secondary_category
 
     def _parse_category(self, category_raw):
         """
@@ -1056,10 +1252,10 @@ class OllamaClient:
         
         try:
             response = requests.post(
-                f"{self.base_url}/api/embeddings",
+                f"{self.base_url}/api/embed",
                 json={
                     "model": self.embedding_model,
-                    "prompt": content,
+                    "input": content,
                     "keep_alive": "30m",
                     # Cap context so the embedder loads small (~1 GB vs ~2.9 GB at the 8192
                     # default) and can stay GPU-resident next to the categorizer — see
@@ -1072,11 +1268,13 @@ class OllamaClient:
             response.raise_for_status()
             result = response.json()
 
-            embedding = result.get('embedding', [])
-            
-            if not embedding:
+            # /api/embed returns {"embeddings": [[...]]}; /api/embeddings (deprecated,
+            # returns empty on Ollama >= 0.32) returned {"embedding": [...]}.
+            embeddings = result.get('embeddings', [])
+            if not embeddings or not embeddings[0]:
                 raise ValueError("No embedding returned from Ollama")
-            
+            embedding = embeddings[0]
+
             logger.debug(f"Generated embedding with {len(embedding)} dimensions")
             return embedding
             
@@ -1389,57 +1587,61 @@ Respond with ONLY valid JSON in this exact format (replace each <> with your rat
         Returns:
             bool: True if healthy
         """
-        if self.backend == 'openrouter' and not self._openrouter_health_check():
+        # Helper: check if a model name exists in the available models list
+        def model_exists(model_name, available_models):
+            if model_name in available_models:
+                return True
+            if f"{model_name}:latest" in available_models:
+                return True
+            for available in available_models:
+                if available.startswith(f"{model_name}:"):
+                    return True
             return False
 
         try:
             response = requests.get(f"{self.base_url}/api/tags", timeout=10)
             response.raise_for_status()
-
             models = response.json().get('models', [])
             model_names = [m.get('name', '') for m in models]
 
-            logger.info(f"Ollama health check passed. Available models: {model_names}")
-            
-            # Helper function to check if model exists (handles :latest suffix)
-            def model_exists(model_name, available_models):
-                # Check exact match
-                if model_name in available_models:
-                    return True
-                # Check with :latest suffix
-                if f"{model_name}:latest" in available_models:
-                    return True
-                # Check if any model starts with the name (handles any tag)
-                for available in available_models:
-                    if available.startswith(f"{model_name}:"):
-                        return True
-                return False
-            
-            # Every required model must be present. Returning True with a missing
-            # model just defers the failure to the first categorize/embed call at
-            # runtime — fail the health check so startup aborts loudly instead.
-            # The categorization model is only needed locally on the ollama backend;
-            # on openrouter it stays installed as a manual rollback target but is
-            # not required to be present (and deliberately isn't kept loaded).
+            if self.backend == 'openrouter':
+                openrouter_ok = self._openrouter_health_check()
+                if openrouter_ok:
+                    logger.info("OpenRouter health check passed — primary backend available")
+                else:
+                    logger.warning(
+                        "OpenRouter health check FAILED — bot will start with local Ollama "
+                        "fallback for categorization. OpenRouter will be retried on each entry."
+                    )
+                # Bot always starts if local Ollama is healthy — the categorize() fallback
+                # handles OpenRouter outages at the entry level, so a DNS blip doesn't kill
+                # the whole bot anymore.
+                embedding_ok = model_exists(self.embedding_model, model_names)
+                if not embedding_ok:
+                    logger.error(f"Required embedding model '{self.embedding_model}' not found in Ollama")
+                    return False
+                if not model_exists(self.categorization_model, model_names):
+                    logger.error(
+                        f"Required categorization model '{self.categorization_model}' not found — "
+                        f"local fallback is unavailable"
+                    )
+                    return False
+                logger.info(
+                    f"Ollama health check passed. Available models: {model_names}. "
+                    f"OpenRouter: {'up' if openrouter_ok else 'down (fallback active)'}"
+                )
+                return True
+
+            # Local Ollama backend — categorization model is required
             embedding_ok = model_exists(self.embedding_model, model_names)
+            categorization_ok = model_exists(self.categorization_model, model_names)
+            logger.info(f"Ollama health check passed. Available models: {model_names}")
             if not embedding_ok:
                 logger.error(f"Required embedding model '{self.embedding_model}' not found in Ollama")
-
-            if self.backend == 'openrouter':
-                if not model_exists(self.categorization_model, model_names):
-                    logger.warning(
-                        f"Ollama categorization model '{self.categorization_model}' is not "
-                        f"installed — fine while LLM_BACKEND='openrouter', but the rollback "
-                        f"to local categorization is not available until it is pulled back"
-                    )
-                return embedding_ok
-
-            categorization_ok = model_exists(self.categorization_model, model_names)
             if not categorization_ok:
                 logger.error(f"Required categorization model '{self.categorization_model}' not found in Ollama")
-
             return categorization_ok and embedding_ok
-            
+
         except Exception as e:
             logger.error(f"Ollama health check failed: {e}")
             return False

@@ -234,7 +234,8 @@ class EditTextModal(discord.ui.Modal, title="Edit Entry Text"):
             # Shorten URLs to TinyURLs (same guard as post_message)
             _url_count = len(re.findall(r'https?://\S+', message_text))
             _is_dexerto = 'dexerto.com' in message_text
-            if _url_count <= 1 or _is_dexerto:
+            _is_polymarket = 'poly.market' in message_text or 'polymarket.com' in message_text
+            if _url_count <= 1 or _is_dexerto or _is_polymarket:
                 message_text = await asyncio.to_thread(shorten_urls_in_text, message_text)
 
             # Re-prepend category tag in unified channel mode
@@ -354,13 +355,19 @@ class SetCategoryView(discord.ui.View):
         self._pending_secondary = _UNCHANGED
         self._confirmed = False
 
+        # The DB may say one category while the actual message tag shows another
+        # (e.g. tag says [Stocks] but DB says general news). Use the tag on the
+        # message as the effective current category so the user's selection is
+        # compared against what they actually see, not a stale DB value.
+        self.effective_current_category = self._parse_tag_from_content(message.content) or current_cat
+
         # Primary category dropdown (row 0)
         primary_options = [
             discord.SelectOption(label=format_category_label(cat), value=cat)
             for cat in sorted(available_categories)
         ]
         primary_select = discord.ui.Select(
-            placeholder=f"Primary: {current_cat} — pick a new category",
+            placeholder=f"Primary: {self.effective_current_category} — pick a new category",
             options=primary_options,
             min_values=1,
             max_values=1,
@@ -372,7 +379,7 @@ class SetCategoryView(discord.ui.View):
         # Secondary category dropdown (row 1)
         secondary_options = [discord.SelectOption(label="None (clear)", value="__none__")]
         for cat in sorted(available_categories):
-            if cat != config.DEFAULT_CATEGORY and cat != current_cat:
+            if cat != config.DEFAULT_CATEGORY and cat != self.effective_current_category:
                 is_current = (cat == self.current_secondary)
                 secondary_options.append(discord.SelectOption(
                     label=format_category_label(cat), value=cat, default=is_current
@@ -395,6 +402,22 @@ class SetCategoryView(discord.ui.View):
         confirm_btn.callback = self._on_confirm
         self.add_item(confirm_btn)
 
+    @staticmethod
+    def _parse_tag_from_content(content):
+        """Extract the primary category tag from a message's [Category] prefix."""
+        if not content:
+            return None
+        m = re.match(r'\*\*?\[([^\]]+)\]\*\*?', content)
+        if m:
+            tag = m.group(1).strip()
+            # Map display labels back to canonical category keys
+            for cat in sorted(config.DISCORD_CHANNELS.keys()):
+                if cat != config.DEFAULT_CATEGORY and format_category_label(cat).lower() == tag.lower():
+                    return cat
+            # If it doesn't match any known label, return the raw tag
+            return tag
+        return None
+
     async def _on_primary_select(self, interaction: discord.Interaction):
         self._pending_primary = interaction.data["values"][0]
         await interaction.response.defer()
@@ -411,7 +434,7 @@ class SetCategoryView(discord.ui.View):
 
         primary_changed = (
             self._pending_primary is not None
-            and self._pending_primary != self.current_category
+            and self._pending_primary != self.effective_current_category
         )
         secondary_changed = (
             self._pending_secondary is not _UNCHANGED
@@ -432,7 +455,7 @@ class SetCategoryView(discord.ui.View):
                 new_cat = self._pending_primary
                 logger.info(
                     f"Updating category tag for {self.entry_id}: "
-                    f"{self.current_category} -> {new_cat}"
+                    f"{self.effective_current_category} -> {new_cat}"
                     + (f", secondary -> {self._pending_secondary}" if secondary_changed else "")
                 )
                 if config.REASON_MODAL_ENABLED:
@@ -485,7 +508,8 @@ class SetCategoryView(discord.ui.View):
                 _base = ensure_url_on_own_line(content)
                 _url_count = len(re.findall(r'https?://\S+', _base))
                 _is_dexerto = 'dexerto.com' in _base
-                if _url_count <= 1 or _is_dexerto:
+                _is_polymarket = 'poly.market' in _base or 'polymarket.com' in _base
+                if _url_count <= 1 or _is_dexerto or _is_polymarket:
                     _base = await asyncio.to_thread(shorten_urls_in_text, _base)
 
                 new_text = f"{_format_category_tag(category, new_secondary)}\n{_base}"

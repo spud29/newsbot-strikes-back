@@ -186,20 +186,56 @@ def register_commands(poster):
                     current_category = entry_data.get('category', 'unknown') if entry_data else 'unknown'
 
             if not entry_id or not entry_data:
+                # DB lookup failed — message may be an orphan or already moved.
+                # Fall back to the Discord message content and let recategorize_entry
+                # post a fresh message to the target channel.
+                logger.warning(
+                    f"Move to Channel: no DB entry for message {message.id} "
+                    f"— falling back to content from Discord"
+                )
+                entry_id = None
+                entry_data = {
+                    'content': message.content,
+                    'video_urls': [],
+                    'category': 'unknown',
+                    'source_type': 'unknown',
+                }
+                current_category = 'unknown'
+
+            # If entry_id is still None after the fallback, do NOT move anything —
+            # the entry may have already been moved by a prior dispatch, and
+            # deleting/posting with no DB mapping strands the entry.
+            if entry_id is None:
                 await interaction.response.send_message(
-                    "❌ Could not find entry data for this message in the database.",
+                    "❌ Couldn't find this entry in the database — it may already have been moved. Nothing was changed.",
                     ephemeral=True
                 )
                 return
 
-            # Auto-toggle between ignore and unified — no dropdown needed
-            if current_category == config.DEFAULT_CATEGORY:
-                new_category = entry_data.get('original_category')
-                if not new_category or new_category == config.DEFAULT_CATEGORY:
-                    new_category = config.FALLBACK_CATEGORY
+            # Determine target: read the ACTUAL channel, not the DB record, so the
+            # toggle works correctly even for orphans and already-moved messages.
+            # NOTE: config.DEFAULT_CATEGORY is 'ignore' and DISCORD_CHANNELS['ignore']
+            # is the ignore dump channel — NOT the unified channel. The unified channel
+            # is tracked separately as config.UNIFIED_CHANNEL_ID (and all non-ignore
+            # categories post there under UNIFIED_CHANNEL_MODE). So we must use the
+            # explicit IDs here rather than DISCORD_CHANNELS.get(DEFAULT_CATEGORY).
+            message_channel_id = message.channel.id
+            unified_channel_id = config.UNIFIED_CHANNEL_ID
+            ignore_channel_id = config.DISCORD_CHANNELS.get('ignore')
+
+            if message_channel_id == ignore_channel_id:
+                # Moving FROM the ignore dump channel → unified channel.
+                # The unified channel carries all non-ignore categories; use the
+                # FALLBACK_CATEGORY so the AI's 'ignore' suggestion is replaced.
+                new_category = config.FALLBACK_CATEGORY
                 direction_label = f"ignore → **{new_category}**"
+            elif message_channel_id == unified_channel_id:
+                # Moving FROM the unified channel → ignore dump channel.
+                new_category = 'ignore'
+                direction_label = f"**{config.FALLBACK_CATEGORY}** → ignore"
             else:
-                new_category = config.DEFAULT_CATEGORY
+                # Some other category channel — toggle to ignore.
+                new_category = 'ignore'
                 direction_label = f"**{current_category}** → ignore"
 
             logger.info(
@@ -408,7 +444,16 @@ def register_commands(poster):
 
             # Show the modal
             modal = EditTextModal(entry_id, entry_data, message, poster)
-            await interaction.response.send_modal(modal)
+            try:
+                await interaction.response.send_modal(modal)
+                logger.info(f"Edit Text modal shown for entry {entry_id}")
+            except discord.HTTPException as e:
+                if e.code == 40060:
+                    logger.debug(f"Edit Text: interaction already acknowledged (cross-session race) — skipping")
+                else:
+                    logger.error(f"Edit Text: HTTP error showing modal: {e}")
+            except Exception as e:
+                logger.error(f"Edit Text: unexpected error showing modal: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Error in 'Edit Text' command: {e}", exc_info=True)

@@ -16,17 +16,72 @@ class RSSPoller:
     def __init__(self):
         """Initialize RSS poller"""
         self.feeds = config.RSS_FEEDS
+        self._feed_429_strikes = {}      # feed_name -> consecutive failed-429 cycles
+        self._feed_cooldown_until = {}   # feed_name -> epoch seconds
+        self._429_COOLDOWN_SECONDS = 1800      # 30 min
+        self._429_STRIKE_LIMIT = 3             # consecutive failed cycles before cooldown
         logger.info(f"RSS Poller initialized with {len(self.feeds)} feeds")
-    
-    @retry_with_backoff(max_retries=3, initial_delay=2)
+
     def poll_feed(self, feed_name, feed_url):
         """
-        Poll a single RSS feed
-        
+        Poll a single RSS feed, with a feed-level 429 cooldown.
+
+        Wrapper that owns the strike/cooldown bookkeeping so a cooldown is keyed
+        to whole cycles, not retry attempts: only a cycle where ALL retry
+        attempts 429 counts as one strike (transient 429s that succeed on retry
+        reset the counter, so they never trigger a cooldown).
+
         Args:
             feed_name: Name of the feed
             feed_url: URL of the RSS feed
-        
+
+        Returns:
+            list: List of entry dictionaries (empty if in cooldown)
+        """
+        cooldown_until = self._feed_cooldown_until.get(feed_name, 0)
+        if time.time() < cooldown_until:
+            logger.debug(f"Feed {feed_name} in 429 cooldown, skipping")
+            return []
+        if cooldown_until and time.time() >= cooldown_until:
+            # Cooldown expired — give the feed a fresh chance.
+            self._feed_429_strikes[feed_name] = 0
+
+        try:
+            entries = self._poll_feed_with_retry(feed_name, feed_url)
+            # Success (even after retries) means the feed is fine.
+            self._feed_429_strikes[feed_name] = 0
+            return entries
+        except Exception as e:
+            is_429 = (
+                "429" in str(e)
+                or (getattr(e, "response", None) is not None
+                    and getattr(e.response, "status_code", None) == 429)
+            )
+            if is_429:
+                strikes = self._feed_429_strikes.get(feed_name, 0) + 1
+                self._feed_429_strikes[feed_name] = strikes
+                if strikes >= self._429_STRIKE_LIMIT:
+                    self._feed_cooldown_until[feed_name] = time.time() + self._429_COOLDOWN_SECONDS
+                    logger.warning(
+                        f"Feed {feed_name}: {strikes} consecutive failed 429 cycles — "
+                        f"cooldown {self._429_COOLDOWN_SECONDS}s"
+                    )
+                else:
+                    logger.warning(
+                        f"Feed {feed_name} 429 cycle {strikes}/{self._429_STRIKE_LIMIT} — "
+                        f"will enter cooldown if persistent"
+                    )
+            raise
+
+    @retry_with_backoff(max_retries=3, initial_delay=2)
+    def _poll_feed_with_retry(self, feed_name, feed_url):
+        """
+        Fetch + parse a single RSS feed (retries live in the decorator).
+
+        Args:
+            feed_name: Name of the feed
+            feed_url: URL of the RSS feed
+
         Returns:
             list: List of entry dictionaries
         """
@@ -48,16 +103,21 @@ class RSSPoller:
             logger.debug(f"RSS feed {feed_name} contains {len(feed.entries)} raw entries")
             
             entries = []
-            skipped = 0
-            
+            skipped_stale = 0
+            skipped_parse = 0
+
             for entry in feed.entries:
-                parsed_entry = self._parse_entry(entry, feed_name)
+                parsed_entry, skip_reason = self._parse_entry(entry, feed_name)
                 if parsed_entry:
                     entries.append(parsed_entry)
+                elif skip_reason == "stale":
+                    skipped_stale += 1
                 else:
-                    skipped += 1
-            
-            logger.info(f"Found {len(entries)} entries in {feed_name} ({skipped} skipped due to parsing errors)")
+                    skipped_parse += 1
+
+            detail = f" ({skipped_parse} skipped due to parsing errors)" if skipped_parse else ""
+            stale_detail = f", {skipped_stale} stale" if skipped_stale else ""
+            logger.info(f"Found {len(entries)} entries in {feed_name}{stale_detail}{detail}")
             if entries:
                 logger.debug(f"Entry IDs from {feed_name}: {[e['id'] for e in entries]}")
             
@@ -82,7 +142,10 @@ class RSSPoller:
             # Extract basic information
             title = entry.get('title', '').strip()
             description = entry.get('description', '').strip()
-            link = entry.get('link', '').strip()
+            # Canonicalize before anything else reads it: `link` is what gets
+            # handed to gallery-dl and shown by the Source command, and a Nitter
+            # feed emits its own host, not x.com.
+            link = self._canonicalize_link(entry.get('link', '').strip())
             
             # Get publication date
             pub_date = entry.get('published', entry.get('updated', ''))
@@ -100,7 +163,7 @@ class RSSPoller:
                             f"Skipping stale RSS entry ({age_hours:.1f}h old, "
                             f"max {max_age_hours}h): {link}"
                         )
-                        return None
+                        return None, "stale"
                 except (TypeError, ValueError):
                     pass
 
@@ -109,7 +172,7 @@ class RSSPoller:
             
             if not status_id:
                 logger.warning(f"Could not extract status ID from: {link}")
-                return None
+                return None, "no_status_id"
             
             # Create unique ID
             entry_id = f"twitter_{status_id}"
@@ -146,12 +209,43 @@ class RSSPoller:
             }
             
             logger.debug(f"Parsed entry: {entry_id} - {title[:50]}...")
-            return parsed
+            return parsed, "ok"
             
         except Exception as e:
             logger.error(f"Error parsing entry from {feed_name}: {e}")
-            return None
+            return None, "error"
     
+    def _canonicalize_link(self, url):
+        """
+        Rewrite a feed's tweet permalink to its canonical x.com form.
+
+        The feed provider decides the host in the <link> element. rss.app emits
+        x.com URLs directly, but a Nitter instance emits its own host plus an
+        anchor: https://nitter.net/WatcherGuru/status/2082883530426601713#m
+
+        That matters because `link` is passed straight to gallery-dl
+        (media_handler.download_twitter_media) and surfaced by the Source
+        context command — gallery-dl's twitter extractor can't parse a
+        non-x.com host, and users shouldn't be shown an instance URL.
+
+        Deliberately host-agnostic rather than a nitter->x.com replacement: the
+        same code then works against rss.app, a public Nitter instance, or a
+        self-hosted one, so switching providers is a config change with no code
+        change to revert. Idempotent on links that are already canonical.
+
+        Args:
+            url: Tweet permalink as published by the feed
+
+        Returns:
+            str: https://x.com/<handle>/status/<id>, or the input unchanged if
+                 it doesn't look like a tweet permalink
+        """
+        match = re.search(r'/([^/]+)/status(?:es)?/(\d+)', url)
+        if not match:
+            return url
+
+        return f"https://x.com/{match.group(1)}/status/{match.group(2)}"
+
     def _extract_status_id(self, url):
         """
         Extract Twitter status ID from URL

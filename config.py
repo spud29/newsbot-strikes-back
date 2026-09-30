@@ -4,8 +4,9 @@ Configuration for the Discord News Aggregator Bot
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file — override any existing env vars
+# so the .env always wins (fixes stale DISCORD_TOKEN cached in shell env)
+load_dotenv(override=True)
 
 # Sensitive credentials from .env
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -33,6 +34,16 @@ PERPLEXITY_BUTTON_STYLE = "primary"  # Not used by context menu
 # Citations are now automatically included in the "Get More Info" thread response
 PERPLEXITY_CITATIONS_BUTTON_ENABLED = True  # Not used (citations always shown if available)
 PERPLEXITY_CITATIONS_BUTTON_LABEL = "View Citations"  # Not used by context menu
+# --- Entry enrichment (Tavily + Firecrawl) ---
+# Adds a "[Context]" block to entries before categorization so vague headlines
+# get scored with full information. Firecrawl scrapes linked articles (free);
+# Tavily searches bare headlines (1 credit each, capped daily).
+ENRICHMENT_ENABLED = False  # disabled Aug 22 — [Context] blocks looked bad on Discord
+FIRECRAWL_API_KEY = os.getenv('FIRECRAWL_API_KEY')
+TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')  # optional; set when you sign up
+ENRICHMENT_TAVILY_DAILY_CAP = 25  # max Tavily searches per calendar day
+ENRICHMENT_STATE_FILE = os.path.join(os.path.dirname(__file__), 'data', 'enrichment_state.json')
+
 PERPLEXITY_CITATIONS_BUTTON_EMOJI = "📚"  # Not used by context menu
 PERPLEXITY_CITATIONS_BUTTON_STYLE = "secondary"  # Not used by context menu
 
@@ -43,7 +54,7 @@ NEWS_SEARCH_COOLDOWN_SECONDS = 30  # Per-user cooldown to prevent API abuse
 
 # gallery-dl config path (explicit so it works under NSSM/LocalSystem,
 # where ~ resolves to the system profile instead of the user's home)
-GALLERY_DL_CONFIG = r"C:\Users\spud9\AppData\Roaming\gallery-dl\config.json"
+GALLERY_DL_CONFIG = os.path.expanduser("~/.config/gallery-dl/config.json")
 
 # Dexerto tweet pair merger
 # Dexerto posts stories as two tweets: tweet 1 = headline, tweet 2 = blurb + article URL.
@@ -51,16 +62,53 @@ GALLERY_DL_CONFIG = r"C:\Users\spud9\AppData\Roaming\gallery-dl\config.json"
 # If no follow-up arrives within this window, tweet 1 is posted alone during the cleanup cycle.
 DEXERTO_PENDING_MAX_AGE_HOURS = 1.0
 
-# RSS Feed URLs
+# ---------------------------------------------------------------------------
+# Twitter feed discovery
+# ---------------------------------------------------------------------------
+# These feeds exist ONLY to discover new tweet IDs. rss_poller keeps the status
+# ID from each item's link and uses the description merely as fallback text —
+# the real content and all media come from gallery-dl hitting x.com directly
+# (media_handler.download_twitter_media). Keep that split in mind before adding
+# a provider: whatever serves this list never needs to render a tweet well, it
+# only needs to publish permalinks promptly.
+#
+# Migrated off paid rss.app 2026-07-30. Nitter was measured as strictly better
+# on both axes that matter here: equal or fresher (it led rss.app on 2 of 8
+# feeds, trailed on none) and far deeper on quiet accounts — quiver_quant
+# returned 2 items from rss.app vs 20 from Nitter. That depth also closes the
+# re-post hole described at PROCESSED_IDS_RETENTION_HOURS below, which is worst
+# on exactly those low-volume feeds.
+#
+# Defaults to the self-hosted instance in docker-compose.yml (see nitter/).
+# Override to fall back to a public instance without a code change or restart
+# of anything but the bot:  NITTER_BASE_URL=https://nitter.net
+# The rss_poller._canonicalize_link() rewrite is host-agnostic, so a public
+# instance, the local one, or a rollback to rss.app all work unmodified.
+#
+# If Docker isn't up yet (it and the bot both start at logon, so this can race),
+# feed fetches raise and poll_all_feeds logs per-feed errors and moves on — the
+# next cycle 5 minutes later recovers on its own. Nothing crashes.
+NITTER_BASE_URL = os.getenv('NITTER_BASE_URL', 'http://localhost:8081').rstrip('/')
+
+# Feed name -> X handle. The KEY is stored as `source` on every entry and is
+# referenced by dexerto_merger and the feedback/learning queries, so renaming a
+# key silently orphans historical rows. Change the handle, never the key.
+TWITTER_HANDLES = {
+    "unusual_whales": "unusual_whales",
+    "dexerto_twitter": "Dexerto",
+    "solana_floor": "SolanaFloor",
+    "quiver_quant": "QuiverQuant",
+    "degenerate_news": "DegenerateNews",
+    "watcher_guru": "WatcherGuru",
+    "newswire": "NewsWire_US",
+    "polymarket": "Polymarket",
+    "khou": "KHOU",
+    "kprc2": "KPRC2",
+}
+
 RSS_FEEDS = {
-    "unusual_whales": "https://rss.app/feeds/MRsE23OX1FDxCdJ6.xml",
-    "dexerto_twitter": "https://rss.app/feeds/jj6pbdE2H5AEwfeY.xml",
-    "solana_floor": "https://rss.app/feeds/cJaLGwWKeTNniyhL.xml",
-    "quiver_quant": "https://rss.app/feeds/yiVD4vcQbQ8i2HDs.xml",
-    "degenerate_news": "https://rss.app/feeds/lJkV7xfSTsJOoYoD.xml",
-    "watcher_guru": "https://rss.app/feeds/jQfpcfiYsZL0NwkI.xml",
-    "newswire": "https://rss.app/feeds/DVrZpUnw9TZqLVNg.xml",
-    "polymarket": "https://rss.app/feeds/iyFNm1K9DmiIS07m.xml"
+    name: f"{NITTER_BASE_URL}/{handle}/rss"
+    for name, handle in TWITTER_HANDLES.items()
 }
 
 # Discord Channel IDs for each category
@@ -252,12 +300,15 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 - Use 'general news' for breaking US events that aren't driven by government, policy, or ideology
 
 ### world news
-- International relations, diplomacy, and geopolitics
-- War, military conflict, and armed operations anywhere in the world
-- Foreign governments, elections, and political events outside the US
-- International organizations and alliances (UN, NATO, EU)
+- **Default: skip.** Most international stories do not belong here unless they involve the US directly or are genuinely outlandish/surprising on a global scale.
 - US involvement abroad counts as world news: airstrikes, negotiations, treaties, sanctions, troop deployments — if the story is about the US acting in the world, it goes here; if it's about US domestic governance, use 'us politics'
-- Foreign protests, unrest, and political crises
+- War, military conflict, and armed operations that are globally significant or involve the US
+- Foreign governments, elections, and political events ONLY if they have clear US relevance (sanctions, treaties, major alliances) or are extraordinary enough to be broadly notable
+- International organizations and alliances (UN, NATO, EU) when they have concrete US impact
+- Foreign protests, unrest, and political crises ONLY if they are large-scale, destabilizing, or likely to have international ripple effects
+- **Not world news**: routine foreign politics, local elections, regional diplomacy with no US angle, minor international disputes — these go to ignore
+- A story is "outlandish enough" for world news if it would surprise an informed US audience or has implications that cross borders (e.g. a major power doing something unexpected, a global crisis, a development that reshapes an entire region)
+- When unsure whether an international story is "outlandish," err on the side of ignore — Brandi can always re-categorize it manually
 
 ### general news
 - Natural disasters, extreme weather events, and accidents
@@ -392,10 +443,17 @@ SYSTEM_PROMPT = """You are an expert news categorization assistant. Your task is
 "CDC confirms new measles outbreak across 4 states" → general news
 "Man arrested after largest bank heist in US history" → general news
 "NASA's James Webb captures image of earliest known galaxy" → science & technology
-"UK Parliament debates new immigration policy" → world news
-"Iran estimates $270 billion in war damage" → world news
+"UK Parliament debates new immigration policy" → ignore (routine foreign politics, no US angle)
+"China announces new local economic policy for Guangdong province" → ignore (regional, no US relevance)
+"Iran estimates $270 billion in war damage" → world news (major war damage estimate, globally significant)
 "US airstrikes target Houthi positions in Yemen" → world news (US acting abroad, not domestic governance)
-"Kremlin says Trump and Putin held a 90-minute call on ending the Ukraine war" → world news
+"Kremlin says Trump and Putin held a 90-minute call on ending the Ukraine war" → world news (US-involved diplomacy, major geopolitical stakes)
+"France passes routine budget bill" → ignore (routine foreign legislation, no US angle)
+"Japan hold upper house elections" → ignore (routine foreign election, no extraordinary stakes)
+"UN Security Council meets on climate" → ignore (routine diplomatic meeting, no concrete US impact)
+"Major earthquake devastates Turkey, thousands displaced" → world news (large-scale disaster with international implications)
+"North Korea fires missile into sea" → world news (provocation with regional/global security implications)
+"Brazilian congress debates minor tax adjustment" → ignore (routine foreign politics, no US angle)
 "Call of Duty releases new battle pass" → video games
 "LeBron James scores 40 points in playoff game" → sports
 "Taylor Swift announces new album release date" → pop culture
@@ -464,6 +522,24 @@ DB_PATH = "data/newsbot.db"
 
 # Polling interval (seconds)
 POLL_INTERVAL = 300  # 5 minutes
+
+# Max entries processed concurrently within one poll cycle. Each entry's pipeline is
+# dominated by network round-trips (OpenRouter categorize + newsworthiness, Discord
+# post), so overlapping them cuts cycle wall-time sharply when a feed dumps a batch.
+# Kept modest to stay under OpenRouter rate limits and avoid hammering Discord.
+# Set to 1 to restore the old strictly-sequential behaviour. Only the network-bound
+# process_entry() work overlaps — the pre-dispatch dedup decision (embedding compare +
+# in-flight registration) runs in a synchronous critical section per entry, so batch
+# members can't race each other into a double-post. See process_batch() in main.py.
+MAX_CONCURRENT_ENTRIES = 4
+
+# Max seconds to wait for a full Telegram poll pass (all channels) before giving up
+# on this cycle. Telethon's own reconnect logic has no outer bound, so a dropped
+# connection can hang this await forever with no exception ever raised — this
+# timeout is what turns that into "skip this cycle, try again next time" instead
+# of freezing the whole poll loop (RSS + Twitter included) indefinitely. Normal
+# passes over 6 channels take a few seconds; 60s leaves generous headroom.
+TELEGRAM_POLL_TIMEOUT = 60
 
 # Embedding retention period (hours) — the dedup window. Embeddings are the
 # expensive rows (full content + vector JSON), so this stays short.
@@ -569,11 +645,44 @@ SHORT_VIDEO_THRESHOLD = 60  # Videos under this duration (seconds) are sent to i
 # Filters entries that end with questions soliciting reader opinions (e.g. "Do you agree?", "Thoughts?")
 AUDIENCE_QUESTION_FILTER_ENABLED = True
 
+# Unusual Whales Article Follow-Up Filter
+# Unusual Whales posts headline tweets, then follow-up tweets linking to their
+# article (content ends with "Read more: https://unusualwhales.com/news/...").
+# The follow-ups are often a day late and rehash the headline already posted.
+# This filter routes them to the ignore channel instead of posting.
+UW_ARTICLE_FOLLOWUP_FILTER_ENABLED = True
+# Sources the filter applies to ("Read more:" also appears in KHOU/Telegram
+# entries where it is NOT a follow-up pattern, so scope it to these handles).
+UW_ARTICLE_FOLLOWUP_SOURCES = {"unusual_whales"}
+
+
 # ALL CAPS Capitalization Fix
 # When enabled, entries detected as ALL CAPS are rewritten to proper
 # sentence capitalization using Ollama before posting to Discord.
 CAPS_FIX_ENABLED = True
 CAPS_FIX_THRESHOLD = 0.65  # Ratio of uppercase letters to trigger rewrite (0.0-1.0)
+
+
+# Chain-ticker resolution (X cashtags stored as "<chain>:<address>")
+# X renders `robinhood:0x39dbed...` as `$PONS` client-side; that display text
+# never reaches us, so we rebuild it by resolving the contract/mint address to
+# its symbol via Dexscreener. Static CRYPTO_TICKER_CODES still handles natives;
+# this covers everything else. Unresolved codes are LEFT UNCHANGED (raw hex kept).
+TICKER_RESOLVE_ENABLED = True
+TICKER_RESOLVE_TIMEOUT = 5           # seconds per HTTP call
+TICKER_RESOLVE_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "ticker_symbols.json"
+)
+TICKER_RESOLVE_MISS_TTL = 86400      # re-try an unresolved address after 24h
+# X chain-namespace prefixes we trust to reference a token (ignore "query:", etc.)
+TICKER_CHAIN_PREFIXES = {
+    "robinhood", "solana", "ethereum", "base", "arbitrum", "optimism",
+    "polygon", "bsc", "avalanche", "bitcoin", "dogecoin", "litecoin",
+    "ripple", "xrp", "cardano", "tron", "ton", "sui", "aptos",
+}
+# Dexscreener chainId is 1:1 with X's prefix for the chains we've seen; keep a
+# map so a future mismatch is a one-line fix (e.g. {"xrp": "ripple"}).
+TICKER_CHAIN_ID_MAP = {}
 
 NEWSWORTHINESS_FILTER_ENABLED = True  # Enable/disable the reaction-worthiness gate
 # Default cutoff. THIS VALUE IS BACKEND-DEPENDENT — it must be re-derived whenever

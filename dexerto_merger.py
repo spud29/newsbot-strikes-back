@@ -180,16 +180,43 @@ class DexertoMerger:
     async def _handle_headline_tweet(self, entry: dict) -> bool:
         """Store tweet 1 (headline) in the pending table.
 
-        If the entry is already pending (re-encountered on a later poll cycle),
-        update the JSON but preserve the original buffered_at so the staleness
-        timer isn't perpetually reset.
+        Before buffering, check whether this entry is actually a reply to an
+        already-pending headline. Dexerto sometimes posts the follow-up without
+        a dexerto.com URL (e.g. a tinyurl.com link or plain explanatory text).
+        The standard follow-up path (is_dexerto_follow_up_tweet) misses these,
+        so we check the conversation here and merge if we find a parent.
         """
         entry_id = entry['id']
+
+        # Check if this entry is a reply to a buffered headline.
+        parent = await asyncio.to_thread(self._find_parent_headline_sync, entry)
+        if parent:
+            headline_entry_id, entry_json = parent['entry_id'], parent['entry_json']
+            with get_db_lock():
+                conn = get_db_connection()
+                conn.execute(
+                    "DELETE FROM dexerto_pending WHERE entry_id = ?", (headline_entry_id,)
+                )
+                conn.commit()
+
+            headline_entry = json.loads(entry_json)
+            headline_entry['dexerto_follow_up'] = re.sub(
+                r'\n{2,}', '\n', entry.get('content', '').strip()
+            )
+            self._db.mark_processed(entry_id)
+            logger.info(
+                f"DexertoMerger: merging reply {entry_id} into headline {headline_entry_id} "
+                f"(no dexerto.com URL in reply)\n"
+                f"  reply content: {entry.get('content', '')[:120]}"
+            )
+            await self._process_entry(headline_entry)
+            return True  # consumed
+
+        # Not a reply to a buffered headline — buffer as a headline as normal.
         conn = get_db_connection()
         with get_db_lock():
             existing = conn.execute(
-                "SELECT buffered_at FROM dexerto_pending WHERE entry_id = ?",
-                (entry_id,)
+                "SELECT buffered_at FROM dexerto_pending WHERE entry_id = ?", (entry_id,)
             ).fetchone()
             if existing:
                 # Already pending — refresh entry_json but keep original buffered_at
@@ -209,6 +236,83 @@ class DexertoMerger:
                 logger.info(f"DexertoMerger: buffered headline {entry_id} (waiting for follow-up tweet)")
             conn.commit()
         return True  # consumed — do NOT call process_entry for this entry yet
+
+    def _find_parent_headline_sync(self, entry: dict) -> dict | None:
+        """Check if this entry is a reply to a buffered headline.
+
+        Fetches the conversation via gallery-dl and checks whether this entry's
+        status_id appears as a reply_id in any buffered headline's conversation.
+        Returns the matching buffered row dict, or None.
+        """
+        link = entry.get('link')
+        if not link:
+            return None
+
+        try:
+            this_sid = int(entry['id'].split('_')[1])
+        except (ValueError, IndexError, AttributeError):
+            return None
+
+        cmd = [
+            sys.executable, '-m', 'gallery_dl',
+            '--config', config.GALLERY_DL_CONFIG,
+            '--dump-json',
+            '--no-download',
+            '--option', 'extractor.twitter.conversations=true',
+            link,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+            items = json.loads(result.stdout.strip())
+        except Exception:
+            return None
+
+        # Find buffered headlines whose status_id matches a reply_id in the
+        # conversation items (meaning this entry replies to that headline).
+        buffered = self._get_buffered_headlines()
+        if not buffered:
+            return None
+
+        buffered_sids = {}
+        for b in buffered:
+            sid = self._status_id_of(b['entry_id'])
+            if sid is not None:
+                buffered_sids[sid] = b
+
+        for item in items:
+            if not (isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict)):
+                continue
+            d = item[1]
+            try:
+                reply_to = int(d.get('reply_id', 0))
+            except (ValueError, TypeError):
+                continue
+            try:
+                tweet_id = int(d.get('tweet_id', 0))
+            except (ValueError, TypeError):
+                continue
+            if reply_to in buffered_sids and tweet_id == this_sid:
+                return buffered_sids[reply_to]
+
+        return None
+
+    def _get_buffered_headlines(self) -> list:
+        """Return all currently buffered headlines as dicts."""
+        conn = get_db_connection()
+        with get_db_lock():
+            rows = conn.execute(
+                "SELECT entry_id, entry_json, buffered_at FROM dexerto_pending"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _status_id_of(entry_id):
@@ -341,9 +445,17 @@ class DexertoMerger:
             if not (isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict)):
                 continue
             d = item[1]
+            try:
+                reply_id = int(d.get('reply_id', 0))
+            except (ValueError, TypeError):
+                continue
+            try:
+                user_id = int(d.get('user', {}).get('id', 0))
+            except (ValueError, TypeError):
+                continue
             if (
-                d.get('reply_id') == tweet1_id
-                and d.get('user', {}).get('id') == dexerto_user_id
+                reply_id == tweet1_id
+                and user_id == dexerto_user_id
                 and 'dexerto.com' in d.get('content', '')
             ):
                 follow_up = re.sub(r'\n{2,}', '\n', d['content'].strip())

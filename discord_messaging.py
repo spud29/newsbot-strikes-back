@@ -28,7 +28,7 @@ def _format_category_tag(primary, secondary=None):
 class DiscordPoster:
     """Posts messages to Discord channels with context menu command support"""
 
-    def __init__(self, perplexity_client=None, database=None, removed_entries_db=None, ollama=None):
+    def __init__(self, perplexity_client=None, database=None, removed_entries_db=None, ollama=None, sync_commands=True):
         """
         Initialize Discord client with app commands support
 
@@ -37,6 +37,9 @@ class DiscordPoster:
             database: Optional Database instance for entry removal
             removed_entries_db: Optional RemovedEntriesDB instance
             ollama: Optional OllamaClient instance — cache is invalidated after re-categorization
+            sync_commands: If True, sync app commands with Discord on connect (default True).
+                           Set to False for short-lived CLI sessions (e.g., newsbot_monitor.py)
+                           to avoid hitting Discord's strict command-sync rate limits.
         """
         intents = discord.Intents.default()
         intents.message_content = True
@@ -51,6 +54,7 @@ class DiscordPoster:
         self._verified_channels = False
         self._client_task = None
         self._shutting_down = False  # True during intentional stop(); gates the watchdog
+        self.sync_commands = sync_commands  # Gate command syncing to avoid rate limits
         self.perplexity_client = perplexity_client
 
         # Initialize database and removed entries if not provided
@@ -59,8 +63,12 @@ class DiscordPoster:
 
         self.ollama = ollama
 
-        # Register context menu commands
-        register_commands(self)
+        # Register context menu commands — only the long-running bot should
+        # handle interactions. Short-lived CLI sessions (sync_commands=False)
+        # must NOT register, or the same interaction gets dispatched to both
+        # the bot and the monitor CLI (double-dispatch → stranded entries).
+        if self.sync_commands:
+            register_commands(self)
 
         # Add error handler for app commands
         @self.tree.error
@@ -85,25 +93,30 @@ class DiscordPoster:
             self.ready = True
             logger.info(f'Discord client logged in as {self.client.user}')
 
-            # Sync commands with Discord
-            try:
-                logger.info("Syncing application commands with Discord...")
-                logger.debug(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
-                synced = await self.tree.sync()
-                logger.info(f"Successfully synced {len(synced)} application command(s) globally")
-                for cmd in synced:
-                    logger.debug(f"  - {cmd.name} (type: {cmd.type})")
+            # Sync commands with Discord — skip if disabled (e.g., short-lived CLI
+            # sessions like newsbot_monitor.py that would hit Discord's strict
+            # command-sync rate limits on every connect).
+            if self.sync_commands:
+                try:
+                    logger.info("Syncing application commands with Discord...")
+                    logger.debug(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
+                    synced = await self.tree.sync()
+                    logger.info(f"Successfully synced {len(synced)} application command(s) globally")
+                    for cmd in synced:
+                        logger.debug(f"  - {cmd.name} (type: {cmd.type})")
 
-                # Also sync to each connected guild immediately (global syncs can take up to 1 hour to propagate)
-                for guild in self.client.guilds:
-                    try:
-                        self.tree.copy_global_to(guild=guild)
-                        guild_synced = await self.tree.sync(guild=guild)
-                        logger.info(f"Guild sync for '{guild.name}' ({guild.id}): {len(guild_synced)} command(s)")
-                    except Exception as guild_err:
-                        logger.warning(f"Guild sync failed for {guild.id}: {guild_err}")
-            except Exception as e:
-                logger.error(f"Failed to sync commands: {e}", exc_info=True)
+                    # Also sync to each connected guild immediately (global syncs can take up to 1 hour to propagate)
+                    for guild in self.client.guilds:
+                        try:
+                            self.tree.copy_global_to(guild=guild)
+                            guild_synced = await self.tree.sync(guild=guild)
+                            logger.info(f"Guild sync for '{guild.name}' ({guild.id}): {len(guild_synced)} command(s)")
+                        except Exception as guild_err:
+                            logger.warning(f"Guild sync failed for {guild.id}: {guild_err}")
+                except Exception as e:
+                    logger.error(f"Failed to sync commands: {e}", exc_info=True)
+            else:
+                logger.info("Skipping application command sync (sync_commands=False)")
 
             # Verify channel access after connection is established
             if not self._verified_channels:
@@ -256,7 +269,8 @@ class DiscordPoster:
 
     @retry_with_backoff(max_retries=3, initial_delay=2)
     async def post_message(self, category, content, media_files=None, video_urls=None, source_type=None,
-                          entry_id=None, display_category=None, secondary_category=None):
+                          entry_id=None, display_category=None, secondary_category=None, video_unavailable=False,
+                          use_nonce=True):
         """
         Post a message to Discord channel (context menu commands only — no buttons)
 
@@ -275,9 +289,11 @@ class DiscordPoster:
         # Discord deduplicates within a 5-minute window: if the first send succeeds but
         # the response times out (causing an exception that triggers the retry), the
         # second attempt will return the original message instead of creating a duplicate.
+        # When use_nonce=False (e.g., monitor CLI in a fresh session), skip the nonce
+        # entirely to avoid cross-session nonce collisions that cause 404 "Unknown Message".
         nonce = (
             int(hashlib.sha256(entry_id.encode()).hexdigest()[:15], 16)
-            if entry_id else None
+            if (entry_id and use_nonce) else None
         )
         try:
             # Get channel ID from category
@@ -288,19 +304,22 @@ class DiscordPoster:
 
             logger.debug(f"Posting to category '{category}' (channel {channel_id})")
 
-            # Get the channel
+            # Get the channel — try cached first, then fetch as fallback
             channel = self.client.get_channel(channel_id)
-
             if not channel:
-                logger.error(
-                    f"Could not find Discord channel: {channel_id}\n"
-                    f"  Category: {category}\n"
-                    f"  This usually means:\n"
-                    f"    1. The bot is not in the server containing this channel\n"
-                    f"    2. The channel ID is incorrect in config.py\n"
-                    f"    3. The bot lacks permissions to view the channel"
-                )
-                return False, None, None
+                try:
+                    channel = await self.client.fetch_channel(channel_id)
+                except Exception as e:
+                    logger.error(
+                        f"Could not find Discord channel: {channel_id}\n"
+                        f"  Category: {category}\n"
+                        f"  get_channel failed, fetch_channel also failed: {e}\n"
+                        f"  This usually means:\n"
+                        f"    1. The bot is not in the server containing this channel\n"
+                        f"    2. The channel ID is incorrect in config.py\n"
+                        f"    3. The bot lacks permissions to view the channel\n"
+                    )
+                    return False, None, None
 
             # Prepare the message content
             message_text = content
@@ -310,11 +329,13 @@ class DiscordPoster:
             message_text = ensure_url_on_own_line(message_text)
 
             # Shorten URLs to TinyURLs, but skip if the message has multiple URLs
-            # (indicates a combined post). Dexerto entries are exempt — they legitimately
-            # carry a dexerto.com article URL alongside a Twitter video.
+            # (indicates a combined post). Dexerto and Polymarket entries are
+            # exempt — they legitimately carry an article URL alongside a
+            # poly.market / dexerto.com link.
             _url_count = len(re.findall(r'https?://\S+', message_text))
             _is_dexerto = 'dexerto.com' in message_text
-            if _url_count <= 1 or _is_dexerto:
+            _is_polymarket = 'poly.market' in message_text or 'polymarket.com' in message_text
+            if _url_count <= 1 or _is_dexerto or _is_polymarket:
                 message_text = await asyncio.to_thread(shorten_urls_in_text, message_text)
 
             # Prepend bold category tag in unified channel mode
@@ -334,6 +355,22 @@ class DiscordPoster:
                     # Only add Twitter video URLs (skip Telegram placeholder URLs)
                     if video_url.startswith('http'):
                         message_text += f" [.]({video_url})"
+            elif source_type == 'twitter' and video_unavailable:
+                # X broadcast URLs (x.com/i/broadcasts/) — gallery-dl can't extract
+                # the video. Strip the "Video"/"Full Episode" label so the post doesn't
+                # claim there's a video that isn't there.
+                message_text = re.sub(
+                    r'\n?\s*Video\s*\n\s*Full Episode\s*👇\s*\n?',
+                    '\n',
+                    message_text,
+                    flags=re.IGNORECASE
+                )
+                message_text = re.sub(
+                    r'\n?\s*Video\s*\n?',
+                    '\n',
+                    message_text,
+                    flags=re.IGNORECASE
+                )
 
             # Prepare file attachments
             files = []
@@ -427,13 +464,19 @@ class DiscordPoster:
                 raise
             else:
                 logger.error(f"Discord HTTP error: {e}")
+                logger.error(f"  Channel ID: {channel_id}, Category: {category}, Entry ID: {entry_id}")
+                if e.status == 404:
+                    logger.error(f"  UNUSUAL: 404 on channel.send() — this should not happen for message creation.")
+                    logger.error(f"  The channel reference may be stale, or the bot may lack access to this channel.")
+                    logger.error(f"  Try restarting the bot to refresh channel caches.")
                 return False, None, None
         except Exception as e:
             logger.error(f"Error posting to Discord: {e}", exc_info=True)
             raise
 
     async def recategorize_entry(self, message_id, channel_id, new_category, entry_id, content,
-                                  media_files=None, video_urls=None, source_type=None, user=None, user_reason=None):
+                                  media_files=None, video_urls=None, source_type=None, user=None, user_reason=None,
+                                  use_nonce=True):
         """
         Move a Discord message to a different category channel
 
@@ -453,10 +496,13 @@ class DiscordPoster:
         try:
             logger.info(f"Re-categorizing message {message_id} from channel {channel_id} to category {new_category}")
 
-            # Get the original channel
+            # Get the original channel — try cached first, then fetch as fallback
             old_channel = self.client.get_channel(channel_id)
             if not old_channel:
-                return False, None, None, f"Could not find original channel: {channel_id}"
+                try:
+                    old_channel = await self.client.fetch_channel(channel_id)
+                except Exception as e:
+                    return False, None, None, f"Could not find original channel: {channel_id} ({e})"
 
             # Fetch the original message
             try:
@@ -466,10 +512,53 @@ class DiscordPoster:
             except Exception as e:
                 return False, None, None, f"Error fetching original message: {str(e)}"
 
+            # Fetch original category from DB for routing decisions
+            old_info = self.database.get_discord_message_info(entry_id) if self.database and entry_id else None
+            old_category = old_info.get('category') if old_info else 'unknown'
+
+            # If the message is already in the target channel, this is a no-op.
+            # Don't post a duplicate — just confirm the DB is consistent and return.
+            target_channel_id = self.channels.get(new_category)
+            if target_channel_id and channel_id == target_channel_id:
+                logger.info(f"Entry {entry_id} is already in target channel {channel_id} for category '{new_category}' — skipping duplicate post")
+                # Ensure DB reflects the correct category/placement_reason even if no
+                # Discord mutation is needed (e.g. entry was manually moved but DB wasn't
+                # updated, or a re-demote landed here).
+                if self.database and entry_id:
+                    try:
+                        import datetime
+                        user_display = f"@{user.name}" if user else "unknown user"
+                        date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        new_placement_reason = (
+                            f"User re-categorization: moved from '{old_category}' to '{new_category}' "
+                            f"by {user_display} on {date_str}"
+                        )
+                        self.database.update_message_mapping_fields(
+                            entry_id,
+                            category=new_category,
+                            placement_reason=new_placement_reason,
+                            user_reason=user_reason,
+                        )
+                        logger.info(f"Updated message mapping category for entry {entry_id} (no-op move)")
+                        if self.ollama:
+                            self.ollama._enhanced_prompt_cache = None
+                    except Exception as e:
+                        logger.error(f"Error updating database: {e}")
+
+                logger.info(f"No-op re-categorized entry {entry_id} to {new_category} (already in target channel)")
+                return True, message_id, channel_id, None
+
             # In unified mode, recategorizing between two non-ignore categories means
             # the message stays in the same channel — just update the tag via in-place edit.
+            # Moves TO ignore are NEVER in-place: ignore has its own channel and must be
+            # cross-posted there, then the original deleted. The in-place path is only for
+            # non-ignore → non-ignore re-categorizations.
+            # Also: when entry_id is None (orphan), old_category is 'unknown' — never
+            # treat that as a non-ignore category, or the in-place path misfires.
             if (config.UNIFIED_CHANNEL_MODE
                     and new_category != config.DEFAULT_CATEGORY
+                    and old_category != config.DEFAULT_CATEGORY  # <-- both must be non-ignore
+                    and old_category not in (None, 'unknown')
                     and channel_id == config.UNIFIED_CHANNEL_ID):
 
                 # Use the original AI category for the tag, not the user's routing choice
@@ -481,7 +570,8 @@ class DiscordPoster:
                 _base = ensure_url_on_own_line(content)
                 _url_count = len(re.findall(r'https?://\S+', _base))
                 _is_dexerto = 'dexerto.com' in _base
-                if _url_count <= 1 or _is_dexerto:
+                _is_polymarket = 'poly.market' in _base or 'polymarket.com' in _base
+                if _url_count <= 1 or _is_dexerto or _is_polymarket:
                     _base = await asyncio.to_thread(shorten_urls_in_text, _base)
                 new_text = f"{_format_category_tag(original_ai_cat, secondary_cat)}\n{_base}"
 
@@ -565,21 +655,180 @@ class DiscordPoster:
                 original_ai_cat = new_category
             secondary_cat = cross_info.get('secondary_category') if cross_info else None
 
-            # Post to the new channel FIRST — the original is deleted only after
-            # the repost succeeds. The old delete-first order meant any repost
-            # failure (Discord outage, 429 exhaustion) destroyed the message and
-            # its attachments with no rollback, leaving the DB pointing at a
-            # deleted message.
+            # Record the intended new state in the database BEFORE any Discord mutations.
+            # If the repost fails, the DB still accurately reflects where the user moved it.
+            if self.database and entry_id:
+                try:
+                    import datetime
+                    old_info = self.database.get_discord_message_info(entry_id)
+                    old_category = old_info.get('category') if old_info else 'unknown'
+                    old_message_id = old_info.get('discord_message_id')
+                    old_channel_id = old_info.get('discord_channel_id')
+                    old_placement_reason = old_info.get('placement_reason') if old_info else None
+                    user_display = f"@{user.name}" if user else "unknown user"
+                    date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    new_placement_reason = (
+                        f"User re-categorization: moved from '{old_category}' to '{new_category}' "
+                        f"by {user_display} on {date_str}"
+                    )
+                    new_channel_id = self.channels.get(new_category)
+                    self.database.update_message_mapping_fields(
+                        entry_id,
+                        discord_message_id=None,  # will be set to real ID on successful post
+                        discord_channel_id=new_channel_id,
+                        category=new_category,
+                        placement_reason=new_placement_reason,
+                        user_reason=user_reason,
+                    )
+                    logger.info(f"Recorded intended state for entry {entry_id} in DB before Discord mutation")
+                    if self.ollama:
+                        self.ollama._enhanced_prompt_cache = None
+                except Exception as e:
+                    logger.error(f"Error recording intended state in database: {e}")
+
+            # Download attachments if media_files not provided — must happen before
+            # the post since post_message needs the file paths.
+            downloaded_files = []
+            if not media_files and original_message.attachments:
+                logger.info(f"Downloading {len(original_message.attachments)} attachments from original message")
+
+                for attachment in original_message.attachments:
+                    try:
+                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(attachment.filename)[1])
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(attachment.url) as resp:
+                                if resp.status == 200:
+                                    temp_file.write(await resp.read())
+                                    temp_file.close()
+                                    downloaded_files.append(temp_file.name)
+                                    logger.debug(f"Downloaded attachment: {attachment.filename} to {temp_file.name}")
+                    except Exception as e:
+                        logger.error(f"Error downloading attachment {attachment.filename}: {e}")
+
+                media_files = downloaded_files if downloaded_files else None
+
+            # Post to the new channel FIRST, before deleting the original.
+            # If the post fails, we haven't touched anything — the original message
+            # is still in the original channel and the DB still has the old message ID.
+            # Old ordering (delete-then-post) stranded entries when the repost 404'd:
+            # the original was gone and the new message never appeared.
+            # Post to the new channel. Pass the real entry_id so the repost gets a
+            # dedup nonce. Two cases:
+            #   (a) Within 5 min of original → Discord returns the original message
+            #       (dedup), but since we're posting to a different channel, a fresh
+            #       message is created and tracked properly.
+            #   (b) After 5 min → fresh message gets created and tracked properly.
+            # Either way, the entry_id ensures the DB mapping is updated correctly.
             success, new_message_id, new_channel_id = await self.post_message(
                 category=new_category,
                 content=content,
                 media_files=media_files,
                 video_urls=video_urls,
                 source_type=source_type,
-                entry_id=None,  # no nonce — avoids 5-min dedup collision with the original's post
+                entry_id=entry_id,
                 display_category=original_ai_cat,
                 secondary_category=secondary_cat,
+                use_nonce=False,
             )
+
+            if not success:
+                # Post failed — try a fresh post as fallback with NO entry_id (fresh nonce).
+                # The original post with this entry_id's nonce already failed and may still
+                # be in Discord's dedup window, which could cause a retry with the same nonce
+                # to be incorrectly rejected. A fresh nonce avoids this.
+                logger.warning(
+                    f"Cross-post failed for {entry_id}, attempting fresh post fallback (no nonce)..."
+                )
+                success2, new_msg_id2, new_ch_id2 = await self.post_message(
+                    category=new_category,
+                    content=content,
+                    media_files=media_files,
+                    video_urls=video_urls,
+                    source_type=source_type,
+                    entry_id=None,  # fresh nonce — avoid dedup conflict with failed post
+                    display_category=original_ai_cat,
+                    secondary_category=secondary_cat,
+                )
+                if success2:
+                    new_message_id = new_msg_id2
+                    new_channel_id = new_ch_id2
+                    logger.info(
+                        f"Fresh post fallback succeeded for {entry_id}: "
+                        f"message {new_message_id} in channel {new_channel_id}"
+                    )
+                else:
+                    # Both attempts failed — rollback DB to old state and return.
+                    # The original message is still in the original channel; nothing was
+                    # deleted. Restore the DB to reflect that.
+                    # IMPORTANT: we saved old_message_id and old_channel_id before the mutation
+                    # (line ~598). Do NOT re-read get_discord_message_info here — by this point
+                    # the DB already has discord_message_id=None and the new category, so a
+                    # fresh read would return the mutated state and the rollback would be a no-op.
+                    try:
+                        self.database.update_message_mapping_fields(
+                            entry_id,
+                            discord_message_id=old_message_id,
+                            discord_channel_id=old_channel_id,
+                            category=old_category,
+                            placement_reason=old_placement_reason,
+                        )
+                        logger.info(f"Rolled back DB for entry {entry_id} after failed post")
+                    except Exception as e:
+                        logger.error(f"Error rolling back DB for entry {entry_id}: {e}")
+                        # Try to restore a basic state even if get_discord_message_info failed
+                        try:
+                            db = Database()
+                            old_row = db.conn.execute(
+                                "SELECT discord_message_id, discord_channel_id, category, placement_reason FROM message_mapping WHERE entry_id = ?",
+                                (entry_id,)
+                            ).fetchone()
+                            if old_row and old_row[0] is not None:
+                                db.update_message_mapping_fields(
+                                    entry_id,
+                                    discord_message_id=old_row[0],
+                                    discord_channel_id=old_row[1],
+                                    category=old_row[2],
+                                    placement_reason=old_row[3],
+                                )
+                                logger.info(f"Rolled back DB for {entry_id} via direct query")
+                        except Exception as fallback_e:
+                            logger.error(f"Fallback rollback also failed for {entry_id}: {fallback_e}")
+                    return False, None, None, "Error posting to new channel"
+
+            # Update the DB mapping BEFORE deleting the original. If the process
+            # dies between delete and DB update, the row keeps NULL message_id
+            # (the stranding bug). Reversing the order means a crash after the
+            # delete = orphaned source copy (recoverable), not a lost entry.
+            if self.database and entry_id and new_message_id:
+                try:
+                    self.database.update_message_mapping_fields(
+                        entry_id,
+                        discord_message_id=new_message_id,
+                        discord_channel_id=new_channel_id,
+                    )
+                    logger.info(f"Updated Discord message ID for entry {entry_id}")
+                except Exception as e:
+                    logger.error(f"Error updating Discord message ID: {e}")
+
+            # Delete the original message now that the new post is confirmed
+            # AND the DB mapping is updated.
+            try:
+                await asyncio.sleep(2.0)  # brief grace period for user to react
+                await original_message.delete()
+                logger.info(
+                    f"Deleted original message {message_id} in channel {channel_id} "
+                    f"for entry {entry_id} after re-categorize to {new_category}"
+                )
+            except discord.NotFound:
+                logger.info(
+                    f"Original message {message_id} already deleted for entry {entry_id} "
+                    f"(not found during cleanup)"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to delete original message {message_id} for entry {entry_id}: {e}. "
+                    f"Orphan may remain in channel {channel_id}."
+                )
 
             # Clean up downloaded temporary files
             for file_path in downloaded_files:
@@ -588,23 +837,6 @@ class DiscordPoster:
                     logger.debug(f"Cleaned up temporary file: {file_path}")
                 except Exception as e:
                     logger.warning(f"Could not delete temporary file {file_path}: {e}")
-
-            if not success:
-                return False, None, None, "Error posting to new channel (original message preserved)"
-
-            # Repost is live — now remove the original. A delete failure is logged
-            # loudly but does NOT fail the operation: a visible duplicate beats
-            # losing the message, and the DB mapping below points at the new
-            # message either way.
-            try:
-                await original_message.delete()
-                logger.info(f"Deleted original message {message_id} from channel {channel_id}")
-            except Exception as e:
-                logger.error(
-                    f"Reposted entry {entry_id} as message {new_message_id} but FAILED to delete "
-                    f"the original message {message_id} in channel {channel_id}: {e} — "
-                    f"remove the old copy manually"
-                )
 
             # Discord intermittently skips the link-unfurl on a repost: the message
             # lands with the correct content and flags=0, but no embed is ever
@@ -649,33 +881,6 @@ class DiscordPoster:
                 except Exception as e:
                     logger.error(f"Error recreating thread: {e}", exc_info=True)
                     # Don't fail the whole operation if thread recreation fails
-
-            # Update database message mapping
-            if self.database and entry_id:
-                try:
-                    import datetime
-                    old_info = self.database.get_discord_message_info(entry_id)
-                    old_category = old_info.get('category') if old_info else 'unknown'
-                    user_display = f"@{user.name}" if user else "unknown user"
-                    date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    new_placement_reason = (
-                        f"User re-categorization: moved from '{old_category}' to '{new_category}' "
-                        f"by {user_display} on {date_str}"
-                    )
-                    self.database.update_message_mapping_fields(
-                        entry_id,
-                        discord_message_id=new_message_id,
-                        discord_channel_id=new_channel_id,
-                        category=new_category,
-                        placement_reason=new_placement_reason,
-                        user_reason=user_reason,
-                    )
-                    logger.info(f"Updated message mapping for entry {entry_id}")
-                    if self.ollama:
-                        self.ollama._enhanced_prompt_cache = None
-                except Exception as e:
-                    logger.error(f"Error updating database: {e}")
-                    # Don't fail the whole operation if database update fails
 
             logger.info(f"Successfully re-categorized entry {entry_id} to {new_category}, new message ID: {new_message_id}")
             return True, new_message_id, new_channel_id, None
@@ -780,7 +985,8 @@ class DiscordPoster:
             _base = ensure_url_on_own_line(content)
             _url_count = len(re.findall(r'https?://\S+', _base))
             _is_dexerto = 'dexerto.com' in _base
-            if _url_count <= 1 or _is_dexerto:
+            _is_polymarket = 'poly.market' in _base or 'polymarket.com' in _base
+            if _url_count <= 1 or _is_dexerto or _is_polymarket:
                 _base = await asyncio.to_thread(shorten_urls_in_text, _base)
             new_text = f"{_format_category_tag(new_category, secondary_cat)}\n{_base}"
 

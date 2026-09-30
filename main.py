@@ -7,8 +7,12 @@ import signal
 import sys
 import subprocess
 import os
+import hashlib
+import numpy as np
 from collections import deque
-from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, cleanup_bot_log, shorten_dexerto_url_in_text
+from utils import logger, setup_logging, is_all_caps, strip_wire_prefixes, is_audience_question, is_uw_article_followup, cleanup_bot_log, shorten_dexerto_url_in_text, strip_twitter_card_preview, normalize_crypto_tickers
+from ticker_resolver import keep_tickers_all_caps
+from enrichment import DailyCap, enrich_entry
 import config
 from db_connection import close_db_connection
 from database import Database
@@ -22,6 +26,7 @@ from perplexity_client import PerplexityClient
 from removed_entries import RemovedEntriesDB
 from ocr_handler import is_tradingview_chart_ocr
 from dexerto_merger import DexertoMerger
+from polymarket_merger import PolymarketMerger
 
 class NewsAggregatorBot:
     """Main bot orchestrator"""
@@ -51,9 +56,22 @@ class NewsAggregatorBot:
             process_entry_fn=self.process_entry,
             max_pending_hours=getattr(config, 'DEXERTO_PENDING_MAX_AGE_HOURS', 4.0)
         )
+        self.polymarket_merger = PolymarketMerger(
+            db=self.db,
+            process_entry_fn=self.process_entry,
+            max_pending_hours=getattr(config, 'POLYMARKET_PENDING_MAX_AGE_HOURS', 4.0)
+        )
 
         self.running = False
         self._processing_lock = set()  # Track entries currently being processed (race condition guard)
+        # In-flight embedding registry: entries mid-pipeline that haven't written their
+        # embedding to the DB cache yet. With concurrent processing, find_best_match()
+        # (which reads the DB cache) can't see a batch-mate that's still running — this
+        # registry lets an entry also dedup against its concurrent siblings so two
+        # near-identical items in the same cycle can't both post. Maps entry_id ->
+        # (embedding_np, norm). Checked+updated in a synchronous critical section per
+        # entry (no await between check and register), so it's atomic under asyncio.
+        self._inflight_embeddings = {}
         self._recent_post_times = deque()  # Timestamps of non-ignore posts (flood guard)
         self._last_log_cleanup: float = 0.0
         self._last_nightly_rebuild: float = 0.0
@@ -138,6 +156,39 @@ class NewsAggregatorBot:
         
         logger.info("Bot stopped")
     
+    def _check_and_register_inflight(self, entry_id, embedding):
+        """
+        Concurrent-sibling dedup. Scan entries currently mid-pipeline (registered
+        but not yet written to the DB embedding cache) for the best cosine
+        similarity to `embedding`, then register this entry so later siblings can
+        dedup against it.
+
+        Synchronous and await-free on purpose: the check-then-register must be one
+        atomic step under asyncio, so two batch-mates processed concurrently can't
+        both pass the dedup gate before either has written to the DB. Uses the same
+        cosine math as Database.find_best_match so the sibling check and the DB
+        check agree.
+
+        Returns:
+            float: best cosine similarity to an in-flight sibling (0.0 if none)
+        """
+        query = np.array(embedding)
+        query_norm = np.linalg.norm(query)
+        best = 0.0
+        if query_norm != 0:
+            for sib_id, (sib_np, sib_norm) in self._inflight_embeddings.items():
+                if sib_id == entry_id or sib_norm == 0:
+                    continue
+                if len(sib_np) != len(query):
+                    continue
+                sim = float(np.dot(query, sib_np) / (query_norm * sib_norm))
+                if sim > best:
+                    best = sim
+        # Register self even if the caller is about to suppress this entry — the
+        # finally block in process_entry() always deregisters.
+        self._inflight_embeddings[entry_id] = (query, query_norm)
+        return best
+
     async def process_entry(self, entry):
         """
         Process a single entry through the full pipeline
@@ -232,25 +283,117 @@ class NewsAggregatorBot:
                 logger.debug("Generating embedding for duplicate check...")
                 embedding = await asyncio.to_thread(self.ollama.generate_embedding, content)
 
+                # ── Content-hash dedup: catch identical text that arrived in the same
+                #    polling cycle before either embedding was stored in the DB cache.
+                #    The embedding-based check below catches cross-cycle duplicates; this
+                #    catches same-cycle ones (e.g. two Telegram channels posting the same
+                #    headline simultaneously). ──
+                #    Contract (2026-09-23): these duplicates are NOT silently suppressed
+                #    anymore — they set early_duplicate_info and fall through to the
+                #    normal post path, which routes them to the ignore channel with a
+                #    mapping row. Brandi's rule: every entry is visible in ignore.
+                early_duplicate_info = None
+                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                for cached_hash, cached_info in list(self.db._embeddings_cache.items()):
+                    if cached_info.get('entry_id') and cached_info.get('content'):
+                        cached_entry_hash = hashlib.md5(cached_info['content'].encode('utf-8')).hexdigest()
+                        if content_hash == cached_entry_hash:
+                            logger.info(
+                                f"Same-cycle content-hash duplicate: {entry_id} matches "
+                                f"{cached_info['entry_id']} — flagging for ignore routing "
+                                f"(no silent suppression)"
+                            )
+                            self.stats['duplicates'] += 1
+                            early_duplicate_info = {
+                                'similarity': 1.0,
+                                'match_preview': (cached_info.get('content') or '')[:100],
+                                'source': 'same-cycle content-hash duplicate',
+                                'match_entry_id': cached_info.get('entry_id'),
+                            }
+                            break
+
+                # Concurrent-sibling dedup (atomic, await-free): before checking the DB,
+                # check entries still mid-pipeline this cycle whose embeddings aren't in
+                # the DB cache yet, then register self. Under sequential processing the
+                # DB check alone caught these (the first entry had already written its
+                # embedding); with MAX_CONCURRENT_ENTRIES > 1 siblings overlap, so this
+                # is what stops two near-identical items in one batch both posting.
+                # Same contract as above: flagged for ignore routing, not suppressed.
+                sibling_sim = self._check_and_register_inflight(entry_id, embedding)
+                if sibling_sim >= config.SIMILARITY_THRESHOLD:
+                    logger.info(
+                        f"Concurrent-sibling duplicate: {entry_id} matches an entry "
+                        f"still being processed this cycle (similarity: {sibling_sim:.3f}) "
+                        f"— flagging for ignore routing (no silent suppression)"
+                    )
+                    self.stats['duplicates'] += 1
+                    early_duplicate_info = {
+                        'similarity': sibling_sim,
+                        'match_preview': 'in-flight sibling entry (still mid-pipeline)',
+                        'source': 'concurrent-sibling duplicate',
+                    }
+
                 # Single-pass similarity scan: check both duplicate and similarity thresholds at once
                 best_similarity, match_preview, match_content, match_entry_id = self.db.find_best_match(embedding)
 
+                # ── Content-hash dedup (secondary check, catches identical text that
+                #    arrived in the same cycle before either embedding was stored) ──
+                content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+                if match_entry_id:
+                    matched_info = self.db.get_discord_message_info(match_entry_id)
+                    if matched_info and matched_info.get('content'):
+                        matched_hash = hashlib.md5(matched_info['content'].encode('utf-8')).hexdigest()
+                        if content_hash == matched_hash and best_similarity >= config.DUPLICATE_THRESHOLD:
+                            logger.info(
+                                f"Content-hash duplicate: {entry_id} has identical text to "
+                                f"{match_entry_id} — suppressing"
+                            )
+                            self.stats['duplicates'] += 1
+                            if not early_duplicate_info:
+                                duplicate_info = {
+                                    'similarity': best_similarity,
+                                    'match_preview': match_preview,
+                                    'content_hash_match': True,
+                                }
+                            # Fall through to duplicate handling below
+
                 # Classify the best match against both thresholds.
-                # IMPORTANT: if the matched entry was itself sent to 'ignore' (e.g. during
-                # PAUSE_MODE), it was never actually published — don't treat the new entry
-                # as a duplicate of something the user never saw.
+                # IMPORTANT: if the matched entry was itself sent to 'ignore' during
+                # PAUSE_MODE or by content filters, it was never published — don't
+                # treat the new entry as a duplicate of something the user never saw.
+                # BUT: if the user manually re-categorized it to ignore, they saw it —
+                # respect that decision and suppress duplicates.
                 matched_was_ignored = False
                 if match_entry_id:
                     matched_mapping = self.db.get_discord_message_info(match_entry_id)
                     if matched_mapping and matched_mapping.get('category') == 'ignore':
-                        matched_was_ignored = True
-                        logger.info(
-                            f"Matched entry {match_entry_id} was posted to ignore "
-                            f"(similarity: {best_similarity:.3f}) — not suppressing new entry"
-                        )
+                        # Check WHY it's in ignore
+                        placement_reason = (matched_mapping.get('placement_reason') or '').lower()
+                        # User re-categorization to ignore = they saw it, respect it → suppress dupes
+                        if 'user re-categorization' in placement_reason and 'to ignore' in placement_reason:
+                            matched_was_ignored = False  # user-sent-to-ignore still suppresses dupes
+                            logger.info(
+                                f"Matched entry {match_entry_id} was USER-moved to ignore "
+                                f"(similarity: {best_similarity:.3f}) — suppressing duplicate"
+                            )
+                        # PAUSE_MODE or content filter → never seen → don't suppress
+                        elif 'pause mode' in placement_reason or 'newsworthiness' in placement_reason \
+                                or 'content filter' in placement_reason or 'ai categorized' in placement_reason:
+                            matched_was_ignored = True
+                            logger.info(
+                                f"Matched entry {match_entry_id} was auto-routed to ignore "
+                                f"(similarity: {best_similarity:.3f}) — not suppressing new entry"
+                            )
+                        else:
+                            # Unknown reason, default to not suppressing (safe)
+                            matched_was_ignored = True
+                            logger.info(
+                                f"Matched entry {match_entry_id} is in ignore with unknown reason "
+                                f"(similarity: {best_similarity:.3f}) — not suppressing new entry"
+                            )
 
-                duplicate_info = None
-                if best_similarity >= config.DUPLICATE_THRESHOLD and not matched_was_ignored:
+                duplicate_info = early_duplicate_info
+                if not duplicate_info and best_similarity >= config.DUPLICATE_THRESHOLD and not matched_was_ignored:
                     logger.info(
                         f"Exact duplicate detected (similarity: {best_similarity:.3f}): {entry_id}\n"
                         f"Matches: {match_preview}"
@@ -273,14 +416,23 @@ class NewsAggregatorBot:
                     for cand_sim, cand_preview, cand_content, cand_entry_id in top_matches:
                         # Skip candidates that were themselves routed to ignore —
                         # they were never published, so don't suppress new entries against them.
+                        # BUT: if the user explicitly moved it to ignore, they saw it — suppress dupes against it.
                         if cand_entry_id:
                             cand_mapping = self.db.get_discord_message_info(cand_entry_id)
                             if cand_mapping and cand_mapping.get('category') == 'ignore':
-                                logger.info(
-                                    f"Skipping similarity candidate {cand_entry_id} "
-                                    f"(was posted to ignore, score: {cand_sim:.3f})"
-                                )
-                                continue
+                                cand_placement = (cand_mapping.get('placement_reason') or '').lower()
+                                # User re-categorization to ignore = they saw it, respect it → don't skip
+                                if 'user re-categorization' not in cand_placement:
+                                    logger.info(
+                                        f"Skipping similarity candidate {cand_entry_id} "
+                                        f"(was posted to ignore, score: {cand_sim:.3f})"
+                                    )
+                                    continue
+                                else:
+                                    logger.info(
+                                        f"Checking similarity candidate {cand_entry_id} — "
+                                        f"user-rejected, score: {cand_sim:.3f}"
+                                    )
 
                         logger.info(
                             f"Verifying similarity candidate (score: {cand_sim:.3f}): "
@@ -319,17 +471,60 @@ class NewsAggregatorBot:
                         content = entry.get('full_text') or content
                         # Dexerto merger: append tweet 2 follow-up text (blurb + article URL)
                         if entry.get('dexerto_follow_up'):
+                            # Strip Twitter/Nitter link-card preview junk ("Link",
+                            # article title, meta description, duplicate URL) that
+                            # Nitter appends to the follow-up tweet's RSS description
                             follow_up = await asyncio.to_thread(
-                                shorten_dexerto_url_in_text, entry['dexerto_follow_up']
+                                strip_twitter_card_preview, entry['dexerto_follow_up']
+                            )
+                            follow_up = await asyncio.to_thread(
+                                shorten_dexerto_url_in_text, follow_up
                             )
                             content = f"{content.rstrip()}\n{follow_up}"
                             logger.debug(f"DexertoMerger: appended follow-up text to content for {entry_id}")
+                        # Polymarket merger: append tweet 2 follow-up text (odds + poly.market URL)
+                        # with a "--" separator line between the headline and the odds line
+                        if entry.get('polymarket_follow_up'):
+                            follow_up = entry["polymarket_follow_up"]
+                            content = f"{content.rstrip()}\n--\n{follow_up}"
+                            logger.debug(f"PolymarketMerger: appended follow-up text to content for {entry_id}")
                     elif source_type == 'telegram':
                         entry = await self.media_handler.download_telegram_media(entry)
                         # Content should already be set, but update if needed
                         content = entry.get('content', content)
                 else:
                     logger.debug("Media already downloaded, skipping download step...")
+
+                # Normalize X chain-ticker codes ("<chain>:<address>") to $TICKER
+                # on the finalized content — covers gallery-dl success, RSS
+                # fallback, and Telegram paths. Unresolved codes stay unchanged.
+                if getattr(config, 'TICKER_RESOLVE_ENABLED', True):
+                    content = await asyncio.to_thread(normalize_crypto_tickers, content)
+
+                # Entry enrichment: add [Context] block from Firecrawl (linked
+                # articles) or Tavily (bare vague headlines) BEFORE categorization,
+                # so the classifier and newsworthiness gate judge the full picture.
+                # Failures degrade to unenriched — must never break the pipeline.
+                if getattr(config, 'ENRICHMENT_ENABLED', False):
+                    try:
+                        if not hasattr(self, '_enrichment_cap'):
+                            self._enrichment_cap = DailyCap(
+                                config.ENRICHMENT_STATE_FILE,
+                                config.ENRICHMENT_TAVILY_DAILY_CAP,
+                            )
+                        ctx = await asyncio.to_thread(
+                            enrich_entry,
+                            entry_id,
+                            content,
+                            config.FIRECRAWL_API_KEY,
+                            config.TAVILY_API_KEY,
+                            self._enrichment_cap,
+                        )
+                        if ctx:
+                            content = f"{content.rstrip()}{ctx}"
+                            logger.debug(f"Enrichment: context appended for {entry_id}")
+                    except Exception as e:
+                        logger.warning(f"Enrichment: failed for {entry_id} (continuing unenriched): {e}")
 
                 # Fix ALL CAPS content (wire-service style headlines from any source)
                 # Runs after gallery-dl so the final tweet text is what gets checked and rewritten.
@@ -344,6 +539,10 @@ class NewsAggregatorBot:
                             logger.info(f"Text formatted for {entry_id}")
                         else:
                             logger.debug(f"Text unchanged after format_text (returned original)")
+
+                # Keep cashtag tickers ALL CAPS ($pons -> $PONS) so they survive
+                # the ALL-CAPS cleanup above. Money amounts ($100, $1.5M) untouched.
+                content = keep_tickers_all_caps(content)
 
                 
                 # Combine OCR text and audio transcript with content for better categorization
@@ -392,14 +591,16 @@ class NewsAggregatorBot:
                         f"(score: {duplicate_info['similarity']:.3f}, "
                         f"matches: {duplicate_info['match_preview'][:100]})"
                     )
+                    dup_source = duplicate_info.get('source')
                     logger.info(
                         f"Category overridden to 'ignore' due to duplicate "
-                        f"(AI suggested: {ai_category})"
+                        f"(AI suggested: {ai_category}{f', via {dup_source}' if dup_source else ''})"
                     )
                     placement_reason = (
                         f"Duplicate override: exact duplicate detected "
-                        f"(score: {duplicate_info['similarity']:.3f}), "
-                        f"AI had suggested '{_ai_category}', routed to ignore"
+                        f"(score: {duplicate_info['similarity']:.3f})"
+                        + (f", via {dup_source}" if dup_source else "")
+                        + f", AI had suggested '{_ai_category}', routed to ignore"
                     )
 
                 # Category sanity check: if the AI assigned a real category to the new
@@ -495,16 +696,32 @@ class NewsAggregatorBot:
                                     )
 
                     if not superseded and not keep_both:
-                        logger.info(
-                            f"Similar story suppressed (not posted): {entry_id} "
+                        ai_category = category
+                        category = 'ignore'
+                        secondary_category = None
+                        reasoning = (
+                            f"AI suggested '{ai_category}': {reasoning or 'no reasoning provided'} "
+                            f"| OVERRIDDEN: near-duplicate of {match_entry_id or 'unknown'} "
                             f"(score: {similarity_info['similarity']:.3f}, "
                             f"matches: {similarity_info['match_preview'][:100]})"
                         )
-                        self.stats['duplicates'] += 1
-                        await asyncio.to_thread(self.db.mark_processed, entry_id)
-                        await asyncio.to_thread(self.db.add_embedding, content, embedding, entry_id=entry_id)
-                        self.media_handler.cleanup_entry_media(entry)
-                        return True
+                        placement_reason = (
+                            f"Similar content override: near-duplicate of {match_entry_id or 'unknown'} "
+                            f"(score: {similarity_info['similarity']:.3f}), "
+                            f"AI had suggested '{ai_category}', routed to ignore"
+                        )
+                        logger.info(
+                            f"Near-duplicate routed to ignore (AI suggested '{ai_category}'): {entry_id} "
+                            f"(score: {similarity_info['similarity']:.3f}, "
+                            f"matches: {similarity_info['match_preview'][:100]})"
+                        )
+                        # Fall through: category='ignore' flows past the routing decision
+                        # (which only touches non-ignore categories) into the normal post
+                        # path, which marks processed, stores the embedding, writes the
+                        # message_mapping row, and advances last_message_ids for Telegram.
+                        # DO NOT cleanup_entry_media here -- the post still needs the media.
+                        # DO NOT add mark_processed/add_embedding here -- the post path
+                        # owns both; doing them twice would double-write.
                 
                 # Reaction-worthiness gate (skip for similar/superseded entries).
                 # Two directions:
@@ -621,6 +838,28 @@ class NewsAggregatorBot:
                                 f"- routing from '{original_category}' to 'ignore'"
                             )
 
+                # Filter Unusual Whales article follow-ups (headline tweets already
+                # posted; the "Read more:" follow-up rehashes the same story late)
+                if not similarity_info and not superseded and category != 'ignore':
+                    if getattr(config, 'UW_ARTICLE_FOLLOWUP_FILTER_ENABLED', False):
+                        uw_sources = getattr(config, 'UW_ARTICLE_FOLLOWUP_SOURCES', {'unusual_whales'})
+                        if entry.get('source') in uw_sources and is_uw_article_followup(combined_content):
+                            original_category = category
+                            category = 'ignore'
+                            secondary_category = None
+                            reasoning = (
+                                f"AI suggested '{original_category}': {reasoning or 'no reasoning provided'} "
+                                f"| OVERRIDDEN: UW article follow-up (Read more link to unusualwhales.com)"
+                            )
+                            placement_reason = (
+                                f"Content filter: UW article follow-up detected, "
+                                f"AI had suggested '{original_category}', routed to ignore"
+                            )
+                            logger.info(
+                                f"UW follow-up filter: entry links to unusualwhales.com article "
+                                f"- routing from '{original_category}' to 'ignore'"
+                            )
+
                 # Routing decision: pause mode, category graduation, flood guard.
                 # Runs AFTER the content filters so gate scores and filter verdicts are
                 # recorded honestly even while the bot is paused or a category is
@@ -685,9 +924,10 @@ class NewsAggregatorBot:
                 # Post to Discord
                 media_files = entry.get('media_files', [])
                 video_urls = entry.get('video_urls', [])
-                
+                video_unavailable = entry.get('video_unavailable', False)
+
                 logger.debug(f"Posting to Discord: {len(media_files)} files, {len(video_urls)} videos")
-                
+
                 success, discord_message_id, discord_channel_id = await self.discord_poster.post_message(
                     category=category,
                     content=display_content,
@@ -695,7 +935,8 @@ class NewsAggregatorBot:
                     video_urls=video_urls,
                     source_type=source_type,
                     entry_id=entry_id,
-                    secondary_category=secondary_category
+                    secondary_category=secondary_category,
+                    video_unavailable=video_unavailable
                 )
                 
                 if success:
@@ -790,6 +1031,11 @@ class NewsAggregatorBot:
             finally:
                 # Always release the processing lock when done
                 self._processing_lock.discard(entry_id)
+                # Deregister from the in-flight embedding registry (safe if never
+                # registered — discard-style). By now this entry's embedding is either
+                # in the DB cache (posted/suppressed paths both call add_embedding) or
+                # the entry errored out and won't be a dedup target anyway.
+                self._inflight_embeddings.pop(entry_id, None)
             
         except GalleryDlFailure as e:
             # gallery-dl failed to extract content - add to retry queue
@@ -841,6 +1087,12 @@ class NewsAggregatorBot:
             await self.dexerto_merger.flush_stale()
         except Exception as e:
             logger.error(f"Error flushing stale Dexerto entries: {e}", exc_info=True)
+
+        # Flush Polymarket headlines that have been waiting too long with no follow-up tweet.
+        try:
+            await self.polymarket_merger.flush_stale()
+        except Exception as e:
+            logger.error(f"Error flushing stale Polymarket entries: {e}", exc_info=True)
         
         # Clean up old retry queue entries (older than 24 hours)
         self.retry_queue.cleanup_old_entries(max_age_hours=24)
@@ -917,8 +1169,15 @@ class NewsAggregatorBot:
         # Poll Telegram channels
         try:
             logger.info("\n--- Polling Telegram channels ---")
-            telegram_entries = await self.telegram_poller.poll_all_channels()
+            telegram_entries = await asyncio.wait_for(
+                self.telegram_poller.poll_all_channels(), timeout=config.TELEGRAM_POLL_TIMEOUT
+            )
             all_entries.extend(telegram_entries)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Telegram poll exceeded {config.TELEGRAM_POLL_TIMEOUT}s, skipping this cycle "
+                "(likely a stuck Telethon reconnect)"
+            )
         except Exception as e:
             logger.error(f"Error polling Telegram channels: {e}")
         
@@ -961,14 +1220,19 @@ class NewsAggregatorBot:
         
         # Track already seen entries
         already_seen = 0
-        
-        # Process each entry sequentially
+
+        # Two-phase processing:
+        #   Phase 1 (sequential): the cheap pre-checks that must stay ordered —
+        #     is_processed skip, and the Dexerto pair merger (which buffers headline
+        #     tweets and mutates shared state, so it can't run concurrently).
+        #   Phase 2 (concurrent): the network-bound per-entry pipeline, overlapped up
+        #     to MAX_CONCURRENT_ENTRIES. Sibling dedup inside process_entry keeps two
+        #     near-identical batch-mates from both posting.
         if all_entries:
             logger.info("\n--- Processing entries ---")
-            
+
+            to_dispatch = []
             for i, entry in enumerate(all_entries, 1):
-                logger.info(f"\nEntry {i}/{len(all_entries)}")
-                
                 # Check if already processed before doing expensive operations
                 if self.db.is_processed(entry['id']):
                     already_seen += 1
@@ -983,12 +1247,42 @@ class NewsAggregatorBot:
                 if consumed:
                     continue
 
-                success = await self.process_entry(entry)
+                # Polymarket tweet pair merger: buffer headline tweets and wait for
+                # the matching follow-up tweet (odds + poly.market URL) before posting.
+                consumed = await self.polymarket_merger.handle(entry)
+                if consumed:
+                    continue
 
-                # If successful and was in retry queue, remove it
-                if success:
-                    self.retry_queue.remove_entry(entry['id'], reason="success")
-        
+                to_dispatch.append(entry)
+
+            max_concurrent = max(1, getattr(config, 'MAX_CONCURRENT_ENTRIES', 4))
+            logger.info(
+                f"Dispatching {len(to_dispatch)} entries "
+                f"(concurrency: {max_concurrent})"
+            )
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def _run(idx, entry):
+                async with semaphore:
+                    logger.info(f"\nEntry {idx}/{len(to_dispatch)}: {entry['id']}")
+                    try:
+                        success = await self.process_entry(entry)
+                    except Exception as e:
+                        # process_entry already has broad handling, but guard the
+                        # gather so one crashed task can't cancel its siblings.
+                        logger.error(
+                            f"Unhandled error dispatching {entry.get('id', 'unknown')}: {e}",
+                            exc_info=True
+                        )
+                        return
+                    if success:
+                        self.retry_queue.remove_entry(entry['id'], reason="success")
+
+            if to_dispatch:
+                await asyncio.gather(
+                    *(_run(i, e) for i, e in enumerate(to_dispatch, 1))
+                )
+
         cycle_duration = time.time() - cycle_start
         
         # Log cycle summary
@@ -1000,6 +1294,19 @@ class NewsAggregatorBot:
         logger.info(f"  Duplicates detected: {self.stats['duplicates']}")
         logger.info(f"  Successfully processed: {self.stats['processed']}")
         logger.info(f"  Errors: {self.stats['errors']}")
+
+        # Prompt-cache hit rate (OpenRouter categorization backend only). Shows how
+        # much of the repeated system-prompt prefix Gemini served from its implicit
+        # cache this cycle — a low rate here means we're paying full price for the
+        # ~4.3k-token prompt on every call and something upstream is breaking the
+        # cacheable prefix.
+        cache_stats = self.ollama.get_and_reset_cache_stats()
+        if cache_stats['calls'] > 0 and cache_stats['prompt_tokens'] > 0:
+            logger.info(
+                f"  Prompt cache: {cache_stats['hit_rate']:.0%} hit "
+                f"({cache_stats['cached_tokens']:,}/{cache_stats['prompt_tokens']:,} "
+                f"prompt tokens cached over {cache_stats['calls']} calls)"
+            )
         
         if self.stats['by_category']:
             logger.info("\n  By Category:")
@@ -1153,9 +1460,15 @@ class NewsAggregatorBot:
                 try:
                     await self.poll_cycle()
                     
-                    # Wait for next cycle
+                    # Wait for next cycle, but wake every second so a SIGTERM
+                    # shutdown (stop() sets self.running = False) isn't blocked
+                    # for the full poll interval. Previously a single long sleep
+                    # meant systemd's 90s TimeoutStopSec SIGKILLed us first.
                     logger.info(f"\nWaiting {config.POLL_INTERVAL}s until next cycle...\n")
-                    await asyncio.sleep(config.POLL_INTERVAL)
+                    for _ in range(config.POLL_INTERVAL):
+                        if not self.running:
+                            break
+                        await asyncio.sleep(1)
                     
                 except KeyboardInterrupt:
                     logger.info("\nReceived interrupt signal")
@@ -1179,10 +1492,32 @@ class NewsAggregatorBot:
             
             await self.stop()
 
+# Module-level reference to the running bot for signal-handler shutdown
+_bot_instance = None
+
+def set_bot_instance(bot):
+    global _bot_instance
+    _bot_instance = bot
+
+async def shutdown_gracefully():
+    """Gracefully stop the bot. Called by the signal handler via loop.create_task."""
+    logger.info("Scheduling graceful shutdown...")
+    if _bot_instance is not None:
+        await _bot_instance.stop()
+    else:
+        logger.info("No bot instance to shut down")
+
 def signal_handler(sig, frame):
     """Handle shutdown signals"""
-    logger.info("\nShutdown signal received")
-    sys.exit(0)
+    logger.info("Shutdown signal received")
+    # Schedule graceful shutdown on the running event loop
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(shutdown_gracefully())
+    except RuntimeError:
+        # No running loop — exit directly
+        logger.info("No running event loop, exiting directly")
+        sys.exit(0)
 
 def kill_existing_instance():
     """Kill any existing bot instance recorded in the PID file."""
@@ -1232,6 +1567,7 @@ async def main():
 
     # Create and run bot
     bot = NewsAggregatorBot()
+    set_bot_instance(bot)
     await bot.run()
 
 if __name__ == "__main__":

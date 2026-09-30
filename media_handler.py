@@ -7,7 +7,7 @@ import json
 import subprocess
 import asyncio
 from pathlib import Path
-from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, normalize_crypto_tickers, resolve_shortened_urls, strip_wire_prefixes, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls
+from utils import logger, retry_with_backoff, get_temp_dir, cleanup_temp_files, clean_text_content, normalize_crypto_tickers, resolve_shortened_urls, strip_wire_prefixes, format_quote_tweets, remove_twitter_attribution, remove_xcom_urls, strip_twitter_card_preview
 import config
 from ocr_handler import OCRHandler
 from transcription_handler import TranscriptionHandler
@@ -47,6 +47,18 @@ class MediaHandler:
         
         if not link:
             logger.warning("No link provided for Twitter media download")
+            return entry
+        
+        # Skip X video broadcast URLs — gallery-dl can't handle them
+        # (exits with "Unsupported URL"). These tweets have "Video"/"Full Episode"
+        # labels but no downloadable video. Post as text-only.
+        # The broadcast URL can appear in either the RSS link field or inside
+        # the tweet content (e.g. "Full Episode 👇 https://x.com/i/broadcasts/...").
+        content_text = entry.get('full_text') or entry.get('content', '')
+        if 'x.com/i/broadcasts/' in link or 'x.com/i/broadcasts/' in content_text:
+            logger.info(f"Skipping X broadcast tweet (gallery-dl unsupported): {link}")
+            entry['video_unavailable'] = True
+            entry['full_text'] = content_text
             return entry
         
         logger.debug(f"Downloading Twitter media from: {link}")
@@ -133,6 +145,7 @@ class MediaHandler:
                 full_text = entry.get('content', '')
                 # Apply the same cleaning pipeline as gallery-dl content
                 if full_text:
+                    full_text = strip_twitter_card_preview(full_text)
                     full_text = clean_text_content(full_text)
                     full_text = resolve_shortened_urls(full_text)
                     full_text = strip_wire_prefixes(full_text)
@@ -184,6 +197,7 @@ class MediaHandler:
                         media_files.append(file_path)
             
             # Clean the full text: remove empty lines, resolve shortened URLs, remove x.com URLs, and remove Twitter attribution
+            full_text = strip_twitter_card_preview(full_text)
             full_text = clean_text_content(full_text)
             full_text = normalize_crypto_tickers(full_text)
             full_text = resolve_shortened_urls(full_text)
@@ -191,6 +205,17 @@ class MediaHandler:
             full_text = remove_xcom_urls(full_text)
             full_text = format_quote_tweets(full_text)
             full_text = remove_twitter_attribution(full_text)
+            
+            # Strip X broadcast URLs that remain in the text — these are embedded
+            # links (e.g. "Full Episode 👇 https://x.com/i/broadcasts/XXXX") that
+            # gallery-dl can't extract and users don't need to see.
+            if entry.get('video_unavailable'):
+                full_text = re.sub(
+                    r'https?://x\.com/i/broadcasts/\S+',
+                    '',
+                    full_text
+                )
+                full_text = clean_text_content(full_text)
             
             # Extract text from images using OCR
             ocr_text = ""

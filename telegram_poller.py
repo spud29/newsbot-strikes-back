@@ -43,7 +43,9 @@ class TelegramPoller:
             # vs. a user -> %LOCALAPPDATA%\Temp), which orphaned the authorized session
             # when the bot moved from an NSSM service to a user-level scheduled task.
             import tempfile
-            session_base = os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()
+            # Use XDG_DATA_HOME on Linux (persistent, not /tmp which gets cleared).
+            # Fall back to LOCALAPPDATA on Windows. Only use /tmp as last resort.
+            session_base = os.environ.get('XDG_DATA_HOME') or os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/.local/share')
             session_dir = os.path.join(session_base, 'newsbot')
             os.makedirs(session_dir, exist_ok=True)
             session_path = os.path.join(session_dir, 'newsbot_session')
